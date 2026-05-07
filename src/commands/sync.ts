@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync, statSync, readdirSync } from '
 import { execFileSync } from 'child_process';
 import { join, relative } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
-import { importFile } from '../core/import-file.ts';
+import { importSyncableFile } from '../core/import-file.ts';
 import { createInterface } from 'readline';
 import {
   buildSyncManifest,
@@ -590,14 +590,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       const oldSlug = resolveSlugForPath(from);
       const newSlug = resolveSlugForPath(to);
       try {
-        await engine.updateSlug(oldSlug, newSlug);
+        await engine.updateSlug(oldSlug, newSlug, opts.sourceId ? { sourceId: opts.sourceId } : undefined);
       } catch {
         // Slug doesn't exist or collision, treat as add
       }
       // Reimport at new path (picks up content changes)
       const filePath = join(repoPath, to);
       if (existsSync(filePath)) {
-        const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId });
+        const result = await importSyncableFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId });
         if (result.status === 'imported') chunksCreated += result.chunks;
       }
       pagesAffected.push(newSlug);
@@ -652,7 +652,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         return;
       }
       try {
-        const result = await importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId });
+        const result = await importSyncableFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId });
         if (result.status === 'imported') {
           chunksCreated += result.chunks;
           pagesAffected.push(result.slug);

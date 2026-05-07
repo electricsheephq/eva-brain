@@ -97,9 +97,9 @@ describeE2E('E2E: JSONB roundtrip — v0.12.1 reliability wave', () => {
     const sql = getConn();
     const payload = { type: 'pdf', upload_method: 'TUS resumable' };
     await sql`
-      INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-      VALUES (NULL, 'jsonb-check.bin', 'unsorted/jsonb-check.bin', 'application/octet-stream', 1, 'sha256:deadbeef', ${sql.json(payload)})
-      ON CONFLICT (storage_path) DO UPDATE SET metadata = EXCLUDED.metadata
+      INSERT INTO files (source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+      VALUES ('default', NULL, 'jsonb-check.bin', 'unsorted/jsonb-check.bin', 'application/octet-stream', 1, 'sha256:deadbeef', ${sql.json(payload)})
+      ON CONFLICT (source_id, storage_path) DO UPDATE SET metadata = EXCLUDED.metadata
     `;
     const [row] = await sql`
       SELECT jsonb_typeof(metadata) AS t,

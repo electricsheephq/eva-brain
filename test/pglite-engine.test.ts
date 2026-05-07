@@ -189,6 +189,22 @@ describe('PGLiteEngine: Pages', () => {
     expect((await engine.getPage('test/new-name'))?.title).toBe('Test Page');
   });
 
+  test('updateSlug only renames the selected source', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+         VALUES ('kb', 'kb', '{}'::jsonb)
+         ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage('test/shared', { ...testPage, title: 'Default' });
+    await engine.putPage('test/shared', { ...testPage, title: 'KB' }, { sourceId: 'kb' });
+
+    await engine.updateSlug('test/shared', 'test/renamed', { sourceId: 'kb' });
+
+    expect((await engine.getPage('test/shared'))?.title).toBe('Default');
+    expect(await engine.getPage('test/shared', { sourceId: 'kb' })).toBeNull();
+    expect((await engine.getPage('test/renamed', { sourceId: 'kb' }))?.title).toBe('KB');
+  });
+
   test('validateSlug rejects path traversal', async () => {
     expect(() => engine.putPage('../etc/passwd', testPage)).toThrow();
   });

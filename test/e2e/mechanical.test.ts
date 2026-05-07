@@ -639,9 +639,9 @@ describeE2E('E2E: file_list LIMIT enforcement', () => {
     // Insert 150 file rows for the same slug
     for (let i = 0; i < 150; i++) {
       await sql`
-        INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-        VALUES (${testSlug}, ${'file-' + String(i).padStart(3, '0') + '.txt'}, ${testSlug + '/file-' + i + '.txt'}, ${'text/plain'}, ${100}, ${'hash-' + i}, ${'{}'}::jsonb)
-        ON CONFLICT (storage_path) DO NOTHING
+        INSERT INTO files (source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+        VALUES (${'default'}, ${testSlug}, ${'file-' + String(i).padStart(3, '0') + '.txt'}, ${testSlug + '/file-' + i + '.txt'}, ${'text/plain'}, ${100}, ${'hash-' + i}, ${'{}'}::jsonb)
+        ON CONFLICT (source_id, storage_path) DO NOTHING
       `;
     }
 
