@@ -819,6 +819,28 @@ describe('PGLiteEngine: Stats & Health', () => {
     expect(health.missing_embeddings).toBe(1); // chunk has no embedding
     expect(health.embed_coverage).toBe(0);
   });
+
+  test('getHealth treats embedding presence, not embedded_at timestamp, as coverage truth', async () => {
+    await truncateAll();
+    await engine.putPage('test/embedded-no-timestamp', testPage);
+    await engine.upsertChunks('test/embedded-no-timestamp', [
+      {
+        chunk_index: 0,
+        chunk_text: 'chunk with vector but missing timestamp',
+        chunk_source: 'compiled_truth',
+        embedding: new Float32Array(1536).fill(0.01),
+      },
+    ]);
+    await (engine as any).db.query(
+      `UPDATE content_chunks SET embedded_at = NULL WHERE chunk_text = $1`,
+      ['chunk with vector but missing timestamp'],
+    );
+
+    const health = await engine.getHealth();
+    expect(health.missing_embeddings).toBe(0);
+    expect(health.embed_coverage).toBe(1);
+  });
+
 });
 
 // ─────────────────────────────────────────────────────────────────

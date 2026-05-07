@@ -1947,11 +1947,14 @@ export class PGLiteEngine implements BrainEngine {
     const { rows: [h] } = await this.db.query(`
       WITH entity_pages AS (
         SELECT id, slug FROM pages WHERE type IN ('person', 'company')
+      ),
+      text_chunks AS (
+        SELECT * FROM content_chunks WHERE COALESCE(modality, 'text') = 'text'
       )
       SELECT
         (SELECT count(*) FROM pages) as page_count,
-        (SELECT count(*) FROM content_chunks WHERE embedded_at IS NOT NULL)::float /
-          GREATEST((SELECT count(*) FROM content_chunks), 1)::float as embed_coverage,
+        (SELECT count(*) FROM text_chunks WHERE embedding IS NOT NULL)::float /
+          GREATEST((SELECT count(*) FROM text_chunks), 1)::float as embed_coverage,
         (SELECT count(*) FROM pages p
          WHERE p.updated_at < (SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id)
         ) as stale_pages,
@@ -1964,7 +1967,7 @@ export class PGLiteEngine implements BrainEngine {
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
         ) as dead_links,
-        (SELECT count(*) FROM content_chunks WHERE embedded_at IS NULL) as missing_embeddings,
+        (SELECT count(*) FROM text_chunks WHERE embedding IS NULL) as missing_embeddings,
         (SELECT count(*) FROM links) as link_count,
         (SELECT count(DISTINCT page_id) FROM timeline_entries) as pages_with_timeline,
         (SELECT count(*) FROM entity_pages) as entity_page_count,
