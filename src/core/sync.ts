@@ -134,10 +134,45 @@ function isMarkdownFilePath(path: string): boolean {
   return path.endsWith('.md') || path.endsWith('.mdx');
 }
 
+/**
+ * v0.27.1: image extensions are admitted only when the multimodal config
+ * gate is on. The runtime gate flips through `process.env.GBRAIN_EMBEDDING_MULTIMODAL`
+ * which loadConfigWithEngine populates from the DB plane after engine connect
+ * (or env directly when the operator overrides). When the gate is off,
+ * existing brains keep their current "markdown + code only" sync behavior.
+ */
+function isImageFilePath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return (
+    lower.endsWith('.png') ||
+    lower.endsWith('.jpg') ||
+    lower.endsWith('.jpeg') ||
+    lower.endsWith('.gif') ||
+    lower.endsWith('.webp') ||
+    lower.endsWith('.heic') ||
+    lower.endsWith('.heif') ||
+    lower.endsWith('.avif')
+  );
+}
+
+/** Slug shape for native image asset pages. Preserves extension and path. */
+export function slugifyImagePath(filePath: string): string {
+  return filePath.replace(/\\/g, '/').replace(/^\.?\//, '').toLowerCase();
+}
+
+function isMultimodalEnabled(): boolean {
+  return process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
+}
+
 function isAllowedByStrategy(path: string, strategy: SyncStrategy): boolean {
   if (strategy === 'markdown') return isMarkdownFilePath(path);
   if (strategy === 'code') return isCodeFilePath(path);
-  return isMarkdownFilePath(path) || isCodeFilePath(path);
+  // 'auto' / default: markdown + code, plus images when multimodal is on.
+  return (
+    isMarkdownFilePath(path) ||
+    isCodeFilePath(path) ||
+    (isMultimodalEnabled() && isImageFilePath(path))
+  );
 }
 
 function globToRegex(pattern: string): RegExp {
@@ -283,6 +318,10 @@ export function pathToSlug(
  * flow through without touching the sync code path.
  */
 export function resolveSlugForPath(filePath: string, repoPrefix?: string): string {
+  if (isImageFilePath(filePath)) {
+    const imageSlug = slugifyImagePath(filePath);
+    return repoPrefix ? `${repoPrefix}/${imageSlug}` : imageSlug;
+  }
   const pageKind = isCodeFilePath(filePath) ? 'code' : 'markdown';
   return pathToSlug(filePath, repoPrefix, { pageKind });
 }

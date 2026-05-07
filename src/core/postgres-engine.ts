@@ -4,6 +4,7 @@ import type {
   LinkBatchInput, LinkSourceOpts, TimelineBatchInput,
   ReservedConnection,
   DreamVerdict, DreamVerdictInput,
+  FileSpec, FileRow,
   TakeBatchInput, Take, TakesListOpts, TakeHit, StaleTakeRow,
   TakeResolution, SynthesisEvidenceInput,
 } from './engine.ts';
@@ -236,6 +237,8 @@ export class PostgresEngine implements BrainEngine {
       symbol_name_exists: boolean;
       language_exists: boolean;
       search_vector_exists: boolean;
+      embedding_image_exists: boolean;
+      modality_exists: boolean;
       mcp_log_exists: boolean;
       agent_name_exists: boolean;
       subagent_messages_exists: boolean;
@@ -262,6 +265,10 @@ export class PostgresEngine implements BrainEngine {
                 WHERE table_schema = current_schema() AND table_name = 'content_chunks' AND column_name = 'language') AS language_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema() AND table_name = 'content_chunks' AND column_name = 'search_vector') AS search_vector_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'content_chunks' AND column_name = 'embedding_image') AS embedding_image_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'content_chunks' AND column_name = 'modality') AS modality_exists,
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema = current_schema() AND table_name = 'mcp_request_log') AS mcp_log_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
@@ -281,13 +288,17 @@ export class PostgresEngine implements BrainEngine {
     // v0.26.5: pages_deleted_at_purge_idx in SCHEMA_SQL crashes if the column
     // doesn't exist yet. Migration v34 also adds it, but bootstrap runs first.
     const needsPagesDeletedAt = probe.pages_exists && !probe.deleted_at_exists;
+    const needsChunksEmbeddingImage = probe.chunks_exists
+      && (!probe.embedding_image_exists || !probe.modality_exists);
     // v0.26.3 (v33): idx_mcp_log_agent_time in SCHEMA_SQL needs agent_name col.
     const needsMcpLogBootstrap = probe.mcp_log_exists && !probe.agent_name_exists;
     // v0.27 (v36): idx_subagent_messages_provider in SCHEMA_SQL needs provider_id
     // (the SECOND column in the composite index `(job_id, provider_id)`).
     const needsSubagentProviderId = probe.subagent_messages_exists && !probe.subagent_provider_id_exists;
 
-    if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap && !needsPagesDeletedAt && !needsMcpLogBootstrap && !needsSubagentProviderId) return;
+    if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
+        && !needsPagesDeletedAt && !needsChunksEmbeddingImage
+        && !needsMcpLogBootstrap && !needsSubagentProviderId) return;
 
     console.log('  Pre-v0.21 brain detected, applying forward-reference bootstrap');
 
@@ -348,6 +359,16 @@ export class PostgresEngine implements BrainEngine {
       // not to crash. v34 runs later via runMigrations and is idempotent.
       await conn.unsafe(`
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+      `);
+    }
+
+    if (needsChunksEmbeddingImage) {
+      // v39 (multimodal_dual_column_v0_27_1) adds modality + embedding_image.
+      // The schema blob creates idx_chunks_embedding_image, so older Postgres
+      // brains need these columns before SCHEMA_SQL replays.
+      await conn.unsafe(`
+        ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS modality TEXT NOT NULL DEFAULT 'text';
+        ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_image vector(1024);
       `);
     }
 
@@ -413,7 +434,7 @@ export class PostgresEngine implements BrainEngine {
     const sourceId = opts?.sourceId ?? 'default';
     const deletedCondition = includeDeleted ? sql`` : sql`AND deleted_at IS NULL`;
     const rows = await sql`
-      SELECT id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at
+      SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at
       FROM pages
       WHERE slug = ${slug} AND source_id = ${sourceId} ${deletedCondition}
       LIMIT 1
@@ -648,6 +669,10 @@ export class PostgresEngine implements BrainEngine {
           ${symbolKindClause}
           ${hardExcludeClause}
           ${visibilityClause}
+          -- v0.27.1: hide image rows from text-keyword search so OCR text
+          -- doesn't drown text-page hits. Image search runs a separate
+          -- vector path on embedding_image.
+          AND cc.modality = 'text'
         ORDER BY score DESC
         LIMIT ${innerLimitParam}
       ),
@@ -828,16 +853,20 @@ export class PostgresEngine implements BrainEngine {
     // wasting candidate slots on hidden rows.
     const visibilityClause = buildVisibilityClause('p', 's');
 
+    // v0.27.1: column routing. See pglite-engine.ts searchVector for rationale.
+    const col = opts?.embeddingColumn === 'embedding_image' ? 'embedding_image' : 'embedding';
+    const modalityFilter = col === 'embedding_image' ? `AND cc.modality = 'image'` : `AND cc.modality = 'text'`;
+
     const rawQuery = `
       WITH hnsw_candidates AS (
         SELECT
           p.slug, p.id as page_id, p.title, p.type, p.source_id,
           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-          1 - (cc.embedding <=> $1::vector) AS raw_score
+          1 - (cc.${col} <=> $1::vector) AS raw_score
         FROM content_chunks cc
         JOIN pages p ON p.id = cc.page_id
         JOIN sources s ON s.id = p.source_id
-        WHERE cc.embedding IS NOT NULL
+        WHERE cc.${col} IS NOT NULL ${modalityFilter}
           ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
           ${typeClause}
           ${excludeSlugsClause}
@@ -845,7 +874,7 @@ export class PostgresEngine implements BrainEngine {
           ${symbolKindClause}
           ${hardExcludeClause}
           ${visibilityClause}
-        ORDER BY cc.embedding <=> $1::vector
+        ORDER BY cc.${col} <=> $1::vector
         LIMIT ${innerLimitParam}
       )
       SELECT
@@ -907,7 +936,9 @@ export class PostgresEngine implements BrainEngine {
     // v0.20.0 Cathedral II Layer 6: adds parent_symbol_path / doc_comment /
     // symbol_name_qualified so nested-chunk emission (A3) can round-trip
     // scope metadata through upserts.
-    const cols = '(page_id, chunk_index, chunk_text, chunk_source, embedding, model, token_count, embedded_at, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified)';
+    // v0.27.1 (Phase 8): added `modality` + `embedding_image` to the column
+    // list. Image chunks pass embedding=null + embedding_image=Float32Array.
+    const cols = '(page_id, chunk_index, chunk_text, chunk_source, embedding, model, token_count, embedded_at, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified, modality, embedding_image)';
     const rows: string[] = [];
     const params: unknown[] = [];
     let paramIdx = 1;
@@ -916,29 +947,37 @@ export class PostgresEngine implements BrainEngine {
       const embeddingStr = chunk.embedding
         ? '[' + Array.from(chunk.embedding).join(',') + ']'
         : null;
+      const embeddingImageStr = chunk.embedding_image
+        ? '[' + Array.from(chunk.embedding_image).join(',') + ']'
+        : null;
       const parentPath = chunk.parent_symbol_path && chunk.parent_symbol_path.length > 0
         ? chunk.parent_symbol_path
         : null;
+      const modality = chunk.modality ?? 'text';
 
-      if (embeddingStr) {
-        rows.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::vector, $${paramIdx++}, $${paramIdx++}, now(), $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::text[], $${paramIdx++}, $${paramIdx++})`);
-        params.push(
-          pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
-          embeddingStr, chunk.model || 'text-embedding-3-large', chunk.token_count || null,
-          chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
-          chunk.start_line ?? null, chunk.end_line ?? null,
-          parentPath, chunk.doc_comment || null, chunk.symbol_name_qualified || null,
-        );
-      } else {
-        rows.push(`($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, NULL, $${paramIdx++}, $${paramIdx++}, NULL, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}::text[], $${paramIdx++}, $${paramIdx++})`);
-        params.push(
-          pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
-          chunk.model || 'text-embedding-3-large', chunk.token_count || null,
-          chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
-          chunk.start_line ?? null, chunk.end_line ?? null,
-          parentPath, chunk.doc_comment || null, chunk.symbol_name_qualified || null,
-        );
-      }
+      const embeddingPh = embeddingStr ? `$${paramIdx++}::vector` : 'NULL';
+      const embeddedAtPh = embeddingStr ? 'now()' : 'NULL';
+      const embeddingImagePh = embeddingImageStr ? `$${paramIdx++}::vector` : 'NULL';
+
+      rows.push(
+        `($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, ` +
+        `${embeddingPh}, $${paramIdx++}, $${paramIdx++}, ${embeddedAtPh}, ` +
+        `$${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, ` +
+        `$${paramIdx++}::text[], $${paramIdx++}, $${paramIdx++}, ` +
+        `$${paramIdx++}, ${embeddingImagePh})`,
+      );
+
+      // Param push order MUST match placeholder allocation order.
+      if (embeddingStr) params.push(embeddingStr);
+      if (embeddingImageStr) params.push(embeddingImageStr);
+      params.push(
+        pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
+        chunk.model || 'text-embedding-3-large', chunk.token_count || null,
+        chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
+        chunk.start_line ?? null, chunk.end_line ?? null,
+        parentPath, chunk.doc_comment || null, chunk.symbol_name_qualified || null,
+        modality,
+      );
     }
 
     // Single statement upsert: preserves existing embeddings via COALESCE when new value is NULL.
@@ -967,7 +1006,9 @@ export class PostgresEngine implements BrainEngine {
          end_line = EXCLUDED.end_line,
          parent_symbol_path = EXCLUDED.parent_symbol_path,
          doc_comment = EXCLUDED.doc_comment,
-         symbol_name_qualified = EXCLUDED.symbol_name_qualified`,
+         symbol_name_qualified = EXCLUDED.symbol_name_qualified,
+         modality = EXCLUDED.modality,
+         embedding_image = COALESCE(EXCLUDED.embedding_image, content_chunks.embedding_image)`,
       params as Parameters<typeof sql.unsafe>[1],
     );
   }
@@ -993,7 +1034,7 @@ export class PostgresEngine implements BrainEngine {
       SELECT count(*)::int AS count
       FROM content_chunks cc
       JOIN pages p ON p.id = cc.page_id
-      WHERE cc.embedding IS NULL ${sourceCondition}
+      WHERE cc.embedding IS NULL AND cc.modality = 'text' ${sourceCondition}
     `;
     return Number((row as { count?: number } | undefined)?.count ?? 0);
   }
@@ -1008,7 +1049,7 @@ export class PostgresEngine implements BrainEngine {
              cc.model, cc.token_count
       FROM content_chunks cc
       JOIN pages p ON p.id = cc.page_id
-      WHERE cc.embedding IS NULL ${sourceCondition}
+      WHERE cc.embedding IS NULL AND cc.modality = 'text' ${sourceCondition}
       ORDER BY p.source_id, p.id, cc.chunk_index
       LIMIT 100000
     `;
@@ -1506,6 +1547,53 @@ export class PostgresEngine implements BrainEngine {
     return rows as unknown as RawData[];
   }
 
+  // Files (v0.27.1): binary asset metadata. Image bytes never touch the DB
+  // (storage_path references a path inside the brain repo). Identity is
+  // (source_id, storage_path); re-upsert with same content_hash is a no-op,
+  // different content_hash overwrites in place.
+  async upsertFile(spec: FileSpec): Promise<{ id: number; created: boolean }> {
+    const sql = this.sql;
+    const sourceId = spec.source_id ?? 'default';
+    const metadata = (spec.metadata ?? {}) as Parameters<typeof sql.json>[0];
+    const rows = await sql<Array<{ id: number; created: boolean }>>`
+      INSERT INTO files (source_id, page_slug, page_id, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+      VALUES (${sourceId}, ${spec.page_slug ?? null}, ${spec.page_id ?? null}, ${spec.filename}, ${spec.storage_path}, ${spec.mime_type ?? null}, ${spec.size_bytes ?? null}, ${spec.content_hash}, ${sql.json(metadata)})
+      ON CONFLICT (source_id, storage_path) DO UPDATE SET
+        page_slug = EXCLUDED.page_slug,
+        page_id = EXCLUDED.page_id,
+        filename = EXCLUDED.filename,
+        mime_type = EXCLUDED.mime_type,
+        size_bytes = EXCLUDED.size_bytes,
+        content_hash = EXCLUDED.content_hash,
+        metadata = EXCLUDED.metadata
+      RETURNING id, (xmax = 0) AS created
+    `;
+    if (rows.length === 0) throw new Error(`upsertFile returned no rows for ${spec.storage_path}`);
+    return { id: rows[0].id, created: !!rows[0].created };
+  }
+
+  async getFile(sourceId: string, storagePath: string): Promise<FileRow | null> {
+    const sql = this.sql;
+    const rows = await sql<Array<FileRow>>`
+      SELECT id, source_id, page_slug, page_id, filename, storage_path, mime_type, size_bytes, content_hash, metadata, created_at
+      FROM files
+      WHERE source_id = ${sourceId} AND storage_path = ${storagePath}
+      LIMIT 1
+    `;
+    return rows.length > 0 ? rows[0] : null;
+  }
+
+  async listFilesForPage(pageId: number): Promise<FileRow[]> {
+    const sql = this.sql;
+    const rows = await sql<Array<FileRow>>`
+      SELECT id, source_id, page_slug, page_id, filename, storage_path, mime_type, size_bytes, content_hash, metadata, created_at
+      FROM files
+      WHERE page_id = ${pageId}
+      ORDER BY created_at ASC
+    `;
+    return rows as FileRow[];
+  }
+
   // Dream-cycle significance verdict cache (v0.23).
   async getDreamVerdict(filePath: string, contentHash: string): Promise<DreamVerdict | null> {
     const sql = this.sql;
@@ -1992,10 +2080,14 @@ export class PostgresEngine implements BrainEngine {
   }
 
   // Sync
-  async updateSlug(oldSlug: string, newSlug: string): Promise<void> {
+  async updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<void> {
     newSlug = validateSlug(newSlug);
     const sql = this.sql;
-    await sql`UPDATE pages SET slug = ${newSlug}, updated_at = now() WHERE slug = ${oldSlug}`;
+    const sourceId = opts?.sourceId ?? 'default';
+    await sql`
+      UPDATE pages SET slug = ${newSlug}, updated_at = now()
+      WHERE slug = ${oldSlug} AND source_id = ${sourceId}
+    `;
   }
 
   async rewriteLinks(_oldSlug: string, _newSlug: string): Promise<void> {

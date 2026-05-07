@@ -222,9 +222,8 @@ function collectValidationErrors(
   //    trigger phrases.
   for (let i = firstNonEmpty + 1; i < closeLine; i++) {
     const line = lines[i];
-    const m = line.match(/^\s*[A-Za-z_][\w-]*\s*:\s*(.*)$/);
-    if (!m) continue;
-    const value = m[1].trim();
+    const value = frontmatterScalarValue(line);
+    if (value === null) continue;
     if (!value.startsWith('"')) continue;
     let count = 0;
     for (let j = 0; j < value.length; j++) {
@@ -258,6 +257,31 @@ function collectValidationErrors(
       });
     }
   }
+}
+
+function frontmatterScalarValue(line: string): string | null {
+  let i = 0;
+  while (i < line.length && isInlineWhitespace(line.charCodeAt(i))) i++;
+  if (i >= line.length || !isFrontmatterKeyStart(line.charCodeAt(i))) return null;
+  i++;
+  while (i < line.length && isFrontmatterKeyChar(line.charCodeAt(i))) i++;
+  while (i < line.length && isInlineWhitespace(line.charCodeAt(i))) i++;
+  if (line[i] !== ':') return null;
+  i++;
+  while (i < line.length && isInlineWhitespace(line.charCodeAt(i))) i++;
+  return line.slice(i).trim();
+}
+
+function isInlineWhitespace(code: number): boolean {
+  return code === 0x20 || code === 0x09;
+}
+
+function isFrontmatterKeyStart(code: number): boolean {
+  return (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a) || code === 0x5f;
+}
+
+function isFrontmatterKeyChar(code: number): boolean {
+  return isFrontmatterKeyStart(code) || (code >= 0x30 && code <= 0x39) || code === 0x2d;
 }
 
 /**

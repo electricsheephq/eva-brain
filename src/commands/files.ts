@@ -64,18 +64,17 @@ export async function attachFileRecordWithEngine(engine: BrainEngine, pageSlug: 
     const storagePath = `${pageSlug}/${filename}`;
     const pageRows = await engine.executeRaw<{ id: number }>('SELECT id FROM pages WHERE slug = $1 LIMIT 1', [pageSlug]);
     const pageId = pageRows[0]?.id ?? null;
-    await engine.executeRaw(
-      `INSERT INTO files (page_slug, page_id, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-       ON CONFLICT (storage_path) DO UPDATE SET
-         page_slug = EXCLUDED.page_slug,
-         page_id = EXCLUDED.page_id,
-         content_hash = EXCLUDED.content_hash,
-         size_bytes = EXCLUDED.size_bytes,
-         mime_type = EXCLUDED.mime_type,
-         metadata = EXCLUDED.metadata`,
-      [pageSlug, pageId, filename, storagePath, mimeType, sizeBytes, hash, JSON.stringify({ ingest: 'media-evidence-mvp' })],
-    );
+    await engine.upsertFile({
+      source_id: 'default',
+      page_slug: pageSlug,
+      page_id: pageId,
+      filename,
+      storage_path: storagePath,
+      mime_type: mimeType,
+      size_bytes: sizeBytes,
+      content_hash: hash,
+      metadata: { ingest: 'media-evidence-mvp' },
+    });
     return storagePath;
   }
 }
@@ -154,9 +153,9 @@ async function attachFileRecord(pageSlug: string, filePath: string, mimeType: st
   const storagePath = `${pageSlug}/${filename}`;
 
   await sql`
-    INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-    VALUES (${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${sizeBytes}, ${hash}, ${sql.json({ ingest: 'media-evidence-mvp' })})
-    ON CONFLICT (storage_path) DO UPDATE SET
+    INSERT INTO files (source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+    VALUES (${'default'}, ${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${sizeBytes}, ${hash}, ${sql.json({ ingest: 'media-evidence-mvp' })})
+    ON CONFLICT (source_id, storage_path) DO UPDATE SET
       page_slug = EXCLUDED.page_slug,
       content_hash = EXCLUDED.content_hash,
       size_bytes = EXCLUDED.size_bytes,
@@ -225,9 +224,9 @@ async function uploadFile(args: string[]) {
   }
 
   await sql`
-    INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-    VALUES (${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${hash}, ${'{}'}::jsonb)
-    ON CONFLICT (storage_path) DO UPDATE SET
+    INSERT INTO files (source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+    VALUES (${'default'}, ${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${hash}, ${'{}'}::jsonb)
+    ON CONFLICT (source_id, storage_path) DO UPDATE SET
       content_hash = EXCLUDED.content_hash,
       size_bytes = EXCLUDED.size_bytes,
       mime_type = EXCLUDED.mime_type
@@ -318,10 +317,10 @@ async function uploadRaw(args: string[]) {
   // Record in DB
   const sql = db.getConnection();
   await sql`
-    INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-    VALUES (${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${'sha256:' + hash},
+    INSERT INTO files (source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+    VALUES (${'default'}, ${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${'sha256:' + hash},
             ${sql.json({ type: fileType, upload_method: method })})
-    ON CONFLICT (storage_path) DO UPDATE SET
+    ON CONFLICT (source_id, storage_path) DO UPDATE SET
       content_hash = EXCLUDED.content_hash,
       size_bytes = EXCLUDED.size_bytes,
       mime_type = EXCLUDED.mime_type
@@ -402,9 +401,9 @@ async function syncFiles(dir?: string) {
     const pageSlug = pathParts.length > 1 ? pathParts.slice(0, -1).join('/') : null;
 
     await sql`
-      INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-      VALUES (${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${hash}, ${'{}'}::jsonb)
-      ON CONFLICT (storage_path) DO UPDATE SET
+      INSERT INTO files (source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+      VALUES (${'default'}, ${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${hash}, ${'{}'}::jsonb)
+      ON CONFLICT (source_id, storage_path) DO UPDATE SET
         content_hash = EXCLUDED.content_hash,
         size_bytes = EXCLUDED.size_bytes,
         mime_type = EXCLUDED.mime_type

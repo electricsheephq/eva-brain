@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import { join, relative } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
-import { importFile } from '../core/import-file.ts';
+import { importSyncableFile, isImageFilePath } from '../core/import-file.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -109,7 +109,7 @@ export async function runImport(
   async function processFile(eng: BrainEngine, filePath: string) {
     const relativePath = relative(dir, filePath);
     try {
-      const result = await importFile(eng, filePath, relativePath, { noEmbed, sourceId: opts.sourceId });
+      const result = await importSyncableFile(eng, filePath, relativePath, { noEmbed, sourceId: opts.sourceId });
       if (result.status === 'imported') {
         imported++;
         chunksCreated += result.chunks;
@@ -273,17 +273,36 @@ export async function runImport(
       const { recordSyncFailures } = await import('../core/sync.ts');
       recordSyncFailures(failures, gitHead);
     }
-    if (failures.length === 0) {
-      await engine.setConfig('sync.last_commit', gitHead);
-    } else {
-      console.error(
-        `\nImport completed with ${failures.length} failure(s). ` +
-        `sync.last_commit NOT advanced — re-run 'gbrain sync' to retry, or ` +
-        `'gbrain sync --skip-failed' to acknowledge and move past them.`,
+    if (opts.sourceId !== undefined) {
+      if (failures.length === 0) {
+        await engine.executeRaw(
+          `UPDATE sources SET last_commit = $1, last_sync_at = now() WHERE id = $2`,
+          [gitHead, opts.sourceId],
+        );
+      } else {
+        console.error(
+          `\nImport completed with ${failures.length} failure(s). ` +
+          `source ${opts.sourceId} last_commit NOT advanced — re-run 'gbrain sync --source ${opts.sourceId}' to retry, or ` +
+          `'gbrain sync --source ${opts.sourceId} --skip-failed' to acknowledge and move past them.`,
+        );
+      }
+      await engine.executeRaw(
+        `UPDATE sources SET local_path = $1 WHERE id = $2`,
+        [dir, opts.sourceId],
       );
+    } else {
+      if (failures.length === 0) {
+        await engine.setConfig('sync.last_commit', gitHead);
+      } else {
+        console.error(
+          `\nImport completed with ${failures.length} failure(s). ` +
+          `sync.last_commit NOT advanced — re-run 'gbrain sync' to retry, or ` +
+          `'gbrain sync --skip-failed' to acknowledge and move past them.`,
+        );
+      }
+      await engine.setConfig('sync.repo_path', dir);
     }
     await engine.setConfig('sync.last_run', new Date().toISOString());
-    await engine.setConfig('sync.repo_path', dir);
   }
 
   return { imported, skipped, errors, chunksCreated, failures };
@@ -328,10 +347,15 @@ export function collectMarkdownFiles(dir: string): string[] {
         walk(full);
       } else if (entry.endsWith('.md') || entry.endsWith('.mdx')) {
         files.push(full);
+      } else if (multimodalEnabled && isImageFilePath(entry)) {
+        // v0.27.1 (F2): images join the walker only when multimodal is on.
+        // Pre-v0.27.1 brains keep their existing markdown-only walk.
+        files.push(full);
       }
     }
   }
 
+  const multimodalEnabled = process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
   walk(dir);
   return files.sort();
 }

@@ -139,6 +139,12 @@ describe('parseMarkdown validation surface', () => {
       const parsed = parseMarkdown(md, undefined, { validate: true });
       expect(parsed.errors!.map(e => e.code)).not.toContain('NESTED_QUOTES');
     });
+
+    test('tab-heavy scalar lines are scanned without regex backtracking', () => {
+      const md = `${fence}\nA${'\t'.repeat(20_000)}: "Just a normal title"\n${fence}\n\nbody`;
+      const parsed = parseMarkdown(md, undefined, { validate: true });
+      expect(parsed.errors!.map(e => e.code)).not.toContain('NESTED_QUOTES');
+    });
   });
 
   describe('EMPTY_FRONTMATTER', () => {

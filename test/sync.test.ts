@@ -276,6 +276,38 @@ describe('performSync dry-run never writes', () => {
     expect(await engine.getConfig('sync.repo_path')).toBeNull();
   });
 
+  test('source-scoped full sync does NOT rewrite the global sync checkpoint', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const head = execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf8' }).trim();
+    await engine.setConfig('sync.repo_path', '/default/brain');
+    await engine.setConfig('sync.last_commit', 'default-commit');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, last_commit, config)
+       VALUES ('supportkb', 'Support KB', $1, NULL, '{}'::jsonb)`,
+      [repoPath],
+    );
+
+    const result = await performSync(engine, {
+      sourceId: 'supportkb',
+      noPull: true,
+      noEmbed: true,
+    });
+
+    expect(result.status).toBe('first_sync');
+    expect(await engine.getConfig('sync.repo_path')).toBe('/default/brain');
+    expect(await engine.getConfig('sync.last_commit')).toBe('default-commit');
+    expect(await engine.getPage('people/alice', { sourceId: 'supportkb' })).not.toBeNull();
+    expect(await engine.getPage('people/alice')).toBeNull();
+
+    const rows = await engine.executeRaw<{ local_path: string; last_commit: string | null; last_sync_at: unknown }>(
+      `SELECT local_path, last_commit, last_sync_at FROM sources WHERE id = 'supportkb'`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].local_path).toBe(repoPath);
+    expect(rows[0].last_commit).toBe(head);
+    expect(rows[0].last_sync_at).toBeTruthy();
+  });
+
   test('incremental dry-run does NOT write to DB or advance the bookmark', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     // First do a real sync to seed the bookmark.
