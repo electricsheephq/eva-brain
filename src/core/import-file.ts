@@ -316,6 +316,9 @@ export async function importFromContent(
     // before their code repo syncs are common, and the missing edges land
     // later via `gbrain reconcile-links` (Layer 8 D3, v0.21.0).
     const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
+    const linkSourceOpts = opts.sourceId
+      ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
+      : undefined;
     for (const ref of codeRefs) {
       const codeSlug = slugifyCodePath(ref.path);
       // Forward: markdown guide → code page (this guide documents that code)
@@ -323,14 +326,14 @@ export async function importFromContent(
         await tx.addLink(
           slug, codeSlug,
           ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
-          'documents', 'markdown', slug, 'compiled_truth',
+          'documents', 'markdown', slug, 'compiled_truth', linkSourceOpts,
         );
       } catch { /* code page not yet imported — reconcile-links will catch it */ }
       // Reverse: code page → markdown guide (this code is documented by the guide)
       try {
         await tx.addLink(
           codeSlug, slug,
-          ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
+          ref.path, 'documented_by', 'markdown', slug, 'compiled_truth', linkSourceOpts,
         );
       } catch { /* same reason — silent skip */ }
     }

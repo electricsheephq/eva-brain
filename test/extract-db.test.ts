@@ -142,6 +142,28 @@ describe('gbrain extract links --source db', () => {
     const acmeLinks = await engine.getLinks('companies/acme');
     expect(acmeLinks.length).toBe(0);
   });
+
+  test('--source-id writes links inside the selected source when slugs overlap', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('kb-db', 'kb-db') ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage('people/alice', personPage('Alice default'));
+    await engine.putPage('companies/acme', companyPage('Acme default'));
+    await engine.putPage('people/alice', personPage('Alice kb'), { sourceId: 'kb-db' });
+    await engine.putPage('companies/acme', companyPage('Acme kb', '[Alice](people/alice) joined.'), { sourceId: 'kb-db' });
+
+    await runExtract(engine, ['links', '--source', 'db', '--source-id', 'kb-db']);
+
+    const rows = await engine.executeRaw<{ from_src: string; to_src: string }>(
+      `SELECT f.source_id AS from_src, t.source_id AS to_src
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.slug = $1 AND t.slug = $2`,
+      ['companies/acme', 'people/alice'],
+    );
+    expect(rows).toEqual([{ from_src: 'kb-db', to_src: 'kb-db' }]);
+  });
 });
 
 describe('gbrain extract timeline --source db', () => {
@@ -227,6 +249,31 @@ describe('gbrain extract timeline --source db', () => {
 
     const entries = await engine.getTimeline('people/alice');
     expect(entries.length).toBe(0);
+  });
+
+  test('--source-id writes timeline entries inside the selected source when slugs overlap', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('kb-db-time', 'kb-db-time') ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage('people/alice', {
+      type: 'person', title: 'Alice default', compiled_truth: '',
+      timeline: '- **2026-01-15** | Default source event',
+    });
+    await engine.putPage('people/alice', {
+      type: 'person', title: 'Alice kb', compiled_truth: '',
+      timeline: '- **2026-01-15** | KB source event',
+    }, { sourceId: 'kb-db-time' });
+
+    await runExtract(engine, ['timeline', '--source', 'db', '--source-id', 'kb-db-time']);
+
+    const rows = await engine.executeRaw<{ source_id: string; summary: string }>(
+      `SELECT p.source_id, te.summary
+         FROM timeline_entries te
+         JOIN pages p ON p.id = te.page_id
+        WHERE p.slug = $1`,
+      ['people/alice'],
+    );
+    expect(rows).toEqual([{ source_id: 'kb-db-time', summary: 'KB source event' }]);
   });
 });
 

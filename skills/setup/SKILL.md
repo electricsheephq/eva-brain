@@ -28,7 +28,10 @@ Set up GBrain from scratch. Target: working brain in under 5 minutes.
 ## Install (if not already installed)
 
 ```bash
-bun add github:garrytan/gbrain
+git clone https://github.com/electricsheephq/eva-brain ~/eva-brain
+cd ~/eva-brain
+bun install
+bun link
 ```
 
 ## How GBrain connects
@@ -56,17 +59,21 @@ Supabase gives you managed Postgres + pgvector (vector search built in) for $25/
 ## Prerequisites
 
 - A Supabase account (Pro tier recommended, $25/mo) OR any Postgres with pgvector
-- An OpenAI API key (for semantic search embeddings, ~$4-5 for 7,500 pages)
+- A Voyage API key for Eva's default semantic search posture, or an OpenClaw/Codex
+  OAuth runtime for extraction. Do not ask users for an OpenAI API key just to run
+  Eva Brain extraction.
 - A git-backed markdown knowledge base (or start fresh)
 
 ## Available init options
 
+- `gbrain init --embedding-model voyage:voyage-4-large --embedding-dimensions 2048` -- Eva default for technical workspaces
 - `gbrain init --supabase` -- interactive wizard (prompts for connection string)
 - `gbrain init --url <connection_string>` -- direct, no prompts
 - `gbrain init --non-interactive --url <connection_string>` -- for scripts/agents
 - `gbrain doctor --json` -- health check after init
 
-There is no `--local`, `--sqlite`, or offline mode. GBrain requires Postgres + pgvector.
+PGLite is the default local engine for agent installs. Postgres + pgvector is the
+multi-machine/managed option.
 
 ## Phase A: Supabase Setup (recommended)
 
@@ -252,7 +259,8 @@ gbrain sync --no-pull --no-embed
 ```
 
 This indexes new/changed files without pulling from git or regenerating embeddings.
-Embeddings can be refreshed later in batch (`gbrain embed --stale`).
+Embeddings can be refreshed later in batch (`gbrain embed --stale --source default`,
+or the concrete source id for non-default sources).
 
 ### gbrain vs memory_search
 
@@ -329,8 +337,11 @@ Read `docs/GBRAIN_SKILLPACK.md` Section 18 for the full reference. Key points:
    string uses Session mode (port 6543, Session mode) or direct (port 5432).
 
 2. **Set up automatic sync.** Choose the approach that fits your environment:
-   - **Cron** (recommended for agents): register a cron every 5-30 minutes:
-     `gbrain sync --repo /data/brain && gbrain embed --stale`
+   - **Cron** (recommended for agents): register a cron every 5-30 minutes.
+     For local-only folders with no git remote, use:
+     `gbrain import /data/brain --no-embed && gbrain embed --stale --source default`
+     For git-tracked repos with an upstream branch, use:
+     `gbrain sync --repo /data/brain && gbrain embed --stale --source default`
    - **Watch mode**: `gbrain sync --watch --repo /data/brain` under a process
      manager. Pair with a cron fallback (watch exits after 5 consecutive failures).
    - **Webhook or git hook**: if available in your environment.
@@ -341,9 +352,11 @@ Read `docs/GBRAIN_SKILLPACK.md` Section 18 for the full reference. Key points:
    - If page count is way too low, the pooler bug is silently skipping pages.
    - Push a test change and confirm it appears in `gbrain search`.
 
-4. **Chain sync + embed.** Always run both: `gbrain sync --repo <path> && gbrain
-   embed --stale`. For small syncs, embeddings are generated inline. The `embed
-   --stale` is a safety net for any stale chunks.
+4. **Chain refresh + embed.** Always run the repo-appropriate refresh command
+   (`import` for local-only folders, `sync` for git-tracked repos), then
+   `gbrain embed --stale --source <source-id>`. For small syncs, embeddings are
+   generated inline. The source-scoped stale embed is a safety net for any stale
+   chunks without reprocessing unrelated sources.
 
 Tell the user: "Live sync is configured. The brain will stay current automatically.
 I'll verify it's working in the next phase."
@@ -414,8 +427,9 @@ Next steps:
 - `gbrain doctor --json` -- health check
 - `gbrain check-update --json` -- check for updates
 - `gbrain embed refresh` -- generate embeddings
-- `gbrain embed --stale` -- backfill missing embeddings
-- `gbrain sync --repo <path>` -- one-shot sync from brain repo
+- `gbrain embed --stale --source <source-id>` -- backfill missing embeddings for one source
+- `gbrain import <path> --no-embed` -- refresh a local-only folder with no git remote
+- `gbrain sync --repo <path>` -- one-shot sync from a git-tracked brain repo
 - `gbrain sync --watch --repo <path>` -- continuous sync polling
 - `gbrain config get sync.last_run` -- check last sync timestamp
 - `gbrain stats` -- page count + embed coverage

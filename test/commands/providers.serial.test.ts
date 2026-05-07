@@ -12,6 +12,7 @@ const chatMock = mock(async () => ({
 }));
 const probeOllamaMock = mock(async () => ({ reachable: false, models_endpoint_valid: false }));
 const probeLMStudioMock = mock(async () => ({ reachable: false, models_endpoint_valid: false }));
+const loadGbrainEnvMock = mock(() => ({ ...process.env }));
 const loadConfigMock = mock(() => ({
   embedding_model: 'openai:text-embedding-3-large',
   embedding_dimensions: 1536,
@@ -58,6 +59,7 @@ mock.module('../../src/core/ai/probes.ts', () => ({
 
 mock.module('../../src/core/config.ts', () => ({
   loadConfig: loadConfigMock,
+  loadGbrainEnv: loadGbrainEnvMock,
 }));
 
 mock.module('../../src/core/ai/auth.ts', () => ({
@@ -76,6 +78,7 @@ describe('providers command auth hardening', () => {
     chatMock.mockClear();
     probeOllamaMock.mockClear();
     probeLMStudioMock.mockClear();
+    loadGbrainEnvMock.mockClear();
     loadConfigMock.mockClear();
     resolveProviderAuthMock.mockClear();
     logSpy.mockClear();
@@ -130,6 +133,25 @@ describe('providers command auth hardening', () => {
     expect(output).toContain('Recommended: openai:text-embedding-3-large');
     expect(output).toContain('OpenAI auth resolved via openclaw-codex');
     expect(output).not.toContain('oc-secret');
+  });
+
+  test('providers explain reads env detected state from gbrain.env loader', async () => {
+    loadGbrainEnvMock.mockReturnValueOnce({
+      VOYAGE_API_KEY: 'from-gbrain-env',
+      OLLAMA_BASE_URL: 'http://example.test:11434/v1',
+    });
+    const { runProviders } = await import('../../src/commands/providers.ts');
+    await runProviders('explain', ['--json']);
+
+    const payload = JSON.parse(String(logSpy.mock.calls[0]?.[0]));
+    expect(payload.env_detected.VOYAGE_API_KEY).toBe(true);
+    expect(payload.local_probes.ollama.url).toBe('http://example.test:11434/v1');
+    expect(probeOllamaMock).toHaveBeenCalledWith(expect.objectContaining({
+      OLLAMA_BASE_URL: 'http://example.test:11434/v1',
+    }));
+    expect(probeLMStudioMock).toHaveBeenCalledWith(expect.objectContaining({
+      VOYAGE_API_KEY: 'from-gbrain-env',
+    }));
   });
 
   test('providers test --model requires an explicit value', async () => {

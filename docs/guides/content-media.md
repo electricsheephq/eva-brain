@@ -2,15 +2,22 @@
 
 ## Current Shipping Boundary
 
-This fork currently ships a text-backed media evidence path:
+This fork currently ships a media evidence path:
 
 - normalized media evidence JSON can be imported with `gbrain import-media`
 - text-backed extraction can be bridged through `gbrain ingest-media --extract openclaw`
+- image MVP extraction can use the OpenClaw gateway route at `/plugins/gbrain/extract`
 - OCR, captions, transcripts, summaries, entities, tags, locators, and match reasons become searchable once they are present in that normalized payload
 
-The `--extract openclaw` adapter currently requires `GBRAIN_OPENCLAW_COMPLETION_COMMAND` and text-based input within the command size cap; it is not arbitrary binary extraction.
+The `--extract openclaw` adapter prefers `GBRAIN_OPENCLAW_GATEWAY_URL` or
+`OPENCLAW_GATEWAY_URL`, which calls OpenClaw's OAuth-backed Codex runtime through
+`/plugins/gbrain/extract` and supports text plus the current image MVP. The
+`GBRAIN_OPENCLAW_COMPLETION_COMMAND` fallback remains text-only and is meant for
+local host adapters that cannot accept file media.
 
-Direct binary image/video/audio understanding is the next adapter milestone. Keep binary extraction behind host, resolver, or provider adapters; do not present it as core GBrain behavior until it is live-smoked end to end.
+Direct binary video/audio/PDF understanding is the next adapter milestone. Keep
+binary extraction behind host, resolver, or provider adapters; do not present it
+as core GBrain behavior until it is live-smoked end to end.
 
 ## Goal
 YouTube videos, social media, PDFs, and documents become searchable brain pages with the agent's own analysis and full cross-references to every entity mentioned.
@@ -124,8 +131,11 @@ on user_shares_media(url_or_file):
             gbrain add_link <slug> <entity_slug>
             gbrain add_link <entity_slug> <slug>
 
-    # Always sync after ingestion
-    gbrain sync
+    # import-media / ingest-media writes searchable pages directly.
+    # For separate local markdown folders, refresh with:
+    gbrain import <folder> --no-embed
+    gbrain embed --stale --source <source-id>
+    # Use `gbrain sync --repo <repo>` only for git-tracked sources with a remote/upstream.
 ```
 
 ## Tricky Spots

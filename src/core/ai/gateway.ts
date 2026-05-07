@@ -22,6 +22,7 @@
  */
 
 import { embedMany, generateObject, generateText } from 'ai';
+import { listRecipes } from './recipes/index.ts';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createAnthropic } from '@ai-sdk/anthropic';
@@ -40,7 +41,6 @@ import { dimsProviderOptions } from './dims.ts';
 import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
 
 const MAX_CHARS = 8000;
-const VOYAGE_EMBED_TIMEOUT_MS = 30_000;
 const DEFAULT_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
 const DEFAULT_EMBEDDING_DIMENSIONS = 1536;
 const DEFAULT_EXPANSION_MODEL = 'anthropic:claude-haiku-4-5-20251001';
@@ -48,6 +48,39 @@ const DEFAULT_CHAT_MODEL = 'anthropic:claude-sonnet-4-6-20250929';
 
 let _config: AIGatewayConfig | null = null;
 const _modelCache = new Map<string, any>();
+
+/**
+ * The function the gateway calls to actually run a batch through the AI SDK.
+ * Defaults to the imported `embedMany`. Tests inject a stub via
+ * `__setEmbedTransportForTests` to drive recursion + fast-path scenarios
+ * without hitting a real provider. Production never reads the override.
+ */
+type EmbedManyFn = typeof embedMany;
+let _embedTransport: EmbedManyFn = embedMany;
+
+/**
+ * Per-recipe shrink-on-miss state. When a recipe's pre-split misses the
+ * provider's batch cap and recursive halving fires, we tighten its
+ * effective `safety_factor` so subsequent `embed()` calls pre-split smaller
+ * out of the gate. After 10 consecutive batch successes, the factor heals
+ * back toward the recipe default (×1.5 per heal, capped at the declared
+ * `safety_factor`). Module-scoped because the gateway itself is module-scoped;
+ * `resetGateway()` and `configureGateway()` clear it.
+ */
+interface ShrinkEntry {
+  factor: number;
+  consecutiveSuccesses: number;
+}
+const _shrinkState = new Map<string, ShrinkEntry>();
+
+/** Floor for shrink-on-miss to prevent infinite shrinking. */
+const SHRINK_FLOOR = 0.05;
+/** Successful batches needed before the factor heals back toward recipe default. */
+const SHRINK_HEAL_AFTER = 10;
+/** Default chars-per-token when a recipe omits it. Matches OpenAI tiktoken on English. */
+const DEFAULT_CHARS_PER_TOKEN = 4;
+/** Default safety factor when a recipe omits it. */
+const DEFAULT_SAFETY_FACTOR = 0.8;
 
 /** Configure the gateway. Called by cli.ts#connectEngine. Clears cached models. */
 export function configureGateway(config: AIGatewayConfig): void {
@@ -62,12 +95,66 @@ export function configureGateway(config: AIGatewayConfig): void {
     env: config.env,
   };
   _modelCache.clear();
+  _shrinkState.clear();
+  warnRecipesMissingBatchTokens();
+}
+
+/**
+ * Recipes that have already triggered the missing-max_batch_tokens warning
+ * in this process. Bounded by the number of registered recipes (~10 today).
+ * Cleared on `resetGateway()` so tests can re-exercise the warning path.
+ */
+const _warnedRecipes = new Set<string>();
+
+/**
+ * Walk every registered recipe with an `embedding` touchpoint. Each one
+ * missing `max_batch_tokens` gets exactly one stderr line per process for
+ * its first appearance. Recipes WITH the field stay quiet. The
+ * recursive-halving safety net only fires when `max_batch_tokens` is set,
+ * so a recipe that forgets it has no protection if the provider has a
+ * batch cap. Loud-fail over silent-skip per CLAUDE.md; a future
+ * Cohere/Mistral/Jina recipe that inherits the embedding-touchpoint
+ * pattern but forgets the cap re-creates the v0.27 Voyage backfill loop.
+ * The warning calls that out before production traffic hits it.
+ */
+function warnRecipesMissingBatchTokens(): void {
+  for (const recipe of listRecipes()) {
+    const embedding = recipe.touchpoints?.embedding;
+    if (!embedding || embedding.max_batch_tokens !== undefined) continue;
+    // OpenAI is the canonical "no cap declared, fast path is intentional"
+    // recipe; suppress the warning for it. Every other recipe missing the
+    // field is suspicious.
+    if (recipe.id === 'openai') continue;
+    if (_warnedRecipes.has(recipe.id)) continue;
+    _warnedRecipes.add(recipe.id);
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[ai.gateway] recipe "${recipe.id}" declares an embedding touchpoint ` +
+      `without max_batch_tokens; recursion is the only safety net for batch caps.`
+    );
+  }
 }
 
 /** Reset (for tests). */
 export function resetGateway(): void {
   _config = null;
   _modelCache.clear();
+  _shrinkState.clear();
+  _embedTransport = embedMany;
+  _warnedRecipes.clear();
+}
+
+/**
+ * Test-only seam. Replaces the function the gateway calls to embed a
+ * sub-batch. Pass `null` to restore the real `embedMany` from the AI SDK.
+ * Exported intentionally for the adaptive-embed-batch test suite to drive
+ * recursion + fast-path scenarios deterministically. Production code MUST
+ * NOT call this — there is no use case outside tests.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function __setEmbedTransportForTests(fn: EmbedManyFn | null): void {
+  _embedTransport = fn ?? embedMany;
 }
 
 function requireConfig(): AIGatewayConfig {
@@ -190,15 +277,69 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
         `${recipe.name} requires a base URL.`,
         recipe.setup_hint,
       );
-      // For openai-compatible, auth is optional (ollama local) but pass a dummy key if unauthenticated.
+      // For openai-compatible, auth is optional (Ollama local) but pass a dummy key if unauthenticated.
       const apiKey = auth.source === 'unauthenticated'
         ? 'unauthenticated'
         : requireAuth(auth, recipe, 'embedding');
+      // Voyage AI compatibility shim:
+      // 1. Rejects `encoding_format: "float"` (only accepts "base64" or omit).
+      //    The AI SDK hardcodes encoding_format: "float" for openai-compatible.
+      // 2. Returns `usage.total_tokens` instead of `usage.prompt_tokens`.
+      //    The AI SDK Zod schema requires `prompt_tokens` when usage is present.
+      const voyageOutputDimension = recipe.id === 'voyage'
+        ? dimsProviderOptions(
+            recipe.implementation,
+            modelId,
+            cfg.embedding_dimensions ?? DEFAULT_EMBEDDING_DIMENSIONS,
+          )?.openaiCompatible?.output_dimension
+        : undefined;
+      const voyageFetch = recipe.id === 'voyage'
+        ? async (url: string | URL | Request, init?: RequestInit) => {
+            if (init?.body && typeof init.body === 'string') {
+              try {
+                const parsed = JSON.parse(init.body);
+                delete parsed.encoding_format;
+                if (parsed.output_dimension == null && parsed.dimensions != null) {
+                  parsed.output_dimension = parsed.dimensions;
+                }
+                if (parsed.output_dimension == null && voyageOutputDimension != null) {
+                  parsed.output_dimension = voyageOutputDimension;
+                }
+                delete parsed.dimensions;
+                init = { ...init, body: JSON.stringify(parsed) };
+              } catch { /* not JSON, pass through */ }
+            }
+            const resp = await globalThis.fetch(url, init);
+            // Patch response to add prompt_tokens from total_tokens
+            const text = await resp.text();
+            try {
+              const json = JSON.parse(text);
+              if (json.usage && json.usage.total_tokens != null && json.usage.prompt_tokens == null) {
+                json.usage.prompt_tokens = json.usage.total_tokens;
+              }
+              return new Response(JSON.stringify(json), {
+                status: resp.status,
+                statusText: resp.statusText,
+                headers: resp.headers,
+              });
+            } catch {
+              return new Response(text, {
+                status: resp.status,
+                statusText: resp.statusText,
+                headers: resp.headers,
+              });
+            }
+          }
+        : undefined;
+      // SDK accepts a `fetch` override at runtime but the typed settings don't
+      // expose it on this version pin; cast so v0.28.5's #680 fetch-shim
+      // (Voyage encoding_format + usage normalization) typechecks.
       const client = createOpenAICompatible({
         name: recipe.id,
         baseURL: baseUrl,
         apiKey,
-      });
+        ...(voyageFetch ? { fetch: voyageFetch } : {}),
+      } as Parameters<typeof createOpenAICompatible>[0]);
       return client.textEmbeddingModel(modelId);
     }
     default:
@@ -206,86 +347,223 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
   }
 }
 
-async function embedVoyageNative(
-  modelId: string,
-  apiKey: string,
-  texts: string[],
-  dims: number,
-): Promise<Float32Array[]> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), VOYAGE_EMBED_TIMEOUT_MS);
-  let response: Response;
-  try {
-    response = await fetch('https://api.voyageai.com/v1/embeddings', {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: modelId,
-        input: texts,
-        output_dimension: dims,
-      }),
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+/** Minimum sub-batch size before we give up splitting and just throw. */
+const MIN_SUB_BATCH = 1;
 
-  const bodyText = await response.text();
-  let body: any;
-  try {
-    body = bodyText ? JSON.parse(bodyText) : {};
-  } catch {
-    body = { detail: bodyText };
-  }
-
-  if (!response.ok) {
-    throw new AIConfigError(
-      `Voyage embedding request failed (${response.status}): ${body?.detail ?? body?.message ?? response.statusText}`,
-      'Check VOYAGE_API_KEY, model id, and output dimension support.',
-    );
-  }
-
-  const data = Array.isArray(body?.data) ? body.data : [];
-  return data.map((row: any) => new Float32Array(row.embedding));
-}
-
-/** Embed many texts. Truncates to 8000 chars. Throws AIConfigError or AITransientError. */
+/**
+ * Embed many texts. Truncates to MAX_CHARS, then dispatches based on whether
+ * the recipe declares a per-batch token budget.
+ *
+ * Flow:
+ * ```
+ * embed(texts)
+ *   ├─ resolve recipe + model
+ *   ├─ truncate each text to MAX_CHARS (8000)
+ *   ├─ read recipe.touchpoints.embedding.{max_batch_tokens, chars_per_token, safety_factor}
+ *   │
+ *   ├─ if max_batch_tokens declared (Voyage path):
+ *   │     budget = max_batch_tokens × shrinkState[recipe].factor (default = recipe.safety_factor)
+ *   │     splitByTokenBudget(texts, budget, recipe.chars_per_token)
+ *   │     for each sub-batch: embedSubBatch(...)
+ *   │
+ *   └─ else (OpenAI fast path):
+ *         embedSubBatch(texts, ...) once  // no pre-split, no token-limit safety net
+ *
+ * embedSubBatch(texts, ...)
+ *   ├─ try: _embedTransport(texts) → dim check → return Float32Array[]
+ *   │       on success: bump shrinkState[recipe].consecutiveSuccesses
+ *   │
+ *   └─ catch:
+ *         if isTokenLimitError(err) AND texts.length > MIN_SUB_BATCH:
+ *               shrinkState[recipe].factor *= 0.5     (next embed() pre-splits tighter)
+ *               halve at mid=⌈N/2⌉
+ *               embedSubBatch(left)  ──┐
+ *               embedSubBatch(right) ──┴─ concat in order, return
+ *         else:
+ *               throw normalizeAIError(err, ...)
+ * ```
+ *
+ * Per-recipe state lives in `_shrinkState` and survives across `embed()`
+ * calls within one process. The healing path (after `SHRINK_HEAL_AFTER`
+ * consecutive batch successes) walks the factor back toward the recipe's
+ * declared `safety_factor` so a transient miss doesn't permanently cap
+ * throughput.
+ */
 export async function embed(texts: string[]): Promise<Float32Array[]> {
   if (!texts || texts.length === 0) return [];
 
   const cfg = requireConfig();
   const { model, recipe, modelId } = await resolveEmbeddingProvider(getEmbeddingModel());
   const truncated = texts.map(t => (t ?? '').slice(0, MAX_CHARS));
+  const providerOpts = dimsProviderOptions(recipe.implementation, modelId, cfg.embedding_dimensions ?? DEFAULT_EMBEDDING_DIMENSIONS);
   const expected = cfg.embedding_dimensions ?? DEFAULT_EMBEDDING_DIMENSIONS;
 
-  try {
-    const embeddings = recipe.id === 'voyage'
-      ? await embedVoyageNative(
-          modelId,
-          requireAuth(resolveProviderAuth(recipe, cfg), recipe, 'embedding'),
-          truncated,
-          expected,
-        )
-      : (await embedMany({
-          model,
-          values: truncated,
-          providerOptions: dimsProviderOptions(recipe.implementation, modelId, expected),
-        })).embeddings.map((e: number[]) => new Float32Array(e));
+  const embedding = recipe.touchpoints?.embedding;
+  const maxBatchTokens = embedding?.max_batch_tokens;
+  const charsPerToken = embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
 
-    // Verify dims match expectation; mismatch = likely misconfigured provider options.
-    const first = embeddings?.[0];
-    if (first && first.length !== expected) {
-      throw new AIConfigError(
-        `Embedding dim mismatch: model ${modelId} returned ${first.length} but schema expects ${expected}.`,
-        `Archive/backup the old brain, then run a fresh init with matching --embedding-model and --embedding-dimensions.`,
+  // Pre-split is gated on max_batch_tokens. Recipes without it (e.g. OpenAI)
+  // ride the fast path: one embedMany call, no recursion safety net.
+  const batches = maxBatchTokens
+    ? splitByTokenBudget(truncated, Math.floor(maxBatchTokens * effectiveSafetyFactor(recipe)), charsPerToken)
+    : [truncated];
+
+  const allEmbeddings: Float32Array[] = [];
+
+  for (const batch of batches) {
+    const result = await embedSubBatch(batch, model, providerOpts, expected, recipe, modelId);
+    allEmbeddings.push(...result);
+  }
+
+  return allEmbeddings;
+}
+
+/**
+ * Split texts into sub-batches that stay under the provided budget. Pure;
+ * no module state. Exported for the adaptive-embed-batch test suite.
+ *
+ * @param texts - The texts to partition. Each text counts as
+ *   `Math.ceil(text.length / charsPerToken)` tokens for budget purposes.
+ * @param budgetTokens - The token ceiling for each sub-batch. Caller is
+ *   responsible for applying any safety-factor shrink before passing in.
+ * @param charsPerToken - Provider-specific character density. Defaults to
+ *   `DEFAULT_CHARS_PER_TOKEN` (4) when omitted, matching OpenAI tiktoken.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function splitByTokenBudget(
+  texts: string[],
+  budgetTokens: number,
+  charsPerToken: number = DEFAULT_CHARS_PER_TOKEN,
+): string[][] {
+  const ratio = charsPerToken > 0 ? charsPerToken : DEFAULT_CHARS_PER_TOKEN;
+  const batches: string[][] = [];
+  let current: string[] = [];
+  let currentTokens = 0;
+
+  for (const text of texts) {
+    const estTokens = Math.ceil(text.length / ratio);
+    if (current.length > 0 && currentTokens + estTokens > budgetTokens) {
+      batches.push(current);
+      current = [];
+      currentTokens = 0;
+    }
+    current.push(text);
+    currentTokens += estTokens;
+  }
+  if (current.length > 0) batches.push(current);
+
+  return batches;
+}
+
+/**
+ * Returns true if the error looks like a provider batch-token-limit error.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function isTokenLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    /max.*allowed.*tokens.*batch/i.test(msg) ||
+    /batch.*too.*many.*tokens/i.test(msg) ||
+    /token.*limit.*exceeded/i.test(msg)
+  );
+}
+
+/**
+ * Resolve the recipe's effective safety factor (declared default, optionally
+ * shrunk by prior misses in this process).
+ */
+function effectiveSafetyFactor(recipe: Recipe): number {
+  const declared = recipe.touchpoints?.embedding?.safety_factor ?? DEFAULT_SAFETY_FACTOR;
+  const entry = _shrinkState.get(recipe.id);
+  return entry?.factor ?? declared;
+}
+
+/** Tighten the recipe's effective safety factor on a token-limit miss. */
+function shrinkOnMiss(recipe: Recipe): void {
+  const declared = recipe.touchpoints?.embedding?.safety_factor ?? DEFAULT_SAFETY_FACTOR;
+  const current = _shrinkState.get(recipe.id)?.factor ?? declared;
+  const next = Math.max(SHRINK_FLOOR, current * 0.5);
+  _shrinkState.set(recipe.id, { factor: next, consecutiveSuccesses: 0 });
+}
+
+/** Bump the win counter; heal toward declared default after enough wins. */
+function recordSubBatchSuccess(recipe: Recipe): void {
+  const declared = recipe.touchpoints?.embedding?.safety_factor ?? DEFAULT_SAFETY_FACTOR;
+  const entry = _shrinkState.get(recipe.id);
+  if (!entry || entry.factor >= declared) {
+    // Either no shrink active, or already at/above the declared ceiling — nothing to heal.
+    if (entry) {
+      _shrinkState.set(recipe.id, { factor: entry.factor, consecutiveSuccesses: 0 });
+    }
+    return;
+  }
+  const wins = entry.consecutiveSuccesses + 1;
+  if (wins >= SHRINK_HEAL_AFTER) {
+    const healed = Math.min(declared, entry.factor * 1.5);
+    _shrinkState.set(recipe.id, { factor: healed, consecutiveSuccesses: 0 });
+  } else {
+    _shrinkState.set(recipe.id, { factor: entry.factor, consecutiveSuccesses: wins });
+  }
+}
+
+/**
+ * Read the current shrink state for a recipe. Test-only seam.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function __getShrinkStateForTests(recipeId: string): ShrinkEntry | undefined {
+  const entry = _shrinkState.get(recipeId);
+  return entry ? { ...entry } : undefined;
+}
+
+/**
+ * Embed a single sub-batch with automatic halving on token-limit errors.
+ * If the batch is already at MIN_SUB_BATCH and still fails, throws.
+ */
+async function embedSubBatch(
+  texts: string[],
+  model: any,
+  providerOpts: any,
+  expectedDims: number,
+  recipe: Recipe,
+  modelId: string,
+): Promise<Float32Array[]> {
+  try {
+    const result = await _embedTransport({
+      model,
+      values: texts,
+      providerOptions: providerOpts,
+    });
+
+    if (!Array.isArray(result.embeddings) || result.embeddings.length !== texts.length) {
+      throw new AITransientError(
+        `Embedding provider returned ${result.embeddings?.length ?? 0} embedding(s) for ${texts.length} input(s).`,
       );
     }
 
-    return embeddings;
+    const first = result.embeddings[0];
+    if (first && Array.isArray(first) && first.length !== expectedDims) {
+      throw new AIConfigError(
+        `Embedding dim mismatch: model ${modelId} returned ${first.length} but schema expects ${expectedDims}.`,
+        `Run \`gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${first.length}\` or change models.`,
+      );
+    }
+
+    recordSubBatchSuccess(recipe);
+    return result.embeddings.map((e: number[]) => new Float32Array(e));
   } catch (err) {
+    // On token-limit error, tighten the recipe's effective safety factor
+    // (so the next embed() pre-splits smaller) and recursively halve THIS
+    // batch to make forward progress without dropping work.
+    if (isTokenLimitError(err) && texts.length > MIN_SUB_BATCH) {
+      shrinkOnMiss(recipe);
+      const mid = Math.ceil(texts.length / 2);
+      const left = await embedSubBatch(texts.slice(0, mid), model, providerOpts, expectedDims, recipe, modelId);
+      const right = await embedSubBatch(texts.slice(mid), model, providerOpts, expectedDims, recipe, modelId);
+      return [...left, ...right];
+    }
     throw normalizeAIError(err, `embed(${recipe.id}:${modelId})`);
   }
 }

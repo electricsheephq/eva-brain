@@ -27,8 +27,9 @@ export interface EmbedBatchOptions {
 
 /**
  * Embed a batch of texts via the gateway. Sub-batches of 100 so upstream
- * progress callbacks fire incrementally on large imports. The gateway
- * handles truncation, retries, and provider dispatch.
+ * progress callbacks fire incrementally on large imports. The gateway owns
+ * adaptive batch splitting and per-recipe token-budget logic; this paginator
+ * is purely about progress-callback granularity.
  */
 const BATCH_SIZE = 100;
 export async function embedBatch(

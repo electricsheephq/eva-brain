@@ -11,6 +11,16 @@
 
 import type { Implementation } from './types.ts';
 
+const VOYAGE_OUTPUT_DIMENSION_MODELS = new Set([
+  'voyage-4-large',
+  'voyage-4',
+  'voyage-4-lite',
+  'voyage-3-large',
+  'voyage-3.5',
+  'voyage-3.5-lite',
+  'voyage-code-3',
+]);
+
 /**
  * Build the providerOptions blob for embedMany() that pins output dimensions.
  *
@@ -45,7 +55,7 @@ export function dimsProviderOptions(
       // Most openai-compatible providers (Ollama, LM Studio, vLLM, LiteLLM)
       // do not expose a standard dimensions knob. Voyage's compat endpoint is
       // the exception: it accepts output_dimension and defaults to 1024 dims.
-      if (modelId.startsWith('voyage-')) {
+      if (VOYAGE_OUTPUT_DIMENSION_MODELS.has(modelId)) {
         return { openaiCompatible: { output_dimension: dims } };
       }
       return undefined;

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -95,7 +95,7 @@ describe('ingest-media OpenClaw env-sensitive guards', () => {
     const dir = mkdtempSync(join(tmpdir(), 'gbrain-ingest-media-large-image-'));
     const mediaPath = join(dir, 'large.png');
     const prevGatewayUrl = process.env.GBRAIN_OPENCLAW_GATEWAY_URL;
-    writeFileSync(mediaPath, Buffer.alloc(10_000_001));
+    writeFileSync(mediaPath, Buffer.alloc(8_000_001));
     process.env.GBRAIN_OPENCLAW_GATEWAY_URL = 'http://127.0.0.1:1';
 
     try {
@@ -103,8 +103,49 @@ describe('ingest-media OpenClaw env-sensitive guards', () => {
         mediaPath,
         '--extract', 'openclaw',
         '--slug', 'media/evidence/large',
-      ])).rejects.toThrow('only supports image inputs up to 10000000 bytes');
+      ])).rejects.toThrow('only supports image inputs up to 8000000 bytes');
     } finally {
+      if (prevGatewayUrl === undefined) delete process.env.GBRAIN_OPENCLAW_GATEWAY_URL;
+      else process.env.GBRAIN_OPENCLAW_GATEWAY_URL = prevGatewayUrl;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  test('cleans up temporary OpenClaw extraction files after import', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-ingest-media-cleanup-'));
+    const mediaPath = join(dir, 'receipt.png');
+    const prevGatewayUrl = process.env.GBRAIN_OPENCLAW_GATEWAY_URL;
+    const originalFetch = globalThis.fetch;
+    writeFileSync(mediaPath, 'fake-image-binary');
+    process.env.GBRAIN_OPENCLAW_GATEWAY_URL = 'http://127.0.0.1:18789';
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      ok: true,
+      extraction: {
+        schemaVersion: 'gbrain.media-extraction.v1',
+        kind: 'image',
+        sourceRef: 'receipt.png',
+        title: 'Receipt',
+        summary: 'A receipt image.',
+        segments: [{ id: 'frame-1', kind: 'frame', caption: 'Receipt total visible.' }],
+      },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch;
+    const before = new Set(readdirSync(tmpdir()).filter(name => name.startsWith('gbrain-codex-extraction-')));
+
+    try {
+      await runIngestMedia(engine, [
+        mediaPath,
+        '--extract', 'openclaw',
+        '--slug', 'media/evidence/cleanup-receipt',
+        '--no-file',
+        '--no-embed',
+      ]);
+      const after = readdirSync(tmpdir()).filter(name => name.startsWith('gbrain-codex-extraction-'));
+      expect(after.filter(name => !before.has(name))).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
       if (prevGatewayUrl === undefined) delete process.env.GBRAIN_OPENCLAW_GATEWAY_URL;
       else process.env.GBRAIN_OPENCLAW_GATEWAY_URL = prevGatewayUrl;
       rmSync(dir, { recursive: true, force: true });

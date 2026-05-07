@@ -221,6 +221,7 @@ async function runTest(args: string[]): Promise<void> {
 }
 
 function runEnv(args: string[]): void {
+  const env = currentGatewayEnv();
   const id = args[0];
   if (!id) {
     console.error('Usage: gbrain providers env <id>');
@@ -240,7 +241,7 @@ function runEnv(args: string[]): void {
     for (const k of required) {
       const resolution = authResolution(recipe);
       const set = resolution.source === 'env' && resolution.credentialKey === k;
-      console.log(`  ${k.padEnd(32)} ${set ? '✓ selected' : process.env[k] ? '• available' : '✗ not set'}`);
+      console.log(`  ${k.padEnd(32)} ${set ? '✓ selected' : env[k] ? '• available' : '✗ not set'}`);
     }
   } else {
     console.log('Required: (none)');
@@ -248,7 +249,7 @@ function runEnv(args: string[]): void {
   if (optional.length > 0) {
     console.log('\nOptional:');
     for (const k of optional) {
-      const set = !!process.env[k];
+      const set = !!env[k];
       console.log(`  ${k.padEnd(32)} ${set ? '✓ set' : '✗ not set'}`);
     }
   }
@@ -268,18 +269,19 @@ async function runExplain(args: string[]): Promise<void> {
   const asJson = args.includes('--json') || args.includes('-j');
 
   const recipes = listRecipes();
+  const env = currentGatewayEnv();
   const env_detected = {
-    OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
-    GOOGLE_GENERATIVE_AI_API_KEY: !!process.env.GOOGLE_GENERATIVE_AI_API_KEY,
-    ANTHROPIC_API_KEY: !!process.env.ANTHROPIC_API_KEY,
-    VOYAGE_API_KEY: !!process.env.VOYAGE_API_KEY,
-    DEEPSEEK_API_KEY: !!process.env.DEEPSEEK_API_KEY,
-    GROQ_API_KEY: !!process.env.GROQ_API_KEY,
-    TOGETHER_API_KEY: !!process.env.TOGETHER_API_KEY,
+    OPENAI_API_KEY: !!env.OPENAI_API_KEY,
+    GOOGLE_GENERATIVE_AI_API_KEY: !!env.GOOGLE_GENERATIVE_AI_API_KEY,
+    ANTHROPIC_API_KEY: !!env.ANTHROPIC_API_KEY,
+    VOYAGE_API_KEY: !!env.VOYAGE_API_KEY,
+    DEEPSEEK_API_KEY: !!env.DEEPSEEK_API_KEY,
+    GROQ_API_KEY: !!env.GROQ_API_KEY,
+    TOGETHER_API_KEY: !!env.TOGETHER_API_KEY,
   };
 
   // Parallel probes for local providers (1s timeout each)
-  const [ollama, lmstudio] = await Promise.all([probeOllama(), probeLMStudio()]);
+  const [ollama, lmstudio] = await Promise.all([probeOllama(env), probeLMStudio(env)]);
 
   const options: ProviderOption[] = [];
   for (const r of recipes) {
@@ -339,8 +341,8 @@ async function runExplain(args: string[]): Promise<void> {
     generated_at: new Date().toISOString(),
     env_detected,
     local_probes: {
-      ollama: { url: process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434/v1', reachable: ollama.reachable, models_endpoint_valid: ollama.models_endpoint_valid === true },
-      lmstudio: { url: process.env.LMSTUDIO_BASE_URL ?? 'http://localhost:1234/v1', reachable: lmstudio.reachable, models_endpoint_valid: lmstudio.models_endpoint_valid === true },
+      ollama: { url: env.OLLAMA_BASE_URL ?? 'http://localhost:11434/v1', reachable: ollama.reachable, models_endpoint_valid: ollama.models_endpoint_valid === true },
+      lmstudio: { url: env.LMSTUDIO_BASE_URL ?? 'http://localhost:1234/v1', reachable: lmstudio.reachable, models_endpoint_valid: lmstudio.models_endpoint_valid === true },
     },
     options,
     recommended: recommended.id,

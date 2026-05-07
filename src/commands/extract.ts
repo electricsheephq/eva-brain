@@ -302,6 +302,8 @@ export interface ExtractOpts {
    * Pass undefined or omit for a full walk (CLI / first-run path).
    */
   slugs?: string[];
+  /** Concrete source id for writes created by fs/incremental extraction. */
+  sourceId?: string;
 }
 
 /**
@@ -329,7 +331,7 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
       // Nothing changed — skip entirely.
       return result;
     }
-    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode);
+    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, opts.sourceId);
     result.links_created = r.links_created;
     result.timeline_entries_created = r.timeline_created;
     result.pages_processed = r.pages;
@@ -338,12 +340,12 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
 
   // Full walk path: CLI `gbrain extract` or first-run.
   if (opts.mode === 'links' || opts.mode === 'all') {
-    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode);
+    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode, opts.sourceId);
     result.links_created = r.created;
     result.pages_processed = r.pages;
   }
   if (opts.mode === 'timeline' || opts.mode === 'all') {
-    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode);
+    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode, opts.sourceId);
     result.timeline_entries_created = r.created;
     result.pages_processed = Math.max(result.pages_processed, r.pages);
   }
@@ -361,6 +363,8 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   const typeFilter = (typeIdx >= 0 && typeIdx + 1 < args.length) ? (args[typeIdx + 1] as PageType) : undefined;
   const sinceIdx = args.indexOf('--since');
   const since = (sinceIdx >= 0 && sinceIdx + 1 < args.length) ? args[sinceIdx + 1] : undefined;
+  const sourceIdIdx = args.indexOf('--source-id');
+  const sourceId = (sourceIdIdx >= 0 && sourceIdIdx + 1 < args.length) ? args[sourceIdIdx + 1] : undefined;
   const dryRun = args.includes('--dry-run');
   const jsonMode = args.includes('--json');
   // --include-frontmatter: v0.13 flag. Default OFF for back-compat. The
@@ -381,7 +385,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   }
 
   if (!subcommand || !['links', 'timeline', 'all'].includes(subcommand)) {
-    console.error('Usage: gbrain extract <links|timeline|all> [--source fs|db] [--dir <brain-dir>] [--dry-run] [--json] [--type T] [--since DATE]');
+    console.error('Usage: gbrain extract <links|timeline|all> [--source fs|db] [--source-id <id>] [--dir <brain-dir>] [--dry-run] [--json] [--type T] [--since DATE]');
     process.exit(1);
   }
 
@@ -404,12 +408,12 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
       // can opt in via mode + source.
       result = { links_created: 0, timeline_entries_created: 0, pages_processed: 0 };
       if (subcommand === 'links' || subcommand === 'all') {
-        const r = await extractLinksFromDB(engine, dryRun, jsonMode, typeFilter, since, { includeFrontmatter });
+        const r = await extractLinksFromDB(engine, dryRun, jsonMode, typeFilter, since, { includeFrontmatter, sourceId });
         result.links_created = r.created;
         result.pages_processed = r.pages;
       }
       if (subcommand === 'timeline' || subcommand === 'all') {
-        const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since);
+        const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, sourceId);
         result.timeline_entries_created = r.created;
         result.pages_processed = Math.max(result.pages_processed, r.pages);
       }
@@ -419,6 +423,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
         dir: brainDir,
         dryRun,
         jsonMode,
+        sourceId,
       });
     }
   } catch (e) {
@@ -450,6 +455,7 @@ async function extractForSlugs(
   mode: 'links' | 'timeline' | 'all',
   dryRun: boolean,
   jsonMode: boolean,
+  sourceId?: string,
 ): Promise<{ links_created: number; timeline_created: number; pages: number }> {
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
   const allFiles = walkMarkdownFiles(brainDir);
@@ -467,6 +473,9 @@ async function extractForSlugs(
 
   const linkBatch: LinkBatchInput[] = [];
   const timelineBatch: TimelineBatchInput[] = [];
+  const sourceOpts = sourceId
+    ? { from_source_id: sourceId, to_source_id: sourceId, origin_source_id: sourceId }
+    : undefined;
 
   async function flushLinks() {
     if (linkBatch.length === 0) return;
@@ -508,7 +517,7 @@ async function extractForSlugs(
             if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
             linksCreated++;
           } else {
-            linkBatch.push(link);
+            linkBatch.push({ ...link, ...sourceOpts });
             if (linkBatch.length >= BATCH_SIZE) await flushLinks();
           }
         }
@@ -522,7 +531,7 @@ async function extractForSlugs(
             if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
             timelineCreated++;
           } else {
-            timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+            timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail, source_id: sourceId });
             if (timelineBatch.length >= BATCH_SIZE) await flushTimeline();
           }
         }
@@ -546,7 +555,7 @@ async function extractForSlugs(
 }
 
 async function extractLinksFromDir(
-  engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean,
+  engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean, sourceId?: string,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
   const allSlugs = new Set(files.map(f => f.relPath.replace('.md', '')));
@@ -563,6 +572,9 @@ async function extractLinksFromDir(
 
   let created = 0;
   const batch: LinkBatchInput[] = [];
+  const sourceOpts = sourceId
+    ? { from_source_id: sourceId, to_source_id: sourceId, origin_source_id: sourceId }
+    : undefined;
   async function flush() {
     if (batch.length === 0) return;
     try {
@@ -591,7 +603,7 @@ async function extractLinksFromDir(
           if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
           created++;
         } else {
-          batch.push(link);
+          batch.push({ ...link, ...sourceOpts });
           if (batch.length >= BATCH_SIZE) await flush();
         }
       }
@@ -609,7 +621,7 @@ async function extractLinksFromDir(
 }
 
 async function extractTimelineFromDir(
-  engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean,
+  engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean, sourceId?: string,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
 
@@ -649,7 +661,7 @@ async function extractTimelineFromDir(
           if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
           created++;
         } else {
-          batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+          batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail, source_id: sourceId });
           if (batch.length >= BATCH_SIZE) await flush();
         }
       }
@@ -668,9 +680,12 @@ async function extractTimelineFromDir(
 
 // --- Sync integration hooks ---
 
-export async function extractLinksForSlugs(engine: BrainEngine, repoPath: string, slugs: string[]): Promise<number> {
+export async function extractLinksForSlugs(engine: BrainEngine, repoPath: string, slugs: string[], sourceId?: string): Promise<number> {
   const allFiles = walkMarkdownFiles(repoPath);
   const allSlugs = new Set(allFiles.map(f => f.relPath.replace('.md', '')));
+  const sourceOpts = sourceId
+    ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
+    : undefined;
   let created = 0;
   for (const slug of slugs) {
     const filePath = join(repoPath, slug + '.md');
@@ -678,14 +693,14 @@ export async function extractLinksForSlugs(engine: BrainEngine, repoPath: string
     try {
       const content = readFileSync(filePath, 'utf-8');
       for (const link of await extractLinksFromFile(content, slug + '.md', allSlugs)) {
-        try { await engine.addLink(link.from_slug, link.to_slug, link.context, link.link_type); created++; } catch { /* skip */ }
+        try { await engine.addLink(link.from_slug, link.to_slug, link.context, link.link_type, undefined, undefined, undefined, sourceOpts); created++; } catch { /* skip */ }
       }
     } catch { /* skip */ }
   }
   return created;
 }
 
-export async function extractTimelineForSlugs(engine: BrainEngine, repoPath: string, slugs: string[]): Promise<number> {
+export async function extractTimelineForSlugs(engine: BrainEngine, repoPath: string, slugs: string[], sourceId?: string): Promise<number> {
   let created = 0;
   for (const slug of slugs) {
     const filePath = join(repoPath, slug + '.md');
@@ -693,7 +708,7 @@ export async function extractTimelineForSlugs(engine: BrainEngine, repoPath: str
     try {
       const content = readFileSync(filePath, 'utf-8');
       for (const entry of extractTimelineFromContent(content, slug)) {
-        try { await engine.addTimelineEntry(entry.slug, { date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail }); created++; } catch { /* skip */ }
+        try { await engine.addTimelineEntry(entry.slug, { date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail }, { sourceId }); created++; } catch { /* skip */ }
       }
     } catch { /* skip */ }
   }
@@ -713,9 +728,10 @@ async function extractLinksFromDB(
   jsonMode: boolean,
   typeFilter: PageType | undefined,
   since: string | undefined,
-  opts?: { includeFrontmatter?: boolean },
+  opts?: { includeFrontmatter?: boolean; sourceId?: string },
 ): Promise<{ created: number; pages: number; unresolved: UnresolvedFrontmatterRef[] }> {
   const includeFrontmatter = opts?.includeFrontmatter ?? false;
+  const sourceId = opts?.sourceId;
   // Batch resolver: pg_trgm + exact only, NO search fallback. Dodges the
   // N-thousand API call trap on 46K-page brains. Resolver has a per-run
   // cache so duplicate names (same person appearing on many pages) resolve
@@ -725,12 +741,15 @@ async function extractLinksFromDB(
   const nullResolver = {
     resolve: async () => null as string | null,
   };
-  const allSlugs = await engine.getAllSlugs();
-  const slugList = Array.from(allSlugs);
+  const pages = await engine.listPages({
+    sourceId: sourceId ?? '__all__',
+    limit: 100000,
+  });
+  const allSlugs = new Set(pages.map((p) => p.slug));
   let processed = 0, created = 0;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
-  progress.start('extract.links_db', slugList.length);
+  progress.start('extract.links_db', pages.length);
 
   // Dedup in dry-run only — DB enforces uniqueness via ON CONFLICT in batch writes.
   const dryRunSeen = dryRun ? new Set<string>() : null;
@@ -752,10 +771,9 @@ async function extractLinksFromDB(
     }
   }
 
-  for (let i = 0; i < slugList.length; i++) {
-    const slug = slugList[i];
-    const page = await engine.getPage(slug);
-    if (!page) continue;
+  for (let i = 0; i < pages.length; i++) {
+    const page = pages[i];
+    const slug = page.slug;
     if (typeFilter && page.type !== typeFilter) continue;
     if (since) {
       const updatedMs = new Date(page.updated_at).getTime();
@@ -794,6 +812,7 @@ async function extractLinksFromDB(
         }
         created++;
       } else {
+        const pageSourceId = page.source_id ?? 'default';
         batch.push({
           from_slug: fromSlug,
           to_slug: c.targetSlug,
@@ -802,6 +821,9 @@ async function extractLinksFromDB(
           link_source: c.linkSource,
           origin_slug: c.originSlug,
           origin_field: c.originField,
+          from_source_id: pageSourceId,
+          to_source_id: pageSourceId,
+          origin_source_id: pageSourceId,
         });
         if (batch.length >= BATCH_SIZE) await flush();
       }
@@ -839,13 +861,16 @@ async function extractTimelineFromDB(
   jsonMode: boolean,
   typeFilter: PageType | undefined,
   since: string | undefined,
+  sourceId?: string,
 ): Promise<{ created: number; pages: number }> {
-  const allSlugs = await engine.getAllSlugs();
-  const slugList = Array.from(allSlugs);
+  const pages = await engine.listPages({
+    sourceId: sourceId ?? '__all__',
+    limit: 100000,
+  });
   let processed = 0, created = 0;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
-  progress.start('extract.timeline_db', slugList.length);
+  progress.start('extract.timeline_db', pages.length);
 
   // Dedup in dry-run only — DB enforces uniqueness via ON CONFLICT in batch writes.
   const dryRunSeen = dryRun ? new Set<string>() : null;
@@ -867,10 +892,9 @@ async function extractTimelineFromDB(
     }
   }
 
-  for (let i = 0; i < slugList.length; i++) {
-    const slug = slugList[i];
-    const page = await engine.getPage(slug);
-    if (!page) continue;
+  for (let i = 0; i < pages.length; i++) {
+    const page = pages[i];
+    const slug = page.slug;
     if (typeFilter && page.type !== typeFilter) continue;
     if (since) {
       const updatedMs = new Date(page.updated_at).getTime();
@@ -896,7 +920,7 @@ async function extractTimelineFromDB(
         }
         created++;
       } else {
-        batch.push({ slug, date: entry.date, summary: entry.summary, detail: entry.detail || '' });
+        batch.push({ slug, date: entry.date, summary: entry.summary, detail: entry.detail || '', source_id: page.source_id ?? 'default' });
         if (batch.length >= BATCH_SIZE) await flush();
       }
     }

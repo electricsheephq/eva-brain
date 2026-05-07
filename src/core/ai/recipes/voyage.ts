@@ -16,11 +16,24 @@ export const voyage: Recipe = {
   },
   touchpoints: {
     embedding: {
-      // Voyage 4/3.5/code models support output_dimension values including 2048.
-      models: ['voyage-4-large', 'voyage-4', 'voyage-4-lite', 'voyage-code-3', 'voyage-3.5', 'voyage-3.5-lite', 'voyage-3-large', 'voyage-3'],
+      // Eva defaults to 2048d for technical workspaces; callers can still
+      // choose lower Voyage output dimensions explicitly.
+      models: [
+        'voyage-4-large', 'voyage-4', 'voyage-4-lite', 'voyage-4-nano',
+        'voyage-3.5', 'voyage-3-large', 'voyage-3', 'voyage-3-lite',
+        'voyage-code-3', 'voyage-finance-2', 'voyage-law-2',
+      ],
       default_dims: 2048,
       cost_per_1m_tokens_usd: 0.18,
-      price_last_verified: '2026-05-05',
+      price_last_verified: '2026-04-20',
+      // Voyage enforces 120K tokens per batch. Voyage's tokenizer runs
+      // ~3-4× denser than OpenAI tiktoken on mixed content (code/JSON/CJK),
+      // so the per-recipe pre-split uses 1 char ≈ 1 token at 0.5 utilization
+      // (60K char budget). Recursive halving in the gateway is the runtime
+      // safety net when dense payloads still overshoot.
+      max_batch_tokens: 120_000,
+      chars_per_token: 1,
+      safety_factor: 0.5,
     },
   },
   setup_hint: 'Get an API key at https://dash.voyageai.com/api-keys, then `export VOYAGE_API_KEY=...`',

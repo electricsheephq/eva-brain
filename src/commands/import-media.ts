@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { existsSync, readFileSync, statSync, mkdtempSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, statSync, mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { basename, extname, join } from 'path';
 import { tmpdir } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
@@ -28,7 +28,7 @@ function defaultMediaSlug(filename: string): string {
   return `media/evidence/${stem}`;
 }
 
-const MAX_OPENCLAW_IMAGE_BYTES = 10_000_000;
+const MAX_OPENCLAW_IMAGE_BYTES = 8_000_000;
 
 function defaultContent(title: string, evidence: MediaEvidence): string {
   const fmType = evidence.kind === 'pdf' ? 'media' : 'media';
@@ -240,8 +240,13 @@ export async function runImportMedia(engine: BrainEngine, args: string[]) {
   }, null, 2));
 }
 
-async function resolveIngestExtractionFile(mediaFile: string, extractionFile: string, kindHint: string | undefined, title: string | undefined): Promise<string> {
-  if (extractionFile !== 'openclaw') return extractionFile;
+async function resolveIngestExtractionFile(
+  mediaFile: string,
+  extractionFile: string,
+  kindHint: string | undefined,
+  title: string | undefined,
+): Promise<{ extractionFile: string; cleanupDir?: string }> {
+  if (extractionFile !== 'openclaw') return { extractionFile };
 
   const client = createConfiguredCodexExtractionClient();
   if (!client) {
@@ -275,7 +280,7 @@ async function resolveIngestExtractionFile(mediaFile: string, extractionFile: st
   const dir = mkdtempSync(join(tmpdir(), 'gbrain-codex-extraction-'));
   const out = join(dir, 'extraction.json');
   writeFileSync(out, JSON.stringify(extraction, null, 2) + '\n');
-  return out;
+  return { extractionFile: out, cleanupDir: dir };
 }
 
 function inferOpenClawExtractionKind(mediaFile: string, mimeType: string | null, kindHint: string | undefined): MediaExtractionKind {
@@ -331,18 +336,24 @@ export async function runIngestMedia(engine: BrainEngine, args: string[]) {
     process.exit(1);
   }
 
-  const resolvedExtractionFile = await resolveIngestExtractionFile(mediaFile, extractionFile, type, title);
+  const resolved = await resolveIngestExtractionFile(mediaFile, extractionFile, type, title);
 
-  await runImportMedia(engine, [
-    '--slug', slug || defaultMediaSlug(mediaFile),
-    '--extraction', resolvedExtractionFile,
-    ...(contentFile ? ['--content-file', contentFile] : []),
-    '--media-file', mediaFile,
-    '--raw-data-source', 'gbrain.media-evidence.v1',
-    ...(title ? ['--title', title] : []),
-    ...(source ? ['--source', source] : []),
-    ...(type ? ['--type', type] : []),
-    ...(noFile ? ['--no-file'] : []),
-    ...(noEmbed ? ['--no-embed'] : []),
-  ]);
+  try {
+    await runImportMedia(engine, [
+      '--slug', slug || defaultMediaSlug(mediaFile),
+      '--extraction', resolved.extractionFile,
+      ...(contentFile ? ['--content-file', contentFile] : []),
+      '--media-file', mediaFile,
+      '--raw-data-source', 'gbrain.media-evidence.v1',
+      ...(title ? ['--title', title] : []),
+      ...(source ? ['--source', source] : []),
+      ...(type ? ['--type', type] : []),
+      ...(noFile ? ['--no-file'] : []),
+      ...(noEmbed ? ['--no-embed'] : []),
+    ]);
+  } finally {
+    if (resolved.cleanupDir) {
+      rmSync(resolved.cleanupDir, { recursive: true, force: true });
+    }
+  }
 }

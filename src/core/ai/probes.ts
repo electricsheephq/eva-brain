@@ -41,12 +41,12 @@ export async function probeOpenAICompat(baseUrl: string, timeoutMs: number = 100
   }
 }
 
-export async function probeOllama(): Promise<ProbeResult> {
-  const url = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434/v1';
+export async function probeOllama(env: Record<string, string | undefined> = process.env): Promise<ProbeResult> {
+  const url = env.OLLAMA_BASE_URL ?? 'http://localhost:11434/v1';
   return probeOpenAICompat(url);
 }
 
-export async function probeLMStudio(): Promise<ProbeResult> {
-  const url = process.env.LMSTUDIO_BASE_URL ?? 'http://localhost:1234/v1';
+export async function probeLMStudio(env: Record<string, string | undefined> = process.env): Promise<ProbeResult> {
+  const url = env.LMSTUDIO_BASE_URL ?? 'http://localhost:1234/v1';
   return probeOpenAICompat(url);
 }

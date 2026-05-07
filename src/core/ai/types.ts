@@ -29,6 +29,30 @@ export interface EmbeddingTouchpoint {
   dims_options?: number[]; // for Matryoshka-aware providers
   cost_per_1m_tokens_usd?: number;
   price_last_verified?: string; // ISO date
+  /**
+   * Maximum tokens per batch for this provider's embedding endpoint.
+   * When set, the gateway pre-splits batches at
+   * `max_batch_tokens × safety_factor / chars_per_token` characters and
+   * recursively halves on token-limit errors at runtime. When unset, the
+   * gateway makes a single embedMany() call with no safety net (OpenAI fast
+   * path).
+   */
+  max_batch_tokens?: number;
+  /**
+   * Expected character density for this provider's tokenizer (chars per
+   * token). OpenAI tiktoken averages ~4 on English text; Voyage averages
+   * ~1 on mixed content (code/JSON/CJK). Defaults to 4 if omitted.
+   * Only consulted when `max_batch_tokens` is also set.
+   */
+  chars_per_token?: number;
+  /**
+   * Budget-utilization ceiling in (0, 1]. The gateway pre-splits at
+   * `safety_factor × max_batch_tokens` to leave headroom for tokenizer
+   * variance. Defaults to 0.8. Voyage-style providers with dense payloads
+   * should pin this lower (e.g. 0.5). Only consulted when
+   * `max_batch_tokens` is also set.
+   */
+  safety_factor?: number;
 }
 
 export interface ExpansionTouchpoint {

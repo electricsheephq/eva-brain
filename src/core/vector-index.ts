@@ -6,7 +6,7 @@ const CHUNK_EMBEDDING_HNSW_INDEX =
 export function chunkEmbeddingIndexSql(dims: number): string {
   if (dims <= PGVECTOR_HNSW_VECTOR_MAX_DIMS) return CHUNK_EMBEDDING_HNSW_INDEX;
   return [
-    '-- idx_chunks_embedding skipped: pgvector hnsw vector indexes support',
+    '-- idx_chunks_embedding skipped: pgvector HNSW vector indexes support',
     `-- at most ${PGVECTOR_HNSW_VECTOR_MAX_DIMS} dimensions; exact vector scans remain available.`,
   ].join('\n');
 }

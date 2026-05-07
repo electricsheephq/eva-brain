@@ -77,7 +77,10 @@ export async function runReconcileLinks(
   // so filter at call time via page_kind. Not using getAllSlugs because we
   // also need compiled_truth + timeline for extractCodeRefs.
   const mdSlugs = (await engine.executeRaw<{ slug: string }>(
-    `SELECT slug FROM pages WHERE page_kind = 'markdown' ORDER BY slug`,
+    opts.sourceId
+      ? `SELECT slug FROM pages WHERE page_kind = 'markdown' AND source_id = $1 ORDER BY slug`
+      : `SELECT slug FROM pages WHERE page_kind = 'markdown' ORDER BY slug`,
+    opts.sourceId ? [opts.sourceId] : undefined,
   )).map(r => r.slug);
 
   progress.start('reconcile_links.scan', mdSlugs.length);
@@ -90,7 +93,7 @@ export async function runReconcileLinks(
   // On a 47K-page brain this is the slow path; a v0.20.x follow-up can add
   // getPagesBatch. For the typical 2K–5K markdown count it's fine.
   for (const mdSlug of mdSlugs) {
-    const page = await engine.getPage(mdSlug);
+    const page = await engine.getPage(mdSlug, opts.sourceId ? { sourceId: opts.sourceId } : undefined);
     if (!page) {
       progress.tick(1, mdSlug);
       continue;
@@ -111,12 +114,15 @@ export async function runReconcileLinks(
     for (const ref of refs) {
       const codeSlug = slugifyCodePath(ref.path);
       const ctx = ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path;
+      const linkSourceOpts = opts.sourceId
+        ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
+        : undefined;
       edgesAttempted++;
       try {
         // Forward: guide documents code. addLink's inner SELECT drops
         // silently if codeSlug isn't a page yet (benign — counted below).
-        await engine.addLink(mdSlug, codeSlug, ctx, 'documents', 'markdown', mdSlug, 'compiled_truth');
-        await engine.addLink(codeSlug, mdSlug, ref.path, 'documented_by', 'markdown', mdSlug, 'compiled_truth');
+        await engine.addLink(mdSlug, codeSlug, ctx, 'documents', 'markdown', mdSlug, 'compiled_truth', linkSourceOpts);
+        await engine.addLink(codeSlug, mdSlug, ref.path, 'documented_by', 'markdown', mdSlug, 'compiled_truth', linkSourceOpts);
       } catch (e: unknown) {
         // Per-link errors don't abort the batch. Track them for the summary.
         const msg = e instanceof Error ? e.message : String(e);

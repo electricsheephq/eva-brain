@@ -618,6 +618,51 @@ describe('PGLiteEngine: batch ops source-awareness (v0.18.0)', () => {
     expect(rows[0].to_src).toBe('alt');
   });
 
+  test('addLink with explicit source ids does NOT fan out across duplicate slugs', async () => {
+    await engine.addLink(
+      'topics/ai',
+      'topics/ml',
+      'alt mention',
+      'mention',
+      'markdown',
+      undefined,
+      undefined,
+      { fromSourceId: 'alt', toSourceId: 'alt' },
+    );
+    const db = (engine as any).db;
+    const { rows } = await db.query(
+      `SELECT f.source_id AS from_src, t.source_id AS to_src, l.context
+       FROM links l
+       JOIN pages f ON f.id = l.from_page_id
+       JOIN pages t ON t.id = l.to_page_id`
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].from_src).toBe('alt');
+    expect(rows[0].to_src).toBe('alt');
+    expect(rows[0].context).toBe('alt mention');
+  });
+
+  test('removeLink with explicit source ids removes only that source pair', async () => {
+    await engine.addLinksBatch([
+      { from_slug: 'topics/ai', to_slug: 'topics/ml', link_type: 'mention' },
+      { from_slug: 'topics/ai', to_slug: 'topics/ml', link_type: 'mention', from_source_id: 'alt', to_source_id: 'alt' },
+    ]);
+    await engine.removeLink('topics/ai', 'topics/ml', 'mention', undefined, {
+      fromSourceId: 'alt',
+      toSourceId: 'alt',
+    });
+    const db = (engine as any).db;
+    const { rows } = await db.query(
+      `SELECT f.source_id AS from_src, t.source_id AS to_src
+       FROM links l
+       JOIN pages f ON f.id = l.from_page_id
+       JOIN pages t ON t.id = l.to_page_id`
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].from_src).toBe('default');
+    expect(rows[0].to_src).toBe('default');
+  });
+
   test('addTimelineEntriesBatch default source_id does NOT fan out across sources', async () => {
     const inserted = await engine.addTimelineEntriesBatch([
       { slug: 'topics/ai', date: '2024-01-15', summary: 'Founded' },
@@ -645,6 +690,21 @@ describe('PGLiteEngine: batch ops source-awareness (v0.18.0)', () => {
     );
     expect(rows.length).toBe(1);
     expect(rows[0].source_id).toBe('alt');
+  });
+
+  test('addTimelineEntry with explicit source id lands in that source only', async () => {
+    await engine.addTimelineEntry('topics/ai', {
+      date: '2024-01-16',
+      summary: 'Alt only event',
+    }, { sourceId: 'alt' });
+    const db = (engine as any).db;
+    const { rows } = await db.query(
+      `SELECT p.source_id, te.summary FROM timeline_entries te
+       JOIN pages p ON p.id = te.page_id`
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].source_id).toBe('alt');
+    expect(rows[0].summary).toBe('Alt only event');
   });
 });
 

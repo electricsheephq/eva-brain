@@ -129,6 +129,32 @@ describe('gbrain extract links --source fs', () => {
     const links = await engine.getLinks('companies/acme');
     expect(links.length).toBe(0);
   });
+
+  test('--source-id writes links to the selected source when slugs overlap', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('kb-fs', 'kb-fs') ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage('topics/a', { type: 'concept', title: 'A default', compiled_truth: '', timeline: '' });
+    await engine.putPage('topics/b', { type: 'concept', title: 'B default', compiled_truth: '', timeline: '' });
+    await engine.putPage('topics/a', { type: 'concept', title: 'A kb', compiled_truth: '', timeline: '' }, { sourceId: 'kb-fs' });
+    await engine.putPage('topics/b', { type: 'concept', title: 'B kb', compiled_truth: '', timeline: '' }, { sourceId: 'kb-fs' });
+
+    writeFile('topics/a.md', '[B](b.md)\n');
+    writeFile('topics/b.md', '# B\n');
+
+    await runExtract(engine, ['links', '--dir', brainDir, '--source-id', 'kb-fs']);
+
+    const rows = await engine.executeRaw<{ from_src: string; to_src: string }>(
+      `SELECT f.source_id AS from_src, t.source_id AS to_src
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.slug = $1 AND t.slug = $2`,
+      ['topics/a', 'topics/b'],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual({ from_src: 'kb-fs', to_src: 'kb-fs' });
+  });
 });
 
 describe('gbrain extract timeline --source fs', () => {
@@ -157,5 +183,28 @@ title: Alice
     expect(after2.length).toBe(2);
 
     expect(elapsedMs).toBeLessThan(2000);
+  });
+
+  test('--source-id writes timeline entries to the selected source when slugs overlap', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('kb-fs-time', 'kb-fs-time') ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage('people/source-timeline', personPage('Default'));
+    await engine.putPage('people/source-timeline', personPage('KB'), { sourceId: 'kb-fs-time' });
+
+    writeFile('people/source-timeline.md', `
+- **2024-01-15** | source — Source-scoped event
+`);
+
+    await runExtract(engine, ['timeline', '--dir', brainDir, '--source-id', 'kb-fs-time']);
+
+    const rows = await engine.executeRaw<{ source_id: string; summary: string }>(
+      `SELECT p.source_id, te.summary
+         FROM timeline_entries te
+         JOIN pages p ON p.id = te.page_id
+        WHERE p.slug = $1`,
+      ['people/source-timeline'],
+    );
+    expect(rows).toEqual([{ source_id: 'kb-fs-time', summary: 'Source-scoped event' }]);
   });
 });
