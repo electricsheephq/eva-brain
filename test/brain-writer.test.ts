@@ -93,14 +93,18 @@ describe('writeBrainPage', () => {
     }
   });
 
-  test('writes .bak before mutating an existing file', () => {
+  test('writes centralized backup before mutating an existing file', () => {
     const file = join(tmp, 'people', 'jane.md');
     mkdirSync(join(tmp, 'people'), { recursive: true });
     const original = `${fence}\ntype: person\ntitle: Old\n${fence}\n\nold`;
     writeFileSync(file, original);
-    writeBrainPage(file, `${fence}\ntype: person\ntitle: New\n${fence}\n\nnew`, { sourcePath: tmp });
-    expect(existsSync(file + '.bak')).toBe(true);
-    expect(readFileSync(file + '.bak', 'utf8')).toBe(original);
+    const { backupPath } = writeBrainPage(file, `${fence}\ntype: person\ntitle: New\n${fence}\n\nnew`, {
+      sourcePath: tmp,
+      backupRoot: join(tmp, 'backups'),
+    });
+    expect(existsSync(file + '.bak')).toBe(false);
+    expect(backupPath).toBeTruthy();
+    expect(readFileSync(backupPath!, 'utf8')).toBe(original);
   });
 
   test('autoFix: true repairs nested quotes before writing', () => {
@@ -172,6 +176,28 @@ describe('scanBrainSources (PGLite)', () => {
     const beta = report.per_source.find(s => s.source_id === 'beta')!;
     expect(alpha.errors_by_code.NULL_BYTES).toBeGreaterThanOrEqual(1);
     expect(beta.errors_by_code.NESTED_QUOTES).toBeGreaterThanOrEqual(1);
+  });
+
+  test('ignores missing frontmatter by default because bare markdown is valid input', async () => {
+    mkdirSync(join(tmp, 'docs'), { recursive: true });
+    writeFileSync(join(tmp, 'docs', 'plain.md'), '# Plain\n\nNo YAML frontmatter.');
+    await registerSource('docs', tmp);
+
+    const report = await scanBrainSources(engine);
+    expect(report.ok).toBe(true);
+    expect(report.total).toBe(0);
+    expect(report.ignored_missing_open).toBe(1);
+    expect(report.per_source[0]!.ignoredMissingOpen).toBe(1);
+  });
+
+  test('strictMissingOpen reports missing frontmatter for curated page repos', async () => {
+    mkdirSync(join(tmp, 'docs'), { recursive: true });
+    writeFileSync(join(tmp, 'docs', 'plain.md'), '# Plain\n\nNo YAML frontmatter.');
+    await registerSource('docs', tmp);
+
+    const report = await scanBrainSources(engine, { strictMissingOpen: true });
+    expect(report.ok).toBe(false);
+    expect(report.errors_by_code.MISSING_OPEN).toBe(1);
   });
 
   test('respects sourceId filter', async () => {

@@ -25,7 +25,7 @@ mutating: true
 
 This skill guarantees:
 - Every brain page is scanned against the seven canonical frontmatter validation classes
-- Mechanical errors (nested quotes, missing closing `---`, null bytes, slug mismatch) are auto-repairable on demand with `.bak` backups
+- Mechanical errors (nested quotes, missing closing `---`, null bytes, slug mismatch) are auto-repairable on demand with centralized backups under `~/.gbrain/backups/frontmatter/`
 - Validation logic is shared with `gbrain doctor`'s `frontmatter_integrity` subcheck — single source of truth
 - Reports per source (gbrain is multi-source since v0.18.0); never silently audits the wrong root
 
@@ -88,7 +88,7 @@ When issues are found:
 gbrain frontmatter validate <path> --fix
 ```
 
-`--fix` writes `<file>.bak` for every modified file before mutating. The backup is the safety contract — works whether the brain is a git repo or a plain directory.
+`--fix` writes a backup under `~/.gbrain/backups/frontmatter/` for every modified file before mutating. The backup is the safety contract — works whether the brain is a git repo or a plain directory, without filling the source tree with adjacent `.bak` files.
 
 `--dry-run` previews without writing. Use this before applying fixes in batch.
 
@@ -173,7 +173,7 @@ JSON envelope (when `--json` is passed):
 
 **Don't use `--fix` to "make doctor green" without reading the audit first.** SLUG_MISMATCH cases are surfaced for manual review specifically because gbrain derives the slug from path. A mismatch usually means the user renamed a file intentionally; auto-removing the slug field is the right outcome only when you've confirmed the rename was deliberate.
 
-**Don't skip the `.bak` backups.** The `.bak` is the safety contract for non-git brain repos. If `.bak` files accumulate after a fix run, that's a feature, not a bug — the user can review the diffs and delete the backups when satisfied.
+**Don't skip backups.** The centralized backup is the safety contract for non-git brain repos. If backups accumulate after a fix run, review them under `~/.gbrain/backups/frontmatter/` and archive/remove them when satisfied; they should not appear beside the user's source files.
 
 **Don't run `audit` on a brain where sources aren't registered.** The CLI returns "no registered sources to audit" gracefully, but the migration emits a `skipped: no_sources` phase result. Don't paper over this with a manual path-walk; the right fix is to register the source via `gbrain sources add`.
 
