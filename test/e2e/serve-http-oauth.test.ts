@@ -27,6 +27,7 @@ const BASE = `http://localhost:${PORT}`;
 
 describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
   let serverProcess: ReturnType<typeof import('child_process').spawn> | null = null;
+  let serverStderr = '';
   let clientId: string | undefined;
   let clientSecret: string | undefined;
   // DCR-registered clients accumulate here so afterAll can revoke them too
@@ -75,9 +76,9 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    // Collect stderr for debugging failures
-    let stderr = '';
-    serverProcess.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+    // Collect stderr for debugging failures and admin-token E2E probes.
+    serverStderr = '';
+    serverProcess.stderr?.on('data', (d: Buffer) => { serverStderr += d.toString(); });
 
     // Wait for server to be ready (up to 15s)
     let ready = false;
@@ -88,7 +89,7 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
       } catch {}
       await new Promise(r => setTimeout(r, 500));
     }
-    if (!ready) throw new Error('Server failed to start within 15s.\nstderr: ' + stderr.slice(-500));
+    if (!ready) throw new Error('Server failed to start within 15s.\nstderr: ' + serverStderr.slice(-500));
   }, 30_000);
 
   afterAll(async () => {
@@ -330,8 +331,7 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     // Same magic-link cookie dance the existing single-use test uses.
     // Skip gracefully if the bootstrap token isn't extractable — the 401
     // case above pins the auth gate; this test pins the happy path.
-    const stderrBuf = (serverProcess as any)?._stderrBuffer || '';
-    const tokenMatch = String(stderrBuf).match(/Admin Token[\s\S]*?([a-f0-9]{32,64})/);
+    const tokenMatch = serverStderr.match(/Admin Token[\s\S]*?([a-f0-9]{32,64})/);
     if (!tokenMatch) {
       console.warn('[e2e] skipped /admin/api/full-stats happy path: could not extract bootstrap token');
       return;
@@ -723,8 +723,7 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     // spawn handle. The spawn already started so stderr has flushed.
     // Skip if we can't extract — the test is best-effort coverage of the
     // single-use semantic; the styled-401 test above covers the negative path.
-    const stderrBuf = (serverProcess as any)?._stderrBuffer || '';
-    const tokenMatch = String(stderrBuf).match(/Admin Token[\s\S]*?([a-f0-9]{32,64})/);
+    const tokenMatch = serverStderr.match(/Admin Token[\s\S]*?([a-f0-9]{32,64})/);
     if (!tokenMatch) {
       // No way to get the bootstrap token in this test fixture — skip gracefully.
       // The unit-level coverage for nonce single-use is in oauth.test.ts and
