@@ -114,11 +114,22 @@ function unquoteEnvValue(value) {
 
 function commandEnv(config) {
   const fileEnv = readEnvFile(config.envFile);
+  const bunBin = join(homedir(), ".bun", "bin");
+  const basePath = fileEnv.PATH ?? process.env.PATH ?? "";
   return {
     ...process.env,
     ...fileEnv,
-    PATH: fileEnv.PATH ?? process.env.PATH ?? "",
+    BUN_INSTALL: fileEnv.BUN_INSTALL ?? process.env.BUN_INSTALL ?? join(homedir(), ".bun"),
+    PATH: prependPathEntry(basePath, bunBin),
   };
+}
+
+function prependPathEntry(pathValue, entry) {
+  const parts = String(pathValue || "")
+    .split(":")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return [entry, ...parts.filter((part) => part !== entry)].join(":");
 }
 
 function runCommand(command, args, config, options = {}) {

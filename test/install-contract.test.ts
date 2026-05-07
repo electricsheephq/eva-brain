@@ -77,4 +77,17 @@ describe('Eva Brain install contract', () => {
     expect(plugin).toContain('resolved.slice("openai-codex/".length).trim() === ""');
     expect(plugin).toContain('invalid_model');
   });
+
+  test('OpenClaw plugin keeps source-linked Bun CLI usable under LaunchAgents', () => {
+    const plugin = readFileSync(join(root, 'plugins/openclaw-gbrain/index.js'), 'utf8');
+    const readme = readFileSync(join(root, 'plugins/openclaw-gbrain/README.md'), 'utf8');
+
+    expect(plugin).toContain('join(homedir(), ".bun", "bin")');
+    expect(plugin).toContain('prependPathEntry(basePath, bunBin)');
+    expect(plugin).toContain('BUN_INSTALL');
+    expect(readme).toContain('LaunchAgents often start with a minimal PATH');
+    expect(readme).toContain('Use the source-linked CLI from');
+    expect(readme).toContain('Do not point `gbrainBin` at a');
+    expect(readme).toContain("PGLite's `pglite.data`");
+  });
 });

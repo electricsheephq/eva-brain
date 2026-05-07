@@ -79,6 +79,12 @@ not returned by tools or the extraction route, so provider keys such as
 `VOYAGE_API_KEY` can live in the normal GBrain env file without being copied into
 OpenClaw's global launch environment.
 
+The plugin prepends `$HOME/.bun/bin` to spawned command PATH because macOS
+LaunchAgents often start with a minimal PATH. Use the source-linked CLI from
+`bun link` for PGLite installs. Do not point `gbrainBin` at a
+`bun build --compile` binary for local PGLite brains; compiled Bun binaries do
+not bundle PGLite's `pglite.data` runtime asset.
+
 Extraction is intentionally conservative by default: one active extraction at a
 time, up to eight queued requests, and a 30s queue wait. Increase those values
 only after the local OpenClaw/Codex runtime is proven to tolerate the extra load.
