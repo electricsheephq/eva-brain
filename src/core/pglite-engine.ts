@@ -882,12 +882,12 @@ export class PGLiteEngine implements BrainEngine {
 
   async listStaleChunks(): Promise<StaleChunkRow[]> {
     const { rows } = await this.db.query(
-      `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+      `SELECT p.source_id, p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
               cc.model, cc.token_count
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
         WHERE cc.embedding IS NULL
-        ORDER BY p.id, cc.chunk_index
+        ORDER BY p.source_id, p.id, cc.chunk_index
         LIMIT 100000`,
     );
     return rows as unknown as StaleChunkRow[];
