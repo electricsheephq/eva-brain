@@ -760,9 +760,10 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
   // 11a. Frontmatter integrity (v0.22.4).
   // scanBrainSources walks every registered source's local_path on disk
   // (not from the DB), invoking parseMarkdown(..., {validate:true}) per
-  // file. Reports per-source counts grouped by error code. The fix path is
-  // `gbrain frontmatter validate <source-path> --fix`, which writes .bak
-  // backups so it works for both git and non-git brain repos.
+  // file. Reports malformed frontmatter counts grouped by error code. Missing
+  // frontmatter is ignored here by default because plain Markdown is valid
+  // input; use `gbrain frontmatter generate` only when you want intentional
+  // metadata, not to silence doctor.
   progress.heartbeat('frontmatter_integrity');
   const fmHb = startHeartbeat(progress, 'scanning frontmatter…');
   try {
@@ -775,7 +776,8 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
         status: 'ok',
         message: sources === 0
           ? 'No registered sources to scan'
-          : `${sources} source(s) clean — no frontmatter issues`,
+          : `${sources} source(s) clean — no malformed frontmatter issues` +
+            (report.ignored_missing_open ? ` (${report.ignored_missing_open} file(s) without frontmatter ignored)` : ''),
       });
     } else {
       const sourceMessages: string[] = [];
@@ -790,7 +792,7 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
         name: 'frontmatter_integrity',
         status: 'warn',
         message:
-          `${report.total} frontmatter issue(s) across ${sourceMessages.length} source(s). ` +
+          `${report.total} malformed frontmatter issue(s) across ${sourceMessages.length} source(s). ` +
           `${sourceMessages.join('; ')}. Fix: gbrain frontmatter validate <source-path> --fix`,
       });
     }

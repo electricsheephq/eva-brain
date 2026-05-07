@@ -520,7 +520,10 @@ After `gbrain apply-migrations --yes` runs the v0.22.4 audit, your agent
 should read `~/.gbrain/migrations/pending-host-work.jsonl` (filter to
 `migration === "0.22.4"`) and walk each entry's `command` field. Each entry
 points to a per-source `gbrain frontmatter validate <source_path> --fix`
-command — surface counts to the user, get explicit consent, then run.
+command for malformed frontmatter — surface counts to the user, get explicit
+consent, then run. Missing frontmatter in otherwise valid Markdown is optional
+metadata coverage; do not add blanket `type: note` frontmatter just to clear an
+audit.
 
 The migration is **audit-only**. It never mutates brain content during
 `apply-migrations`. Your agent runs the fix command with user consent.
