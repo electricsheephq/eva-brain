@@ -6,7 +6,7 @@ import { homedir } from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-import { saveConfig, loadConfig, toEngineConfig, gbrainPath, type GBrainConfig } from '../core/config.ts';
+import { saveConfig, loadConfig, loadGbrainEnv, toEngineConfig, gbrainPath, type GBrainConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import { getRecipe } from '../core/ai/recipes/index.ts';
 import { configureGateway } from '../core/ai/gateway.ts';
@@ -177,7 +177,7 @@ function configureGatewayFromConfig(config: GBrainConfig): void {
     chat_fallback_chain: config.chat_fallback_chain,
     base_urls: config.provider_base_urls,
     provider_auth: config.provider_auth,
-    env: { ...process.env },
+    env: loadGbrainEnv(),
   });
 }
 

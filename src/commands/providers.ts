@@ -9,7 +9,7 @@ import { resolveProviderAuth, redactAuthResolution } from '../core/ai/auth.ts';
 import { listRecipes, getRecipe } from '../core/ai/recipes/index.ts';
 import { configureGateway, embedOne, isAvailable as gwIsAvailable, chat as gwChat } from '../core/ai/gateway.ts';
 import { probeOllama, probeLMStudio } from '../core/ai/probes.ts';
-import { loadConfig } from '../core/config.ts';
+import { loadConfig, loadGbrainEnv } from '../core/config.ts';
 import { AIConfigError, AITransientError } from '../core/ai/errors.ts';
 import type { AIGatewayConfig, AuthSourceClass, Recipe } from '../core/ai/types.ts';
 
@@ -36,7 +36,8 @@ interface ProviderOption {
 let gatewayConfig: AIGatewayConfig;
 
 function configureFromEnv(): void {
-  const config = loadConfig();
+  const env = loadGbrainEnv();
+  const config = loadConfig(env);
   gatewayConfig = {
     embedding_model: config?.embedding_model,
     embedding_dimensions: config?.embedding_dimensions,
@@ -45,7 +46,7 @@ function configureFromEnv(): void {
     chat_fallback_chain: config?.chat_fallback_chain,
     base_urls: config?.provider_base_urls,
     provider_auth: config?.provider_auth,
-    env: { ...process.env },
+    env,
   };
   configureGateway(gatewayConfig);
 }

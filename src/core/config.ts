@@ -76,7 +76,7 @@ export interface GBrainConfig {
  * Load config with credential precedence: env vars > config file.
  * Plugin config is handled by the plugin runtime injecting env vars.
  */
-export function loadConfig(): GBrainConfig | null {
+export function loadConfig(env: Record<string, string | undefined> = loadGbrainEnv()): GBrainConfig | null {
   let fileConfig: GBrainConfig | null = null;
   try {
     const raw = readFileSync(getConfigPath(), 'utf-8');
@@ -84,7 +84,7 @@ export function loadConfig(): GBrainConfig | null {
   } catch { /* no config file */ }
 
   // Try env vars
-  const dbUrl = process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL;
+  const dbUrl = env.GBRAIN_DATABASE_URL || env.DATABASE_URL;
 
   if (!fileConfig && !dbUrl) return null;
 
@@ -97,27 +97,27 @@ export function loadConfig(): GBrainConfig | null {
     ...fileConfig,
     engine: inferredEngine,
     ...(dbUrl ? { database_url: dbUrl } : {}),
-    ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
-    ...(process.env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: process.env.GBRAIN_EMBEDDING_MODEL } : {}),
+    ...(env.OPENAI_API_KEY ? { openai_api_key: env.OPENAI_API_KEY } : {}),
+    ...(env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: env.GBRAIN_EMBEDDING_MODEL } : {}),
     ...(() => {
-      const raw = process.env.GBRAIN_EMBEDDING_DIMENSIONS;
+      const raw = env.GBRAIN_EMBEDDING_DIMENSIONS;
       if (!raw) return {};
       const value = Number(raw);
       return Number.isInteger(value) && value > 0 ? { embedding_dimensions: value } : {};
     })(),
-    ...(process.env.GBRAIN_EXPANSION_MODEL ? { expansion_model: process.env.GBRAIN_EXPANSION_MODEL } : {}),
-    ...(process.env.GBRAIN_CHAT_MODEL ? { chat_model: process.env.GBRAIN_CHAT_MODEL } : {}),
-    ...(process.env.GBRAIN_CHAT_FALLBACK_CHAIN
-      ? { chat_fallback_chain: process.env.GBRAIN_CHAT_FALLBACK_CHAIN.split(',').map(s => s.trim()).filter(Boolean) }
+    ...(env.GBRAIN_EXPANSION_MODEL ? { expansion_model: env.GBRAIN_EXPANSION_MODEL } : {}),
+    ...(env.GBRAIN_CHAT_MODEL ? { chat_model: env.GBRAIN_CHAT_MODEL } : {}),
+    ...(env.GBRAIN_CHAT_FALLBACK_CHAIN
+      ? { chat_fallback_chain: env.GBRAIN_CHAT_FALLBACK_CHAIN.split(',').map(s => s.trim()).filter(Boolean) }
       : {}),
   };
-  if (process.env.GBRAIN_OPENAI_AUTH_SOURCE === 'openclaw-codex' || process.env.GBRAIN_OPENAI_AUTH_SOURCE === 'openclaw-openai') {
+  if (env.GBRAIN_OPENAI_AUTH_SOURCE === 'openclaw-codex' || env.GBRAIN_OPENAI_AUTH_SOURCE === 'openclaw-openai') {
     merged.provider_auth = {
       ...(merged.provider_auth ?? {}),
       openai: {
-        prefer: process.env.GBRAIN_OPENAI_AUTH_SOURCE,
-        ...(process.env.GBRAIN_OPENAI_AUTH_PROFILE ? { profile: process.env.GBRAIN_OPENAI_AUTH_PROFILE } : {}),
-        ...(process.env.GBRAIN_OPENCLAW_AUTH_PATH ? { openclawAuthPath: process.env.GBRAIN_OPENCLAW_AUTH_PATH } : {}),
+        prefer: env.GBRAIN_OPENAI_AUTH_SOURCE,
+        ...(env.GBRAIN_OPENAI_AUTH_PROFILE ? { profile: env.GBRAIN_OPENAI_AUTH_PROFILE } : {}),
+        ...(env.GBRAIN_OPENCLAW_AUTH_PATH ? { openclawAuthPath: env.GBRAIN_OPENCLAW_AUTH_PATH } : {}),
       },
     };
   }
@@ -163,6 +163,73 @@ export function configDir(): string {
 
 export function configPath(): string {
   return join(configDir(), 'config.json');
+}
+
+export function gbrainEnvPath(env: Record<string, string | undefined> = process.env): string {
+  return env.GBRAIN_ENV_FILE || env.GBRAIN_ENV_PATH || join(configDir(), 'gbrain.env');
+}
+
+function parseEnvValue(value: string): string {
+  const raw = value.trim();
+  if (!raw) return '';
+  const quote = raw[0];
+  if (quote !== "'" && quote !== '"') return stripInlineComment(raw);
+
+  let out = '';
+  for (let i = 1; i < raw.length; i += 1) {
+    const char = raw[i];
+    if (char === quote) return out;
+    if (quote === '"' && char === '\\' && i + 1 < raw.length) {
+      const next = raw[i + 1];
+      if (next === 'n') out += '\n';
+      else if (next === 'r') out += '\r';
+      else if (next === 't') out += '\t';
+      else out += next;
+      i += 1;
+      continue;
+    }
+    out += char;
+  }
+  return out;
+}
+
+function stripInlineComment(raw: string): string {
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw[i] !== '#') continue;
+    const prev = raw[i - 1];
+    if (prev === ' ' || prev === '\t') return raw.slice(0, i).trimEnd();
+  }
+  return raw.trimEnd();
+}
+
+export function parseGbrainEnv(content: string): Record<string, string> {
+  const parsed: Record<string, string> = {};
+  for (const rawLine of String(content || '').split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const assignment = line.replace(/^export\s+/u, '');
+    const idx = assignment.indexOf('=');
+    if (idx <= 0) continue;
+    const key = assignment.slice(0, idx).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key)) continue;
+    parsed[key] = parseEnvValue(assignment.slice(idx + 1));
+  }
+  return parsed;
+}
+
+export function loadGbrainEnv(env: Record<string, string | undefined> = process.env): Record<string, string | undefined> {
+  const merged: Record<string, string | undefined> = { ...env };
+  let parsed: Record<string, string>;
+  try {
+    parsed = parseGbrainEnv(readFileSync(gbrainEnvPath(env), 'utf-8'));
+  } catch {
+    return merged;
+  }
+  for (const [key, value] of Object.entries(parsed)) {
+    if (Object.hasOwn(merged, key)) continue;
+    merged[key] = value;
+  }
+  return merged;
 }
 
 /**

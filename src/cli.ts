@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { readFileSync } from 'fs';
-import { loadConfig, toEngineConfig } from './core/config.ts';
+import { loadConfig, loadGbrainEnv, toEngineConfig } from './core/config.ts';
 import type { BrainEngine } from './core/engine.ts';
 import { operations, OperationError } from './core/operations.ts';
 import type { Operation, OperationContext } from './core/operations.ts';
@@ -630,7 +630,8 @@ async function handleCliOnly(command: string, args: string[]) {
 }
 
 async function connectEngine(): Promise<BrainEngine> {
-  const config = loadConfig();
+  const env = loadGbrainEnv();
+  const config = loadConfig(env);
   if (!config) {
     console.error('No brain configured. Run: gbrain init');
     process.exit(1);
@@ -647,7 +648,7 @@ async function connectEngine(): Promise<BrainEngine> {
     chat_fallback_chain: config.chat_fallback_chain,
     base_urls: config.provider_base_urls,
     provider_auth: config.provider_auth,
-    env: { ...process.env },
+    env,
   });
 
   const { createEngine } = await import('./core/engine-factory.ts');

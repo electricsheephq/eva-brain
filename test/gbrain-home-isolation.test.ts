@@ -15,7 +15,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, existsSync, readdirSync, statSync, rmSync } from 'fs';
+import { mkdtempSync, existsSync, readdirSync, statSync, rmSync, mkdirSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -89,6 +89,61 @@ describe('GBRAIN_HOME write-side isolation', () => {
       expect(loaded?.database_path).toBe(cfg.database_path);
     } finally {
       process.env.GBRAIN_HOME = ORIG_GBRAIN_HOME;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('loadConfig reads local gbrain.env without mutating process env', async () => {
+    const tmp = fresh();
+    const saved = {
+      GBRAIN_HOME: process.env.GBRAIN_HOME,
+      VOYAGE_API_KEY: process.env.VOYAGE_API_KEY,
+      GBRAIN_EMBEDDING_MODEL: process.env.GBRAIN_EMBEDDING_MODEL,
+      GBRAIN_EMBEDDING_DIMENSIONS: process.env.GBRAIN_EMBEDDING_DIMENSIONS,
+    };
+    process.env.GBRAIN_HOME = tmp;
+    delete process.env.VOYAGE_API_KEY;
+    delete process.env.GBRAIN_EMBEDDING_MODEL;
+    delete process.env.GBRAIN_EMBEDDING_DIMENSIONS;
+    try {
+      const gbrainDir = join(tmp, '.gbrain');
+      mkdirSync(gbrainDir, { recursive: true });
+      writeFileSync(
+        join(gbrainDir, 'config.json'),
+        JSON.stringify({ engine: 'pglite', database_path: join(gbrainDir, 'brain.pglite') }) + '\n',
+      );
+      writeFileSync(
+        join(gbrainDir, 'gbrain.env'),
+        [
+          "# Local provider config",
+          "export VOYAGE_API_KEY='voyage-secret # kept'",
+          'GBRAIN_EMBEDDING_MODEL="voyage:voyage-4-large"',
+          'GBRAIN_EMBEDDING_DIMENSIONS=2048 # inline comment',
+          'BAD-NAME=ignored',
+          '',
+        ].join('\n'),
+      );
+
+      const { loadConfig, loadGbrainEnv } = await import('../src/core/config.ts');
+      const config = loadConfig();
+      const env = loadGbrainEnv();
+
+      expect(config?.embedding_model).toBe('voyage:voyage-4-large');
+      expect(config?.embedding_dimensions).toBe(2048);
+      expect(env.VOYAGE_API_KEY).toBe('voyage-secret # kept');
+      expect(env.GBRAIN_EMBEDDING_MODEL).toBe('voyage:voyage-4-large');
+      expect(env.GBRAIN_EMBEDDING_DIMENSIONS).toBe('2048');
+      expect(env['BAD-NAME']).toBeUndefined();
+      expect(process.env.VOYAGE_API_KEY).toBeUndefined();
+    } finally {
+      if (saved.GBRAIN_HOME === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = saved.GBRAIN_HOME;
+      if (saved.VOYAGE_API_KEY === undefined) delete process.env.VOYAGE_API_KEY;
+      else process.env.VOYAGE_API_KEY = saved.VOYAGE_API_KEY;
+      if (saved.GBRAIN_EMBEDDING_MODEL === undefined) delete process.env.GBRAIN_EMBEDDING_MODEL;
+      else process.env.GBRAIN_EMBEDDING_MODEL = saved.GBRAIN_EMBEDDING_MODEL;
+      if (saved.GBRAIN_EMBEDDING_DIMENSIONS === undefined) delete process.env.GBRAIN_EMBEDDING_DIMENSIONS;
+      else process.env.GBRAIN_EMBEDDING_DIMENSIONS = saved.GBRAIN_EMBEDDING_DIMENSIONS;
       rmSync(tmp, { recursive: true, force: true });
     }
   });
