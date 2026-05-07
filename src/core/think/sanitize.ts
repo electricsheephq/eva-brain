@@ -74,17 +74,29 @@ export interface TakeForPrompt {
   since_date?: string | null;
 }
 
+function escapeXmlAttr(value: unknown): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 export function renderTakesBlock(takes: TakeForPrompt[]): { rendered: string; sanitizedCount: number } {
   const lines: string[] = [];
   let sanitizedCount = 0;
   for (const t of takes) {
     const { text, matched } = sanitizeTakeForPrompt(t.claim);
     if (matched.length > 0) sanitizedCount++;
-    const meta = [`kind=${t.kind}`, `who=${t.holder}`, `weight=${t.weight.toFixed(2)}`];
-    if (t.since_date) meta.push(`since=${t.since_date}`);
-    if (t.source) meta.push(`source="${String(t.source).replace(/"/g, '\\"').slice(0, 80)}"`);
+    const meta = [
+      `kind="${escapeXmlAttr(t.kind)}"`,
+      `who="${escapeXmlAttr(t.holder)}"`,
+      `weight="${escapeXmlAttr(t.weight.toFixed(2))}"`,
+    ];
+    if (t.since_date) meta.push(`since="${escapeXmlAttr(t.since_date)}"`);
+    if (t.source) meta.push(`source="${escapeXmlAttr(String(t.source).slice(0, 80))}"`);
     lines.push(
-      `<take id="${t.page_slug}#${t.row_num}" ${meta.join(' ')}>\n${text}\n</take>`,
+      `<take id="${escapeXmlAttr(`${t.page_slug}#${t.row_num}`)}" ${meta.join(' ')}>\n${text}\n</take>`,
     );
   }
   return { rendered: lines.join('\n\n'), sanitizedCount };

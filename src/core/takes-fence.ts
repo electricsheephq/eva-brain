@@ -205,8 +205,9 @@ export function renderTakesFence(takes: ParsedTake[]): string {
     const sinceCell = t.untilDate ? `${t.sinceDate ?? ''} → ${t.untilDate}` : (t.sinceDate ?? '');
     const w = formatWeight(t.weight);
     const source = t.source ?? '';
-    // Escape any pipes inside cells so the table doesn't break.
-    const safe = (s: string) => s.replace(/\|/g, '\\|');
+    // Escape backslashes first so later pipe escapes cannot be confused with
+    // caller-provided escape sequences.
+    const safe = (s: string) => s.replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
     return `| ${t.rowNum} | ${safe(claimCell)} | ${t.kind} | ${safe(t.holder)} | ${w} | ${safe(sinceCell)} | ${safe(source)} |`;
   });
   const inner = ['', header, separator, ...rows, ''].join('\n');

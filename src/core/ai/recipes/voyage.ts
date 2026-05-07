@@ -3,10 +3,6 @@ import type { Recipe } from '../types.ts';
 /**
  * Voyage AI exposes an OpenAI-compatible /embeddings endpoint.
  * Base URL: https://api.voyageai.com/v1
- *
- * Voyage 4 family (Jan 2026): shared embedding space across all v4 variants,
- * flexible dims (256/512/1024/2048), 32K context, MoE architecture (large).
- * You can index with voyage-4-large and query with voyage-4-lite — no reindex.
  */
 export const voyage: Recipe = {
   id: 'voyage',
@@ -29,10 +25,15 @@ export const voyage: Recipe = {
       ],
       default_dims: 2048,
       cost_per_1m_tokens_usd: 0.18,
-      price_last_verified: '2026-05-06',
-      // Voyage enforces 120K tokens per batch. Use conservative limit
-      // because Voyage's tokenizer runs 3-4× denser than tiktoken.
+      price_last_verified: '2026-04-20',
+      // Voyage enforces 120K tokens per batch. Voyage's tokenizer runs
+      // ~3-4× denser than OpenAI tiktoken on mixed content (code/JSON/CJK),
+      // so the per-recipe pre-split uses 1 char ≈ 1 token at 0.5 utilization
+      // (60K char budget). Recursive halving in the gateway is the runtime
+      // safety net when dense payloads still overshoot.
       max_batch_tokens: 120_000,
+      chars_per_token: 1,
+      safety_factor: 0.5,
     },
   },
   setup_hint: 'Get an API key at https://dash.voyageai.com/api-keys, then `export VOYAGE_API_KEY=...`',

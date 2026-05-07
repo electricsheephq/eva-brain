@@ -128,6 +128,18 @@ describe('renderTakesFence', () => {
       expect(after.source).toBe(before.source);
     }
   });
+
+  test('escapes backslashes before pipe separators', () => {
+    const rendered = renderTakesFence([{
+      rowNum: 1,
+      claim: 'Windows path C:\\tmp\\notes | escaped',
+      kind: 'fact',
+      holder: 'world',
+      weight: 1,
+      active: true,
+    }]);
+    expect(rendered).toContain('C:\\\\tmp\\\\notes \\| escaped');
+  });
 });
 
 describe('upsertTakeRow', () => {

@@ -63,10 +63,25 @@ describe('sanitizeTakeForPrompt', () => {
       claim: 'Strong technical founder', kind: 'take', holder: 'garry', weight: 0.85,
     }]);
     expect(r.rendered).toContain('<take id="people/alice-example#2"');
-    expect(r.rendered).toContain('kind=take');
-    expect(r.rendered).toContain('who=garry');
-    expect(r.rendered).toContain('weight=0.85');
+    expect(r.rendered).toContain('kind="take"');
+    expect(r.rendered).toContain('who="garry"');
+    expect(r.rendered).toContain('weight="0.85"');
     expect(r.sanitizedCount).toBe(0);
+  });
+
+  test('renderTakesBlock escapes XML attributes without backslash quoting', () => {
+    const r = renderTakesBlock([{
+      page_slug: 'people/alice-example',
+      row_num: 2,
+      claim: 'Strong technical founder',
+      kind: 'take',
+      holder: 'garry "quoted" <owner>',
+      weight: 0.85,
+      source: 'source "quoted" <tag> \\ path',
+    }]);
+    expect(r.rendered).toContain('who="garry &quot;quoted&quot; &lt;owner&gt;"');
+    expect(r.rendered).toContain('source="source &quot;quoted&quot; &lt;tag&gt; \\ path"');
+    expect(r.rendered).not.toContain('\\"');
   });
 });
 
