@@ -349,7 +349,15 @@ async function handleExtractionRoute(config, req, res) {
 
 function resolveExtractionModel(requested, fallback) {
   const model = normalizeOptionalString(requested) ?? fallback;
-  return model.includes("/") ? model : `openai-codex/${model}`;
+  const resolved = model.includes("/") ? model : `openai-codex/${model}`;
+  if (!resolved.startsWith("openai-codex/") || resolved.slice("openai-codex/".length).trim() === "") {
+    throw new RequestError(
+      400,
+      "invalid_model",
+      "GBrain extraction only supports openai-codex/* models through the OpenClaw OAuth runtime.",
+    );
+  }
+  return resolved;
 }
 
 function buildExtractionPrompt(params) {

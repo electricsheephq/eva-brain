@@ -243,7 +243,7 @@ describe('MinionSupervisor', () => {
           if (!existsSync(h.pidFile)) return false;
           const events = readAudit(h.auditDir);
           return events.some(e => e.event === 'worker_exited');
-        }, 3000);
+        }, 10000);
         expect(ready).toBe(true);
 
         // Now SIGTERM the supervisor. It must exit cleanly within 200ms

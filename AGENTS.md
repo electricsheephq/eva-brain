@@ -6,12 +6,13 @@ start here.
 
 ## Install (5 min)
 
-1. Clone: `git clone https://github.com/garrytan/gbrain ~/gbrain && cd ~/gbrain`
+1. Clone: `git clone https://github.com/electricsheephq/eva-brain ~/eva-brain && cd ~/eva-brain`
 2. Install: `bun install`
-3. Init the brain: `gbrain init` (defaults to PGLite, zero-config). For 1000+ files or
-   multi-machine sync, init suggests Postgres + pgvector via Supabase.
+3. Init the brain: `gbrain init --embedding-model voyage:voyage-4-large --embedding-dimensions 2048`
+   when `VOYAGE_API_KEY` is available. For a text-only bootstrap, import with
+   `gbrain import <dir> --no-embed` after init and run embeddings later.
 4. Read [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) for the full 9-step flow
-   (API keys, identity, cron, verification).
+   (Voyage, OpenClaw plugin, support KB, recurring jobs, verification).
 
 ## Read this order
 

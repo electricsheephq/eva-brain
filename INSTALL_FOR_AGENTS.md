@@ -102,7 +102,8 @@ after GBrain is healthy:
 
 ```bash
 export OPENCLAW_SUPPORT_KB_REPO="https://github.com/electricsheephq/openclaw-support-kb.git"
-export OPENCLAW_SUPPORT_KB_DIR="$HOME/.gbrain/sources/openclaw-support-kb"
+export GBRAIN_PARENT="${GBRAIN_HOME:-$HOME}"
+export OPENCLAW_SUPPORT_KB_DIR="$GBRAIN_PARENT/.gbrain/sources/openclaw-support-kb"
 
 if [ -d "$OPENCLAW_SUPPORT_KB_DIR/.git" ]; then
   git -C "$OPENCLAW_SUPPORT_KB_DIR" pull --ff-only
@@ -133,7 +134,7 @@ NOT inside `~/eva-brain`.
 
 ```bash
 gbrain import ~/brain/ --no-embed     # import markdown files
-gbrain embed --stale                  # generate vector embeddings
+gbrain embed --stale --source default # generate vector embeddings for this brain source
 gbrain query "key themes across these documents?"
 ```
 
@@ -192,15 +193,24 @@ If skipped, minimal defaults are installed automatically.
 
 ## Step 7: Recurring Jobs
 
-Set up using your platform's scheduler (OpenClaw cron, Railway cron, crontab):
+Set up using OpenClaw's scheduler/Minions job path when available. Plain
+`crontab` is a local fallback only, because background agents cannot answer
+interactive shell-approval prompts.
 
-- **Live sync** (every 15 min): `gbrain sync --repo ~/brain && gbrain embed --stale`
+- **Local-only brain refresh** (every 15 min): `gbrain import ~/brain --no-embed && gbrain embed --stale --source default`
+- **Git-tracked brain sync** (every 15 min): use `gbrain sync --repo ~/brain && gbrain embed --stale --source default`
+  only when `~/brain` has a configured git remote and upstream tracking branch.
+  If `git -C ~/brain remote -v` is empty, use the local-only import command above.
+- **Support KB refresh** (after `openclaw-support-kb` updates): run
+  `node scripts/update-client.mjs && gbrain embed --stale --source openclaw-support-kb`
+  from `$OPENCLAW_SUPPORT_KB_DIR`, so KB changes do not trigger a full-brain
+  stale embed sweep.
 - **Auto-update** (daily): `gbrain check-update --json` (tell user, never auto-install)
 - **Dream cycle** (nightly): read `docs/guides/cron-schedule.md` for the full protocol.
   Entity sweep, citation fixes, memory consolidation, plus (v0.23+) overnight conversation
   synthesis and cross-session pattern detection. 8 phases, one cron-friendly command. This
   is what makes the brain compound. Do not skip it.
-- **Weekly**: `gbrain doctor --json && gbrain embed --stale`
+- **Weekly**: `gbrain doctor --json && gbrain embed --stale --source default`
 
 ## Step 8: Integrations
 

@@ -3,6 +3,7 @@ import {
   configureGateway,
   resetGateway,
   isAvailable,
+  embed,
   getEmbeddingModel,
   getEmbeddingDimensions,
   getExpansionModel,
@@ -170,5 +171,86 @@ describe('dims.dimsProviderOptions', () => {
   test('Voyage openai-compatible returns output_dimension', () => {
     const opts = dimsProviderOptions('openai-compatible', 'voyage-3-large', 1024);
     expect(opts).toEqual({ openaiCompatible: { output_dimension: 1024 } });
+    const v4Opts = dimsProviderOptions('openai-compatible', 'voyage-4-large', 2048);
+    expect(v4Opts).toEqual({ openaiCompatible: { output_dimension: 2048 } });
+  });
+
+  test('Voyage model without flexible dimensions returns undefined', () => {
+    const opts = dimsProviderOptions('openai-compatible', 'voyage-3-lite', 1024);
+    expect(opts).toBeUndefined();
+  });
+});
+
+describe('Voyage openai-compatible request shim', () => {
+  beforeEach(() => resetGateway());
+
+  test('sends output_dimension on the actual Voyage embedding request body', async () => {
+    const originalFetch = globalThis.fetch;
+    let requestBody: Record<string, any> | undefined;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body ?? '{}'));
+      return new Response(JSON.stringify({
+        object: 'list',
+        data: [
+          {
+            object: 'embedding',
+            index: 0,
+            embedding: new Array(2048).fill(0.01),
+          },
+        ],
+        model: 'voyage-4-large',
+        usage: { total_tokens: 3 },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      configureGateway({
+        embedding_model: 'voyage:voyage-4-large',
+        embedding_dimensions: 2048,
+        env: { VOYAGE_API_KEY: 'voyage-fake' },
+      });
+
+      const vectors = await embed(['dimension probe']);
+
+      expect(vectors[0].length).toBe(2048);
+      expect(requestBody?.output_dimension).toBe(2048);
+      expect(requestBody?.encoding_format).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('rejects partial embedding responses instead of silently dropping rows', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      object: 'list',
+      data: [
+        {
+          object: 'embedding',
+          index: 0,
+          embedding: new Array(2048).fill(0.01),
+        },
+      ],
+      model: 'voyage-4-large',
+      usage: { total_tokens: 3 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch;
+
+    try {
+      configureGateway({
+        embedding_model: 'voyage:voyage-4-large',
+        embedding_dimensions: 2048,
+        env: { VOYAGE_API_KEY: 'voyage-fake' },
+      });
+
+      await expect(embed(['first', 'second'])).rejects.toThrow('1 embedding(s) for 2 input(s)');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

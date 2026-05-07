@@ -5,10 +5,12 @@
 // (e.g. "attended meetings" vs "received emails").
 // `code` (v0.19.0): tree-sitter-chunked source files; consumed by code-def /
 // code-refs / code-callers / code-callees + Cathedral II two-pass retrieval.
-export type PageType = 'person' | 'company' | 'deal' | 'yc' | 'civic' | 'project' | 'concept' | 'source' | 'media' | 'writing' | 'analysis' | 'guide' | 'hardware' | 'architecture' | 'meeting' | 'note' | 'email' | 'slack' | 'calendar-event' | 'code';
+export type PageType = 'person' | 'company' | 'deal' | 'yc' | 'civic' | 'project' | 'concept' | 'source' | 'media' | 'writing' | 'analysis' | 'guide' | 'hardware' | 'architecture' | 'meeting' | 'note' | 'email' | 'slack' | 'calendar-event' | 'code' | 'synthesis';
 
 export interface Page {
   id: number;
+  /** v0.18.0: owning source id. Slugs are unique per source, not globally. */
+  source_id?: string;
   slug: string;
   type: PageType;
   title: string;
@@ -49,6 +51,8 @@ export interface PageInput {
 export interface PageFilters {
   type?: PageType;
   tag?: string;
+  /** Filter to one source. Omit or pass '__all__' to include all sources. */
+  sourceId?: string;
   limit?: number;
   offset?: number;
   /** ISO date string (YYYY-MM-DD or full ISO timestamp). Filter to pages updated_at > value. */
@@ -72,7 +76,7 @@ export interface PageFilters {
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
 export interface GetPageOpts {
-  /** Filter to a specific source. When omitted, getPage returns the first slug match across sources (pre-existing semantics). */
+  /** Filter to a specific source. When omitted, getPage targets the default source. */
   sourceId?: string;
   /** Include soft-deleted pages. Default false. See PageFilters.includeDeleted. */
   includeDeleted?: boolean;

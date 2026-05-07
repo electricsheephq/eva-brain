@@ -14,8 +14,8 @@ import {
   formatCodeBreakdown,
 } from '../core/sync.ts';
 import { estimateTokens, CHUNKER_VERSION } from '../core/chunkers/code.ts';
-import { EMBEDDING_MODEL, estimateEmbeddingCostUsd } from '../core/embedding.ts';
 import { errorFor, serializeError } from '../core/errors.ts';
+import { assertTouchpoint, resolveRecipe } from '../core/ai/model-resolver.ts';
 import type { SyncManifest } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -89,6 +89,25 @@ function estimateSyncAllCost(sources: Array<{ local_path: string | null; config:
   }
 
   return { totalTokens, totalFiles, activeSources, perSource };
+}
+
+function estimateEmbeddingPreviewCost(tokens: number): { costUsd: number | null; model: string } {
+  const configuredModel = loadConfig()?.embedding_model ?? 'openai:text-embedding-3-large';
+  try {
+    const { parsed, recipe } = resolveRecipe(configuredModel);
+    assertTouchpoint(recipe, 'embedding', parsed.modelId);
+    const costPerMillion = recipe.touchpoints.embedding?.cost_per_1m_tokens_usd;
+    return {
+      model: `${recipe.id}:${parsed.modelId}`,
+      costUsd: costPerMillion === undefined ? null : (tokens / 1_000_000) * costPerMillion,
+    };
+  } catch {
+    return { model: configuredModel, costUsd: null };
+  }
+}
+
+function formatCostPreview(costUsd: number | null): string {
+  return costUsd === null ? 'cost unknown' : `est. $${costUsd.toFixed(2)}`;
 }
 
 /**
@@ -322,15 +341,69 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     throw new Error(hint);
   }
 
+  // v0.28: source-aware re-clone branch. When the source has a remote_url
+  // recorded (i.e. it was registered via `sources add --url`), the on-disk
+  // clone is auto-managed. validateRepoState classifies the on-disk state;
+  // we recover from missing/no-git/not-a-dir by re-cloning, refuse on
+  // url-drift or corruption with structured hints.
+  if (opts.sourceId) {
+    const { validateRepoState } = await import('../core/git-remote.ts');
+    const { recloneIfMissing } = await import('../core/sources-ops.ts');
+    const cfgRows = await engine.executeRaw<{ config: unknown }>(
+      `SELECT config FROM sources WHERE id = $1`,
+      [opts.sourceId],
+    );
+    const cfg =
+      typeof cfgRows[0]?.config === 'string'
+        ? (JSON.parse(cfgRows[0].config as string) as Record<string, unknown>)
+        : ((cfgRows[0]?.config ?? {}) as Record<string, unknown>);
+    const remoteUrl = typeof cfg.remote_url === 'string' ? cfg.remote_url : null;
+    if (remoteUrl) {
+      const state = validateRepoState(repoPath, remoteUrl);
+      switch (state) {
+        case 'healthy':
+          break;
+        case 'missing':
+        case 'no-git':
+        case 'not-a-dir':
+          console.error(
+            `[gbrain] auto-recovery: re-cloning "${opts.sourceId}" (clone state: ${state}).`,
+          );
+          await recloneIfMissing(engine, opts.sourceId);
+          break;
+        case 'corrupted':
+          throw new Error(
+            `Source "${opts.sourceId}" clone at ${repoPath} is corrupted ` +
+              `(\`git remote get-url origin\` failed). Run: ` +
+              `gbrain sources remove ${opts.sourceId} --confirm-destructive && ` +
+              `gbrain sources add ${opts.sourceId} --url ${remoteUrl}`,
+          );
+        case 'url-drift':
+          throw new Error(
+            `Source "${opts.sourceId}" clone at ${repoPath} has a remote ` +
+              `that differs from config.remote_url=${remoteUrl}. ` +
+              `Re-clone with: gbrain sources rebase-clone ${opts.sourceId} ` +
+              `(if available, else: sources remove + sources add).`,
+          );
+      }
+    }
+  }
+
   // Validate git repo
   if (!existsSync(join(repoPath, '.git'))) {
     throw new Error(`Not a git repository: ${repoPath}. GBrain sync requires a git-initialized repo.`);
   }
 
-  // Git pull (unless --no-pull)
+  // Git pull (unless --no-pull). v0.28.1 codex finding (HIGH): the legacy
+  // git() helper at sync.ts:192 spawns git without GIT_SSRF_FLAGS, so
+  // every steady-state pull was bypassing the redirect/submodule/protocol
+  // hardening that cloneRepo applies. Route through pullRepo from
+  // git-remote.ts so the flag set is consistent across initial clone and
+  // ongoing pulls — single source of truth for the defensive flags.
   if (!opts.noPull) {
     try {
-      git(repoPath, 'pull', '--ff-only');
+      const { pullRepo } = await import('../core/git-remote.ts');
+      pullRepo(repoPath);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       if (msg.includes('non-fast-forward') || msg.includes('diverged')) {
@@ -753,8 +826,8 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   if (!opts.noExtract && pagesAffected.length > 0) {
     try {
       const { extractLinksForSlugs, extractTimelineForSlugs } = await import('./extract.ts');
-      const linksCreated = await extractLinksForSlugs(engine, repoPath, pagesAffected);
-      const timelineCreated = await extractTimelineForSlugs(engine, repoPath, pagesAffected);
+      const linksCreated = await extractLinksForSlugs(engine, repoPath, pagesAffected, opts.sourceId);
+      const timelineCreated = await extractTimelineForSlugs(engine, repoPath, pagesAffected, opts.sourceId);
       if (linksCreated > 0 || timelineCreated > 0) {
         console.log(`  Extracted: ${linksCreated} links, ${timelineCreated} timeline entries`);
       }
@@ -766,7 +839,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   if (!noEmbed && pagesAffected.length > 0 && pagesAffected.length <= 100) {
     try {
       const { runEmbed } = await import('./embed.ts');
-      await runEmbed(engine, ['--slugs', ...pagesAffected]);
+      const embedArgs = ['--slugs', ...pagesAffected];
+      if (opts.sourceId) embedArgs.push('--source', opts.sourceId);
+      await runEmbed(engine, embedArgs);
       // Before commit 2 lands: runEmbed is void. Best estimate is pagesAffected,
       // since runEmbed re-embeds every requested slug. Commit 2 sharpens this
       // with EmbedResult.embedded.
@@ -888,7 +963,9 @@ async function performFullSync(
   if (!opts.noEmbed) {
     try {
       const { runEmbed } = await import('./embed.ts');
-      await runEmbed(engine, ['--stale']);
+      const embedArgs = ['--stale'];
+      if (opts.sourceId) embedArgs.push('--source', opts.sourceId);
+      await runEmbed(engine, embedArgs);
       embedded = result.imported;
     } catch { /* embedding is best-effort */ }
   }
@@ -979,14 +1056,14 @@ export async function runSync(engine: BrainEngine, args: string[]) {
     // the cost and will run `embed --stale` later).
     if (!noEmbed) {
       const preview = estimateSyncAllCost(sources);
-      const costUsd = estimateEmbeddingCostUsd(preview.totalTokens);
+      const { costUsd, model } = estimateEmbeddingPreviewCost(preview.totalTokens);
       const previewMsg =
         `sync --all preview: ${preview.totalFiles} files across ${preview.activeSources} source(s), ` +
-        `~${preview.totalTokens.toLocaleString()} tokens, est. $${costUsd.toFixed(2)} on ${EMBEDDING_MODEL}.`;
+        `~${preview.totalTokens.toLocaleString()} tokens, ${formatCostPreview(costUsd)} on ${model}.`;
 
       if (dryRun) {
         if (jsonOut) {
-          console.log(JSON.stringify({ status: 'dry_run', preview, costUsd, model: EMBEDDING_MODEL }));
+          console.log(JSON.stringify({ status: 'dry_run', preview, costUsd, model }));
         } else {
           console.log(previewMsg);
           console.log('--dry-run: exit without syncing.');
@@ -1004,7 +1081,7 @@ export async function runSync(engine: BrainEngine, args: string[]) {
             message: previewMsg,
             hint: 'Pass --yes to proceed, or --dry-run to see the preview and exit 0.',
           }));
-          console.log(JSON.stringify({ error: envelope, preview, costUsd, model: EMBEDDING_MODEL }));
+          console.log(JSON.stringify({ error: envelope, preview, costUsd, model }));
           process.exit(2);
         }
         // Interactive TTY path: prompt [y/N].

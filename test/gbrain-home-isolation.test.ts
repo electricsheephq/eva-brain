@@ -148,6 +148,48 @@ describe('GBRAIN_HOME write-side isolation', () => {
     }
   });
 
+  test('process env wins over local gbrain.env values', async () => {
+    const tmp = fresh();
+    const saved = {
+      GBRAIN_HOME: process.env.GBRAIN_HOME,
+      GBRAIN_EMBEDDING_MODEL: process.env.GBRAIN_EMBEDDING_MODEL,
+      GBRAIN_EMBEDDING_DIMENSIONS: process.env.GBRAIN_EMBEDDING_DIMENSIONS,
+    };
+    process.env.GBRAIN_HOME = tmp;
+    process.env.GBRAIN_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
+    process.env.GBRAIN_EMBEDDING_DIMENSIONS = '1536';
+    try {
+      const gbrainDir = join(tmp, '.gbrain');
+      mkdirSync(gbrainDir, { recursive: true });
+      writeFileSync(
+        join(gbrainDir, 'config.json'),
+        JSON.stringify({ engine: 'pglite', database_path: join(gbrainDir, 'brain.pglite') }) + '\n',
+      );
+      writeFileSync(
+        join(gbrainDir, 'gbrain.env'),
+        [
+          'GBRAIN_EMBEDDING_MODEL=voyage:voyage-4-large',
+          'GBRAIN_EMBEDDING_DIMENSIONS=2048',
+        ].join('\n'),
+      );
+
+      const { loadConfig } = await import('../src/core/config.ts');
+      const config = loadConfig();
+
+      expect(config?.embedding_model).toBe('openai:text-embedding-3-large');
+      expect(config?.embedding_dimensions).toBe(1536);
+      expect(process.env.GBRAIN_EMBEDDING_MODEL).toBe('openai:text-embedding-3-large');
+    } finally {
+      if (saved.GBRAIN_HOME === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = saved.GBRAIN_HOME;
+      if (saved.GBRAIN_EMBEDDING_MODEL === undefined) delete process.env.GBRAIN_EMBEDDING_MODEL;
+      else process.env.GBRAIN_EMBEDDING_MODEL = saved.GBRAIN_EMBEDDING_MODEL;
+      if (saved.GBRAIN_EMBEDDING_DIMENSIONS === undefined) delete process.env.GBRAIN_EMBEDDING_DIMENSIONS;
+      else process.env.GBRAIN_EMBEDDING_DIMENSIONS = saved.GBRAIN_EMBEDDING_DIMENSIONS;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   test('integrity, sync-failures, integrations heartbeat resolve under GBRAIN_HOME', async () => {
     const tmp = fresh();
     process.env.GBRAIN_HOME = tmp;

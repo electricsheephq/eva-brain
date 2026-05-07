@@ -1,5 +1,3 @@
-import { applyChunkEmbeddingIndexPolicy } from './vector-index.ts';
-
 /**
  * PGLite schema — derived from schema-embedded.ts (Postgres schema).
  *
@@ -17,6 +15,8 @@ import { applyChunkEmbeddingIndexPolicy } from './vector-index.ts';
  * DRIFT WARNING: When schema-embedded.ts changes, update this file to match.
  * test/edge-bundle.test.ts has a drift detection test.
  */
+
+import { applyChunkEmbeddingIndexPolicy } from './vector-index.ts';
 
 const PGLITE_SCHEMA_SQL_TEMPLATE = `
 -- GBrain PGLite schema (local embedded Postgres)

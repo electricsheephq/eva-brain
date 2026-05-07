@@ -40,7 +40,6 @@ import { dimsProviderOptions } from './dims.ts';
 import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
 
 const MAX_CHARS = 8000;
-const VOYAGE_EMBED_TIMEOUT_MS = 30_000;
 const DEFAULT_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
 const DEFAULT_EMBEDDING_DIMENSIONS = 1536;
 const DEFAULT_EXPANSION_MODEL = 'anthropic:claude-haiku-4-5-20251001';
@@ -190,15 +189,69 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
         `${recipe.name} requires a base URL.`,
         recipe.setup_hint,
       );
-      // For openai-compatible, auth is optional (ollama local) but pass a dummy key if unauthenticated.
+      // For openai-compatible, auth is optional (Ollama local) but pass a dummy key if unauthenticated.
       const apiKey = auth.source === 'unauthenticated'
         ? 'unauthenticated'
         : requireAuth(auth, recipe, 'embedding');
+      // Voyage AI compatibility shim:
+      // 1. Rejects `encoding_format: "float"` (only accepts "base64" or omit).
+      //    The AI SDK hardcodes encoding_format: "float" for openai-compatible.
+      // 2. Returns `usage.total_tokens` instead of `usage.prompt_tokens`.
+      //    The AI SDK Zod schema requires `prompt_tokens` when usage is present.
+      const voyageOutputDimension = recipe.id === 'voyage'
+        ? dimsProviderOptions(
+            recipe.implementation,
+            modelId,
+            cfg.embedding_dimensions ?? DEFAULT_EMBEDDING_DIMENSIONS,
+          )?.openaiCompatible?.output_dimension
+        : undefined;
+      const voyageFetch = recipe.id === 'voyage'
+        ? async (url: string | URL | Request, init?: RequestInit) => {
+            if (init?.body && typeof init.body === 'string') {
+              try {
+                const parsed = JSON.parse(init.body);
+                delete parsed.encoding_format;
+                if (parsed.output_dimension == null && parsed.dimensions != null) {
+                  parsed.output_dimension = parsed.dimensions;
+                }
+                if (parsed.output_dimension == null && voyageOutputDimension != null) {
+                  parsed.output_dimension = voyageOutputDimension;
+                }
+                delete parsed.dimensions;
+                init = { ...init, body: JSON.stringify(parsed) };
+              } catch { /* not JSON, pass through */ }
+            }
+            const resp = await globalThis.fetch(url, init);
+            // Patch response to add prompt_tokens from total_tokens
+            const text = await resp.text();
+            try {
+              const json = JSON.parse(text);
+              if (json.usage && json.usage.total_tokens != null && json.usage.prompt_tokens == null) {
+                json.usage.prompt_tokens = json.usage.total_tokens;
+              }
+              return new Response(JSON.stringify(json), {
+                status: resp.status,
+                statusText: resp.statusText,
+                headers: resp.headers,
+              });
+            } catch {
+              return new Response(text, {
+                status: resp.status,
+                statusText: resp.statusText,
+                headers: resp.headers,
+              });
+            }
+          }
+        : undefined;
+      // SDK accepts a `fetch` override at runtime but the typed settings don't
+      // expose it on this version pin; cast so v0.28.5's #680 fetch-shim
+      // (Voyage encoding_format + usage normalization) typechecks.
       const client = createOpenAICompatible({
         name: recipe.id,
         baseURL: baseUrl,
         apiKey,
-      });
+        ...(voyageFetch ? { fetch: voyageFetch } : {}),
+      } as Parameters<typeof createOpenAICompatible>[0]);
       return client.textEmbeddingModel(modelId);
     }
     default:
@@ -206,86 +259,134 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
   }
 }
 
-async function embedVoyageNative(
-  modelId: string,
-  apiKey: string,
-  texts: string[],
-  dims: number,
-): Promise<Float32Array[]> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), VOYAGE_EMBED_TIMEOUT_MS);
-  let response: Response;
-  try {
-    response = await fetch('https://api.voyageai.com/v1/embeddings', {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: modelId,
-        input: texts,
-        output_dimension: dims,
-      }),
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+/**
+ * Conservative chars-to-tokens ratio for batch budget estimation.
+ * Voyage's tokenizer runs ~3-4× denser than OpenAI tiktoken on mixed
+ * content (code, markdown, conversation). Using 1 char ≈ 1 token is
+ * intentionally pessimistic to avoid hitting provider batch limits.
+ */
+const CHARS_PER_TOKEN_ESTIMATE = 1;
 
-  const bodyText = await response.text();
-  let body: any;
-  try {
-    body = bodyText ? JSON.parse(bodyText) : {};
-  } catch {
-    body = { detail: bodyText };
-  }
+/** Minimum sub-batch size before we give up splitting and just throw. */
+const MIN_SUB_BATCH = 1;
 
-  if (!response.ok) {
-    throw new AIConfigError(
-      `Voyage embedding request failed (${response.status}): ${body?.detail ?? body?.message ?? response.statusText}`,
-      'Check VOYAGE_API_KEY, model id, and output dimension support.',
-    );
-  }
-
-  const data = Array.isArray(body?.data) ? body.data : [];
-  return data.map((row: any) => new Float32Array(row.embedding));
-}
-
-/** Embed many texts. Truncates to 8000 chars. Throws AIConfigError or AITransientError. */
+/** Embed many texts. Truncates to 8000 chars. Auto-splits for providers with batch limits. */
 export async function embed(texts: string[]): Promise<Float32Array[]> {
   if (!texts || texts.length === 0) return [];
 
   const cfg = requireConfig();
   const { model, recipe, modelId } = await resolveEmbeddingProvider(getEmbeddingModel());
   const truncated = texts.map(t => (t ?? '').slice(0, MAX_CHARS));
+  const providerOpts = dimsProviderOptions(recipe.implementation, modelId, cfg.embedding_dimensions ?? DEFAULT_EMBEDDING_DIMENSIONS);
   const expected = cfg.embedding_dimensions ?? DEFAULT_EMBEDDING_DIMENSIONS;
 
-  try {
-    const embeddings = recipe.id === 'voyage'
-      ? await embedVoyageNative(
-          modelId,
-          requireAuth(resolveProviderAuth(recipe, cfg), recipe, 'embedding'),
-          truncated,
-          expected,
-        )
-      : (await embedMany({
-          model,
-          values: truncated,
-          providerOptions: dimsProviderOptions(recipe.implementation, modelId, expected),
-        })).embeddings.map((e: number[]) => new Float32Array(e));
+  // Determine batch token budget from recipe (if provider declares one).
+  const maxBatchTokens = recipe.touchpoints?.embedding?.max_batch_tokens;
 
-    // Verify dims match expectation; mismatch = likely misconfigured provider options.
-    const first = embeddings?.[0];
-    if (first && first.length !== expected) {
-      throw new AIConfigError(
-        `Embedding dim mismatch: model ${modelId} returned ${first.length} but schema expects ${expected}.`,
-        `Archive/backup the old brain, then run a fresh init with matching --embedding-model and --embedding-dimensions.`,
+  // Split into sub-batches if the provider has a token budget.
+  const batches = maxBatchTokens
+    ? splitByTokenBudget(truncated, maxBatchTokens)
+    : [truncated];
+
+  const allEmbeddings: Float32Array[] = [];
+
+  for (const batch of batches) {
+    const result = await embedSubBatch(batch, model, providerOpts, expected, recipe, modelId);
+    allEmbeddings.push(...result);
+  }
+
+  return allEmbeddings;
+}
+
+/**
+ * Split texts into sub-batches that stay under the provider's token budget.
+ * Uses a conservative chars-to-tokens estimate (1:1) since different
+ * providers' tokenizers vary widely.
+ */
+function splitByTokenBudget(texts: string[], maxTokens: number): string[][] {
+  // Use 80% of declared limit as safety margin for tokenizer variance.
+  const budget = Math.floor(maxTokens * 0.8);
+  const batches: string[][] = [];
+  let current: string[] = [];
+  let currentTokens = 0;
+
+  for (const text of texts) {
+    const estTokens = Math.ceil(text.length / CHARS_PER_TOKEN_ESTIMATE);
+    if (current.length > 0 && currentTokens + estTokens > budget) {
+      batches.push(current);
+      current = [];
+      currentTokens = 0;
+    }
+    current.push(text);
+    currentTokens += estTokens;
+  }
+  if (current.length > 0) batches.push(current);
+
+  return batches;
+}
+
+/** Returns true if the error looks like a provider batch-token-limit error. */
+function isTokenLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    /max.*allowed.*tokens.*batch/i.test(msg) ||
+    /batch.*too.*many.*tokens/i.test(msg) ||
+    /token.*limit.*exceeded/i.test(msg)
+  );
+}
+
+/**
+ * Embed a single sub-batch with automatic halving on token-limit errors.
+ * If the batch is already at MIN_SUB_BATCH and still fails, throws.
+ */
+async function embedSubBatch(
+  texts: string[],
+  model: any,
+  providerOpts: any,
+  expectedDims: number,
+  recipe: Recipe,
+  modelId: string,
+): Promise<Float32Array[]> {
+  try {
+    const result = await embedMany({
+      model,
+      values: texts,
+      providerOptions: providerOpts,
+    });
+
+    if (!Array.isArray(result.embeddings) || result.embeddings.length !== texts.length) {
+      throw new AITransientError(
+        `Embedding provider returned ${result.embeddings?.length ?? 0} embedding(s) for ${texts.length} input(s).`,
       );
     }
 
-    return embeddings;
+    const first = result.embeddings[0];
+    if (first && Array.isArray(first) && first.length !== expectedDims) {
+      // v0.28.5 (#672): the previous fix-hint pointed at `gbrain migrate
+      // --embedding-model … --embedding-dimensions …` but `gbrain migrate`
+      // only handles engine migration, not embedding reconfiguration. The
+      // canonical fix is the manual ALTER recipe in
+      // docs/embedding-migrations.md, surfaced inline so the user doesn't
+      // need to context-switch.
+      throw new AIConfigError(
+        `Embedding dim mismatch: model ${modelId} returned ${first.length} but schema expects ${expectedDims}.`,
+        `Either change models to one that returns ${expectedDims}-d embeddings, ` +
+        `or migrate the existing brain to ${first.length}-d (destructive — see docs/embedding-migrations.md). ` +
+        `Quick recipe: DROP INDEX idx_chunks_embedding; ALTER COLUMN embedding TYPE vector(${first.length}); ` +
+        `UPDATE content_chunks SET embedding = NULL; gbrain config set embedding_dimensions ${first.length}; ` +
+        `gbrain embed --stale.`,
+      );
+    }
+
+    return result.embeddings.map((e: number[]) => new Float32Array(e));
   } catch (err) {
+    // On token-limit error, try splitting the batch in half and retrying.
+    if (isTokenLimitError(err) && texts.length > MIN_SUB_BATCH) {
+      const mid = Math.ceil(texts.length / 2);
+      const left = await embedSubBatch(texts.slice(0, mid), model, providerOpts, expectedDims, recipe, modelId);
+      const right = await embedSubBatch(texts.slice(mid), model, providerOpts, expectedDims, recipe, modelId);
+      return [...left, ...right];
+    }
     throw normalizeAIError(err, `embed(${recipe.id}:${modelId})`);
   }
 }

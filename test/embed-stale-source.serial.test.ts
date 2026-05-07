@@ -56,4 +56,80 @@ describe('embed --stale source awareness', () => {
     ]);
     expect(upserts[0]?.embedding).toBeInstanceOf(Float32Array);
   });
+
+  test('duplicate slugs only re-embed the stale source row', async () => {
+    const getCalls: Array<{ slug: string; sourceId?: string }> = [];
+    const upserts: Array<{ slug: string; sourceId?: string; text?: string }> = [];
+    const defaultChunk: Chunk = {
+      id: 1,
+      page_id: 10,
+      chunk_index: 0,
+      chunk_text: 'Default workspace text',
+      chunk_source: 'compiled_truth',
+      embedding: new Float32Array([0.9, 0.9, 0.9]),
+      model: 'voyage-4-large',
+      token_count: 5,
+      embedded_at: new Date('2026-05-01T00:00:00.000Z'),
+    };
+    const kbChunk: Chunk = {
+      id: 2,
+      page_id: 20,
+      chunk_index: 0,
+      chunk_text: 'KB stale text',
+      chunk_source: 'compiled_truth',
+      embedding: null,
+      model: 'voyage-4-large',
+      token_count: 4,
+      embedded_at: null,
+    };
+    const engine = {
+      countStaleChunks: async () => 1,
+      listStaleChunks: async () => [
+        {
+          source_id: 'openclaw-support-kb',
+          slug: 'docs/shared',
+          chunk_index: 0,
+          chunk_text: 'KB stale text',
+          chunk_source: 'compiled_truth',
+          model: 'voyage-4-large',
+          token_count: 4,
+        },
+      ],
+      getChunks: async (slug: string, opts?: { sourceId?: string }) => {
+        getCalls.push({ slug, sourceId: opts?.sourceId });
+        if (opts?.sourceId === 'openclaw-support-kb') return [kbChunk];
+        if (opts?.sourceId === 'default') return [defaultChunk];
+        throw new Error('embed --stale must pass an explicit source id');
+      },
+      upsertChunks: async (slug: string, chunks, opts?: { sourceId?: string }) => {
+        upserts.push({ slug, sourceId: opts?.sourceId, text: chunks[0]?.chunk_text });
+      },
+    } as Partial<BrainEngine> as BrainEngine;
+
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+    const result = await runEmbedCore(engine, { stale: true });
+
+    expect(result.embedded).toBe(1);
+    expect(getCalls).toEqual([{ slug: 'docs/shared', sourceId: 'openclaw-support-kb' }]);
+    expect(upserts).toEqual([{ slug: 'docs/shared', sourceId: 'openclaw-support-kb', text: 'KB stale text' }]);
+  });
+
+  test('CLI --stale --source passes the source filter into stale queries', async () => {
+    const staleQueryOpts: Array<{ sourceId?: string } | undefined> = [];
+    const engine = {
+      countStaleChunks: async (opts?: { sourceId?: string }) => {
+        staleQueryOpts.push(opts);
+        return 0;
+      },
+      listStaleChunks: async (opts?: { sourceId?: string }) => {
+        staleQueryOpts.push(opts);
+        return [];
+      },
+    } as Partial<BrainEngine> as BrainEngine;
+
+    const { runEmbed } = await import('../src/commands/embed.ts');
+    await runEmbed(engine, ['--stale', '--source', 'openclaw-support-kb']);
+
+    expect(staleQueryOpts).toEqual([{ sourceId: 'openclaw-support-kb' }]);
+  });
 });
