@@ -1,6 +1,6 @@
 {
   "name": "gbrain",
-  "version": "0.28.9",
+  "version": "0.28.10",
   "description": "Eva Brain/GBrain skills and personal knowledge brain with provider-neutral hybrid search",
   "family": "bundle-plugin",
   "configSchema": {
