@@ -55,6 +55,10 @@
       "minExtractionIntervalMs": {
         "type": "number",
         "description": "Minimum delay between extraction starts. Defaults to 0."
+      },
+      "maxExtractionFileBytes": {
+        "type": "number",
+        "description": "Maximum decoded bytes accepted for a file passed to /plugins/gbrain/extract. Defaults to 8000000 and is capped at 20MiB."
       }
     }
   }

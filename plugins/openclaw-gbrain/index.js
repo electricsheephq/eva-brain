@@ -14,11 +14,14 @@ const DEFAULT_MAX_CONCURRENT_EXTRACTIONS = 1;
 const DEFAULT_EXTRACTION_QUEUE_LIMIT = 8;
 const DEFAULT_EXTRACTION_QUEUE_TIMEOUT_MS = 30_000;
 const DEFAULT_MIN_EXTRACTION_INTERVAL_MS = 0;
+const DEFAULT_MAX_EXTRACTION_FILE_BYTES = 8_000_000;
 const GBRAIN_ROUTE_PATH = "/plugins/gbrain/extract";
-const MAX_BODY_BYTES = 12 * 1024 * 1024;
 const MAX_TIMEOUT_MS = 300_000;
 const MAX_EXTRACTION_QUEUE_LIMIT = 100;
 const MAX_MIN_EXTRACTION_INTERVAL_MS = 60_000;
+const MAX_EXTRACTION_FILE_BYTES = 20 * 1024 * 1024;
+const DEFAULT_MAX_BODY_BYTES = 12 * 1024 * 1024;
+const MAX_BODY_BYTES = Math.ceil((MAX_EXTRACTION_FILE_BYTES * 4) / 3) + 512_000;
 
 let activeExtractions = 0;
 const extractionQueue = [];
@@ -57,6 +60,12 @@ function readConfig(pluginConfig) {
       DEFAULT_MIN_EXTRACTION_INTERVAL_MS,
       0,
       MAX_MIN_EXTRACTION_INTERVAL_MS,
+    ),
+    maxExtractionFileBytes: readBoundedInteger(
+      cfg.maxExtractionFileBytes,
+      DEFAULT_MAX_EXTRACTION_FILE_BYTES,
+      1,
+      MAX_EXTRACTION_FILE_BYTES,
     ),
   };
 }
@@ -298,13 +307,13 @@ async function handleExtractionRoute(config, req, res) {
   let tempDir;
   let releaseSlot;
   try {
-    const body = await readJsonBody(req, MAX_BODY_BYTES);
+    const body = await readJsonBody(req, requestBodyLimitBytes(config.maxExtractionFileBytes));
     const request = readExtractionRequest(body);
     const kind = normalizeMediaKind(request.kind);
     const sourceRef = normalizeRequiredString(request.sourceRef, "sourceRef");
     const title = normalizeOptionalString(request.title);
     const text = normalizeOptionalString(request.text);
-    const image = readImageInput(request);
+    const image = readImageInput(request, config);
     if (!text && !image) {
       throw new RequestError(400, "missing_content", "Provide text or file.base64.");
     }
@@ -534,14 +543,46 @@ function readExtractionRequest(value) {
   return value;
 }
 
-function readImageInput(request) {
+function readImageInput(request, config) {
   const file = isRecord(request.file) ? request.file : undefined;
   const base64 = normalizeOptionalString(file?.base64);
   if (!base64) return undefined;
+  const normalizedBase64 = normalizeBase64Payload(base64);
+  const decodedBytes = decodedBase64ByteLength(normalizedBase64);
+  if (decodedBytes > config.maxExtractionFileBytes) {
+    throw new RequestError(
+      413,
+      "file_too_large",
+      `GBrain extraction file is too large (${decodedBytes} bytes, max ${config.maxExtractionFileBytes}).`,
+    );
+  }
   return {
-    base64,
+    base64: normalizedBase64,
     name: sanitizeFileName(normalizeOptionalString(file.name) ?? "image.png"),
+    decodedBytes,
   };
+}
+
+function requestBodyLimitBytes(maxExtractionFileBytes) {
+  return Math.min(
+    MAX_BODY_BYTES,
+    Math.max(DEFAULT_MAX_BODY_BYTES, Math.ceil((maxExtractionFileBytes * 4) / 3) + 512_000),
+  );
+}
+
+function normalizeBase64Payload(value) {
+  const trimmed = value.trim();
+  const dataUrl = trimmed.match(/^data:[^,]+;base64,(.+)$/su);
+  const compact = (dataUrl ? dataUrl[1] : trimmed).replace(/\s+/gu, "");
+  if (!compact || compact.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(compact)) {
+    throw new RequestError(400, "invalid_file_base64", "file.base64 must be valid base64.");
+  }
+  return compact;
+}
+
+function decodedBase64ByteLength(base64) {
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return Math.floor((base64.length * 3) / 4) - padding;
 }
 
 function sanitizeFileName(value) {
