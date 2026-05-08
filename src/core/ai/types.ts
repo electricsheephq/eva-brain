@@ -60,6 +60,18 @@ export interface EmbeddingTouchpoint {
    * Text-only providers leave this undefined.
    */
   supports_multimodal?: boolean;
+  /**
+   * v0.28.11: explicit list of models in this recipe that accept multimodal
+   * input. Required when the recipe mixes text-only and multimodal models
+   * under the same touchpoint (e.g. Voyage). embedMultimodal() validates
+   * `parsed.modelId` against this list AFTER `supports_multimodal` is true,
+   * pre-flighting the HTTP 400 a non-multimodal-capable model would otherwise
+   * trigger at the endpoint. When omitted, every model in `models` is
+   * treated as multimodal-capable (back-compat for providers where the whole
+   * recipe is multimodal). The check fires only inside embedMultimodal();
+   * text embedding paths ignore it.
+   */
+  multimodal_models?: string[];
 }
 
 /**
@@ -142,7 +154,7 @@ export interface Recipe {
 export type AuthSourceClass = 'env' | 'openclaw-codex' | 'openclaw-openai' | 'unauthenticated' | 'missing';
 
 export interface ProviderAuthConfig {
-  /** Default env auth remains highest-priority unless this explicitly selects another source. */
+  /** Explicit credential-source selection. When set, this source wins over stray env API keys. */
   prefer?: Exclude<AuthSourceClass, 'env' | 'unauthenticated' | 'missing'>;
   /** Optional profile name for OpenClaw-backed auth. */
   profile?: string;
@@ -164,6 +176,12 @@ export interface AIGatewayConfig {
   embedding_model?: string;
   /** Target embedding dims. Gateway asserts returned embeddings match this. */
   embedding_dimensions?: number;
+  /**
+   * Separate model for multimodal embeddings (e.g. "voyage:voyage-multimodal-3").
+   * When set, embedMultimodal() routes to this model instead of embedding_model.
+   * Allows brains using OpenAI for text to use Voyage for image embeddings.
+   */
+  embedding_multimodal_model?: string;
   /** Current expansion model as "provider:modelId". */
   expansion_model?: string;
   /** Default chat model for `gateway.chat()` callers (subagent default). */

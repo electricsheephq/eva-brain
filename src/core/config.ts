@@ -82,8 +82,43 @@ export interface GBrainConfig {
    * still win as the operator escape hatch.
    */
   embedding_multimodal?: boolean;
+  /** Model override for multimodal embeddings (e.g. "voyage:voyage-multimodal-3"). */
+  embedding_multimodal_model?: string;
   embedding_image_ocr?: boolean;
   embedding_image_ocr_model?: string;
+
+  /**
+   * Thin-client mode (multi-topology v1). When set, this install does NOT
+   * have a local DB; it talks to a remote `gbrain serve --http` over MCP.
+   * The CLI dispatch guard in `src/cli.ts` checks for this field BEFORE
+   * `connectEngine` and refuses any DB-bound subcommand. The `engine` field
+   * above is still populated (default-inferred) but never used.
+   *
+   * Two URLs because OAuth discovery + `/token` live at the issuer root,
+   * while tool dispatch lives at `/mcp`. They compose from a common base
+   * in the typical setup but the config keeps them explicit so reverse-proxy
+   * topologies work.
+   *
+   * `oauth_client_secret` can also be supplied via the
+   * `GBRAIN_REMOTE_CLIENT_SECRET` env var (preferred for headless agents);
+   * env-var value wins when both are present.
+   */
+  remote_mcp?: {
+    issuer_url: string;
+    mcp_url: string;
+    oauth_client_id: string;
+    oauth_client_secret?: string;
+  };
+}
+
+/**
+ * True when this install is configured as a thin client of a remote
+ * `gbrain serve --http`. Single source of truth for the "is this a
+ * thin-client install?" check used by the CLI dispatch guard, doctor
+ * branch, and remote subcommands.
+ */
+export function isThinClient(config: GBrainConfig | null): boolean {
+  return !!config?.remote_mcp;
 }
 
 /**
@@ -130,8 +165,14 @@ export function loadConfig(env: Record<string, string | undefined> = loadGbrainE
     ...(env.GBRAIN_EMBEDDING_IMAGE_OCR
       ? { embedding_image_ocr: env.GBRAIN_EMBEDDING_IMAGE_OCR === 'true' }
       : {}),
+    ...(env.GBRAIN_EMBEDDING_MULTIMODAL_MODEL
+      ? { embedding_multimodal_model: env.GBRAIN_EMBEDDING_MULTIMODAL_MODEL }
+      : {}),
     ...(env.GBRAIN_EMBEDDING_IMAGE_OCR_MODEL
       ? { embedding_image_ocr_model: env.GBRAIN_EMBEDDING_IMAGE_OCR_MODEL }
+      : {}),
+    ...(env.GBRAIN_REMOTE_CLIENT_SECRET && fileConfig?.remote_mcp
+      ? { remote_mcp: { ...fileConfig.remote_mcp, oauth_client_secret: env.GBRAIN_REMOTE_CLIENT_SECRET } }
       : {}),
   };
   if (env.GBRAIN_OPENAI_AUTH_SOURCE === 'openclaw-codex' || env.GBRAIN_OPENAI_AUTH_SOURCE === 'openclaw-openai') {
@@ -190,6 +231,7 @@ export async function loadConfigWithEngine(
   }
 
   const dbMultimodal = await dbBool('embedding_multimodal');
+  const dbMultimodalModel = await dbStr('embedding_multimodal_model');
   const dbOcr = await dbBool('embedding_image_ocr');
   const dbOcrModel = await dbStr('embedding_image_ocr_model');
 
@@ -199,6 +241,9 @@ export async function loadConfigWithEngine(
   const merged: GBrainConfig = { ...fileConfig };
   if (merged.embedding_multimodal === undefined && dbMultimodal !== undefined) {
     merged.embedding_multimodal = dbMultimodal;
+  }
+  if (merged.embedding_multimodal_model === undefined && dbMultimodalModel !== undefined) {
+    merged.embedding_multimodal_model = dbMultimodalModel;
   }
   if (merged.embedding_image_ocr === undefined && dbOcr !== undefined) {
     merged.embedding_image_ocr = dbOcr;

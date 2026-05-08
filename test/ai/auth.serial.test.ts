@@ -34,11 +34,21 @@ describe('provider auth resolver', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  test('env fallback remains highest priority even when openclaw auth is configured', () => {
+  test('explicit openclaw preference wins over stray env API keys', () => {
     writeFileSync(authPath, JSON.stringify({ profiles: { 'openclaw-codex': { OPENAI_API_KEY: 'oc-secret' } } }));
     const resolution = resolveProviderAuth(openai, config({
       env: { OPENAI_API_KEY: 'env-secret' },
       provider_auth: { openai: { prefer: 'openclaw-codex', openclawAuthPath: authPath } },
+    }));
+    expect(resolution.source).toBe('openclaw-codex');
+    expect(resolution.value).toBe('oc-secret');
+  });
+
+  test('env auth remains the default when no provider auth preference is configured', () => {
+    writeFileSync(authPath, JSON.stringify({ profiles: { 'openclaw-codex': { OPENAI_API_KEY: 'oc-secret' } } }));
+    const resolution = resolveProviderAuth(openai, config({
+      env: { OPENAI_API_KEY: 'env-secret' },
+      provider_auth: { openai: { openclawAuthPath: authPath } },
     }));
     expect(resolution.source).toBe('env');
     expect(resolution.value).toBe('env-secret');

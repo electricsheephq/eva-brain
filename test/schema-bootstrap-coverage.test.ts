@@ -73,6 +73,12 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // v0.26.5 — forward-referenced by `CREATE INDEX pages_deleted_at_purge_idx
   // ON pages (deleted_at) WHERE deleted_at IS NOT NULL`.
   { kind: 'column', table: 'pages', column: 'deleted_at' },
+  // v0.29.1 — forward-referenced by `CREATE INDEX pages_coalesce_date_idx
+  // ON pages ((COALESCE(effective_date, updated_at)))`.
+  { kind: 'column', table: 'pages', column: 'effective_date' },
+  { kind: 'column', table: 'pages', column: 'effective_date_source' },
+  { kind: 'column', table: 'pages', column: 'import_filename' },
+  { kind: 'column', table: 'pages', column: 'salience_touched_at' },
   // v0.27.1 — forward-referenced by `CREATE INDEX idx_chunks_embedding_image
   // ON content_chunks USING hnsw (embedding_image vector_cosine_ops)
   // WHERE embedding_image IS NOT NULL`.
@@ -126,6 +132,11 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
 
       DROP INDEX IF EXISTS pages_deleted_at_purge_idx;
       ALTER TABLE pages DROP COLUMN IF EXISTS deleted_at;
+      DROP INDEX IF EXISTS pages_coalesce_date_idx;
+      ALTER TABLE pages DROP COLUMN IF EXISTS effective_date;
+      ALTER TABLE pages DROP COLUMN IF EXISTS effective_date_source;
+      ALTER TABLE pages DROP COLUMN IF EXISTS import_filename;
+      ALTER TABLE pages DROP COLUMN IF EXISTS salience_touched_at;
 
       DROP INDEX IF EXISTS idx_chunks_embedding_image;
       ALTER TABLE content_chunks DROP COLUMN IF EXISTS embedding_image;
@@ -194,6 +205,11 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       ALTER TABLE links DROP COLUMN IF EXISTS origin_page_id;
       DROP INDEX IF EXISTS pages_deleted_at_purge_idx;
       ALTER TABLE pages DROP COLUMN IF EXISTS deleted_at;
+      DROP INDEX IF EXISTS pages_coalesce_date_idx;
+      ALTER TABLE pages DROP COLUMN IF EXISTS effective_date;
+      ALTER TABLE pages DROP COLUMN IF EXISTS effective_date_source;
+      ALTER TABLE pages DROP COLUMN IF EXISTS import_filename;
+      ALTER TABLE pages DROP COLUMN IF EXISTS salience_touched_at;
       DROP INDEX IF EXISTS idx_subagent_messages_provider;
       ALTER TABLE subagent_messages DROP COLUMN IF EXISTS provider_id;
 
@@ -206,6 +222,39 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
     const { PGLITE_SCHEMA_SQL } = await import('../src/core/pglite-schema.ts');
     await (engine as any).applyForwardReferenceBootstrap();
     await db.exec(PGLITE_SCHEMA_SQL);
+  } finally {
+    await engine.disconnect();
+  }
+}, 30000);
+
+test('initSchema migrates a v40 brain before pages.effective_date existed', async () => {
+  const engine = new PGLiteEngine();
+  await engine.connect({});
+  try {
+    await engine.initSchema();
+    const db = (engine as any).db;
+
+    await db.exec(`
+      DROP INDEX IF EXISTS pages_coalesce_date_idx;
+      ALTER TABLE pages DROP COLUMN IF EXISTS effective_date;
+      ALTER TABLE pages DROP COLUMN IF EXISTS effective_date_source;
+      ALTER TABLE pages DROP COLUMN IF EXISTS import_filename;
+      ALTER TABLE pages DROP COLUMN IF EXISTS salience_touched_at;
+      INSERT INTO config (key, value) VALUES ('version', '40')
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+    `);
+
+    await engine.initSchema();
+
+    for (const column of ['effective_date', 'effective_date_source', 'import_filename', 'salience_touched_at']) {
+      const { rows } = await db.query(
+        `SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'pages' AND column_name = $1`,
+        [column],
+      );
+      expect(rows.length).toBeGreaterThan(0);
+    }
+    expect(await engine.getConfig('version')).toBe('43');
   } finally {
     await engine.disconnect();
   }
@@ -357,25 +406,28 @@ function parseIndexColumnReferences(sql: string): Array<{ table: string; column:
         .replace(/\s+NULLS\s+(?:FIRST|LAST)\s*$/i, '')
         .trim();
       if (!partClean) continue;
-      // Two shapes to extract from:
+      // Shapes to extract from:
       //   `col`                        — plain identifier
       //   `col vector_cosine_ops`      — column followed by operator class (HNSW)
       //   `col COLLATE "C"`            — column with collation
       //   `lower(col)`                 — function-wrapped
+      //   `COALESCE(effective_date, updated_at)` — expression index
       // For shapes 1-3, the column is the LEADING identifier. For shape 4,
-      // the column is the LAST identifier before a close paren.
-      let col: string | null = null;
+      // walk every identifier and filter known SQL/function names.
       if (partClean.includes('(')) {
-        // Function-wrapped: `lower(col)` → grab the last identifier inside.
-        const fnMatch = partClean.match(/(\w+)\s*\)\s*$/);
-        if (fnMatch) col = fnMatch[1];
+        const skip = new Set([
+          'lower', 'upper', 'coalesce', 'greatest', 'least', 'nullif',
+          'case', 'when', 'then', 'else', 'end', 'true', 'false', 'null',
+          'asc', 'desc', 'nulls', 'first', 'last',
+        ]);
+        for (const token of partClean.matchAll(/\b[A-Za-z_][A-Za-z0-9_]*\b/g)) {
+          const col = token[0].toLowerCase();
+          if (!skip.has(col)) result.push({ table, column: col });
+        }
       } else {
         // Plain or operator-class-suffixed: leading identifier wins.
         const leadMatch = partClean.match(/^["`]?(\w+)["`]?/);
-        if (leadMatch) col = leadMatch[1];
-      }
-      if (col && !/^(true|false|null|asc|desc)$/i.test(col)) {
-        result.push({ table, column: col.toLowerCase() });
+        if (leadMatch) result.push({ table, column: leadMatch[1].toLowerCase() });
       }
     }
   }
@@ -395,6 +447,7 @@ test('parseBaseTableColumns + parseIndexColumnReferences extract structural refe
     CREATE INDEX idx_pages_lower ON pages (lower(slug));
     CREATE INDEX idx_pages_composite ON pages (slug, id DESC);
     CREATE INDEX idx_pages_hnsw ON pages USING hnsw (embedding vector_cosine_ops);
+    CREATE INDEX idx_pages_coalesce ON pages ((COALESCE(effective_date, updated_at)));
   `;
   const baseCols = parseBaseTableColumns(fixture);
   expect(baseCols.get('pages')).toBeDefined();
@@ -413,6 +466,9 @@ test('parseBaseTableColumns + parseIndexColumnReferences extract structural refe
   expect(refs).toContainEqual({ table: 'pages', column: 'id' });
   // USING hnsw with operator class.
   expect(refs).toContainEqual({ table: 'pages', column: 'embedding' });
+  // Expression index — every real column inside the expression is covered.
+  expect(refs).toContainEqual({ table: 'pages', column: 'effective_date' });
+  expect(refs).toContainEqual({ table: 'pages', column: 'updated_at' });
 });
 
 test('parseIndexColumnReferences catches v0.27 composite second-column case', () => {

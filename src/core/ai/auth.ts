@@ -18,12 +18,12 @@ export function getProviderAuthConfig(config: AIGatewayConfig | undefined, recip
 
 export function resolveProviderAuth(recipe: Recipe, config: AIGatewayConfig): AuthResolution {
   const providerConfig = getProviderAuthConfig(config, recipe);
-  const envResolution = resolveEnvAuth(recipe, config.env);
-  if (envResolution) return envResolution;
-
   if (providerConfig.prefer === 'openclaw-codex' || providerConfig.prefer === 'openclaw-openai') {
     return resolveOpenClawProfileAuth(recipe, config, providerConfig);
   }
+
+  const envResolution = resolveEnvAuth(recipe, config.env);
+  if (envResolution) return envResolution;
 
   return missingResolution(recipe, providerConfig);
 }

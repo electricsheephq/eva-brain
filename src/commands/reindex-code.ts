@@ -26,11 +26,14 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { importCodeFile } from '../core/import-file.ts';
 import { estimateTokens } from '../core/chunkers/code.ts';
-import { EMBEDDING_MODEL, estimateEmbeddingCostUsd } from '../core/embedding.ts';
 import { errorFor, serializeError } from '../core/errors.ts';
 import { createInterface } from 'readline';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { getEmbeddingModel } from '../core/ai/gateway.ts';
+import { assertTouchpoint, resolveRecipe } from '../core/ai/model-resolver.ts';
+
+const DEFAULT_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
 
 export interface ReindexCodeOpts {
   sourceId?: string;
@@ -50,7 +53,7 @@ export interface ReindexCodeResult {
   skipped: number;
   failed: number;
   totalTokens: number;
-  costUsd: number;
+  costUsd: number | null;
   model: string;
   failures?: Array<{ slug: string; error: string }>;
 }
@@ -69,25 +72,58 @@ async function fetchCodePages(
 ): Promise<CodePageRow[]> {
   // Direct SQL: listPages doesn't expose source_id filtering, and we need
   // compiled_truth + frontmatter anyway (not just the Page shape).
-  const sourceClause = sourceId ? `AND p.source_id = '${sourceId.replace(/'/g, "''")}'` : '';
+  const params: unknown[] = [batchSize, offset];
+  const sourceClause = sourceId !== undefined ? `AND p.source_id = $3` : '';
+  if (sourceId !== undefined) params.push(sourceId);
   const rows = await engine.executeRaw<CodePageRow>(
     `SELECT p.slug, p.compiled_truth, p.frontmatter
      FROM pages p
      WHERE p.type = 'code' ${sourceClause}
      ORDER BY p.slug
-     LIMIT ${batchSize} OFFSET ${offset}`,
+     LIMIT $1 OFFSET $2`,
+    params,
   );
   return rows;
 }
 
 async function countCodePages(engine: BrainEngine, sourceId: string | undefined): Promise<number> {
-  const sourceClause = sourceId ? `AND p.source_id = '${sourceId.replace(/'/g, "''")}'` : '';
+  const params: unknown[] = [];
+  const sourceClause = sourceId !== undefined ? `AND p.source_id = $1` : '';
+  if (sourceId !== undefined) params.push(sourceId);
   const rows = await engine.executeRaw<{ n: string | number }>(
     `SELECT COUNT(*)::text AS n FROM pages p WHERE p.type = 'code' ${sourceClause}`,
+    params,
   );
   if (rows.length === 0) return 0;
   const raw = rows[0]!.n;
   return typeof raw === 'string' ? parseInt(raw, 10) : raw;
+}
+
+function currentEmbeddingModelForPreview(): string {
+  try {
+    return getEmbeddingModel();
+  } catch {
+    return DEFAULT_EMBEDDING_MODEL;
+  }
+}
+
+function estimateEmbeddingPreviewCost(tokens: number): { costUsd: number | null; model: string } {
+  const configuredModel = currentEmbeddingModelForPreview();
+  try {
+    const { parsed, recipe } = resolveRecipe(configuredModel);
+    assertTouchpoint(recipe, 'embedding', parsed.modelId);
+    const costPerMillion = recipe.touchpoints.embedding?.cost_per_1m_tokens_usd;
+    return {
+      model: `${recipe.id}:${parsed.modelId}`,
+      costUsd: costPerMillion === undefined ? null : (tokens / 1_000_000) * costPerMillion,
+    };
+  } catch {
+    return { model: configuredModel, costUsd: null };
+  }
+}
+
+function formatCostPreview(costUsd: number | null): string {
+  return costUsd === null ? 'cost unknown' : `est. $${costUsd.toFixed(2)}`;
 }
 
 /**
@@ -136,7 +172,7 @@ export async function runReindexCode(
   const batchSize = opts.batchSize ?? 100;
 
   const { totalTokens, totalPages } = await estimateReindexCost(engine, opts.sourceId, batchSize);
-  const costUsd = estimateEmbeddingCostUsd(totalTokens);
+  const { costUsd, model } = estimateEmbeddingPreviewCost(totalTokens);
 
   if (opts.dryRun) {
     return {
@@ -147,7 +183,7 @@ export async function runReindexCode(
       failed: 0,
       totalTokens,
       costUsd,
-      model: EMBEDDING_MODEL,
+      model,
     };
   }
 
@@ -160,7 +196,7 @@ export async function runReindexCode(
       failed: 0,
       totalTokens: 0,
       costUsd: 0,
-      model: EMBEDDING_MODEL,
+      model,
     };
   }
 
@@ -200,6 +236,7 @@ export async function runReindexCode(
           const result = await importCodeFile(engine, relPath, row.compiled_truth, {
             noEmbed: opts.noEmbed,
             force: opts.force,
+            sourceId: opts.sourceId,
           });
           if (result.status === 'imported') reindexed++;
           else if (result.status === 'skipped') skipped++;
@@ -229,7 +266,7 @@ export async function runReindexCode(
     failed,
     totalTokens,
     costUsd,
-    model: EMBEDDING_MODEL,
+    model,
     failures: failures.length > 0 ? failures : undefined,
   };
 }
@@ -256,7 +293,7 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
       console.log(
         `reindex-code preview: ${result.codePages} code page(s), ` +
           `~${result.totalTokens.toLocaleString()} tokens, ` +
-          `est. $${result.costUsd.toFixed(2)} on ${result.model}.`,
+          `${formatCostPreview(result.costUsd)} on ${result.model}.`,
       );
       console.log('--dry-run: exit without reindexing.');
     }
@@ -266,15 +303,15 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
   // Cost preview + gate, before touching the DB.
   if (!noEmbed) {
     const preview = await estimateReindexCost(engine, sourceId, 100);
-    const costUsd = estimateEmbeddingCostUsd(preview.totalTokens);
+    const { costUsd, model } = estimateEmbeddingPreviewCost(preview.totalTokens);
     const previewMsg =
       `reindex-code: ${preview.totalPages} code page(s), ` +
       `~${preview.totalTokens.toLocaleString()} tokens, ` +
-      `est. $${costUsd.toFixed(2)} on ${EMBEDDING_MODEL}.`;
+      `${formatCostPreview(costUsd)} on ${model}.`;
 
     if (preview.totalPages === 0) {
       if (json) {
-        console.log(JSON.stringify({ status: 'ok', codePages: 0, reindexed: 0, skipped: 0, failed: 0, totalTokens: 0, costUsd: 0, model: EMBEDDING_MODEL }));
+        console.log(JSON.stringify({ status: 'ok', codePages: 0, reindexed: 0, skipped: 0, failed: 0, totalTokens: 0, costUsd: 0, model }));
       } else {
         console.log('No code pages to reindex.');
       }
@@ -290,7 +327,7 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
           message: previewMsg,
           hint: 'Pass --yes to proceed, or --dry-run to see the preview and exit 0.',
         }));
-        console.log(JSON.stringify({ error: envelope, preview, costUsd, model: EMBEDDING_MODEL }));
+        console.log(JSON.stringify({ error: envelope, preview, costUsd, model }));
         process.exit(2);
       }
       console.log(previewMsg);
@@ -309,7 +346,7 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
     console.log(
       `reindex-code: ${result.reindexed} reindexed, ${result.skipped} skipped, ${result.failed} failed ` +
         `(${result.codePages} total code pages, ~${result.totalTokens.toLocaleString()} tokens, ` +
-        `est. $${result.costUsd.toFixed(2)}).`,
+        `${formatCostPreview(result.costUsd)} on ${result.model}).`,
     );
     if (result.failures && result.failures.length > 0) {
       console.log(`\n${result.failures.length} failure(s):`);

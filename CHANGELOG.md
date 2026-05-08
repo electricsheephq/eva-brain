@@ -2,6 +2,658 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.29.2] - 2026-05-07
+
+**Thin-client mode: install gbrain on a laptop without a local DB and have it consume a remote brain over MCP.**
+**`gbrain init --mcp-only` + `gbrain remote ping` + `gbrain remote doctor` + run_doctor MCP op.**
+
+You can now run `gbrain init --mcp-only --issuer-url <url> --mcp-url <url>/mcp --oauth-client-id <id> --oauth-client-secret <secret>` on a machine that should NOT have its own brain. No PGLite file gets created. No Postgres connection. Three pre-flight smoke probes run before the config lands so a typo in the URL or a bad credential surfaces up front, not later. The CLI's dispatch guard refuses every DB-bound subcommand (`sync`, `embed`, `extract`, `migrate`, `apply-migrations`, `repair-jsonb`, `orphans`, `integrity`, `serve`) with a single canonical error pointing at the remote host. `gbrain doctor` runs a thin-client check set instead: OAuth discovery, token round-trip, MCP initialize.
+
+Once configured, `gbrain remote ping` triggers an autopilot cycle on the remote host and polls until terminal so you don't have to wait for the autopilot cron after writing markdown. `gbrain remote doctor` calls a new `run_doctor` MCP op (admin scope, HTTP-reachable) that returns a structured DoctorReport from the remote host's brain. Fast feedback when something's off.
+
+The new `docs/architecture/topologies.md` documents three deployment shapes (single brain, cross-machine thin client, per-worktree code engines + shared remote artifacts) so users and gstack can compose them deliberately. Topology 3 (per-worktree split-engine for Conductor users) needs zero gbrain code changes — `GBRAIN_HOME` already overrides `~/.gbrain` and `gbrain serve --http --port N` already runs on any port. The new doc spells out the alias-routing footgun (wrong alias = silent wrong-brain writes) explicitly.
+
+### What this means for you
+
+A v0.29.1 caller upgrading to v0.29.2 with no setup change gets identical local-only behavior. The thin-client surface is pure opt-in: only fires when `~/.gbrain/config.json` carries a `remote_mcp` block. Existing local-engine installs are unchanged.
+
+If you want to actually use thin-client mode:
+
+1. On the host running `gbrain serve --http`: `gbrain auth register-client <name> --grant-types client_credentials --scopes "read write admin"` (admin needed for ping + doctor).
+2. On the consuming machine: `gbrain init --mcp-only --issuer-url <issuer> --mcp-url <issuer>/mcp --oauth-client-id <id> --oauth-client-secret <secret>`.
+3. Configure your agent's MCP client to point at the host's `mcp_url` with the bearer token. Per-client snippets in `docs/mcp/`.
+4. `gbrain doctor` to verify connectivity, `gbrain remote ping` after writes, `gbrain remote doctor` for remote-side health.
+
+The full setup recipe and three topology diagrams live in `docs/architecture/topologies.md`.
+
+## To take advantage of v0.29.2
+
+`gbrain upgrade` does this automatically — no schema migration, no data backfill. The thin-client surface is opt-in via the `--mcp-only` flag.
+
+If you're setting up a new thin-client install:
+
+```bash
+# On the host
+gbrain serve --http --port 3001
+gbrain auth register-client neuromancer --grant-types client_credentials --scopes "read write admin"
+
+# On the thin client
+gbrain init --mcp-only \
+  --issuer-url https://brain-host:3001 \
+  --mcp-url https://brain-host:3001/mcp \
+  --oauth-client-id <id> --oauth-client-secret <secret>
+
+# Verify
+gbrain doctor          # thin-client check set: discovery, token, MCP smoke
+gbrain remote doctor   # ask the host to run its own doctor
+gbrain remote ping     # trigger an autopilot cycle on the host
+```
+
+If anything fails, please file an issue: https://github.com/garrytan/gbrain/issues with:
+- output of `gbrain doctor --json` from the thin client
+- a redacted copy of `~/.gbrain/config.json`
+- which step failed
+
+### Itemized changes
+
+**New CLI surfaces**:
+
+- `gbrain init --mcp-only` (`src/commands/init.ts`) — thin-client setup. Pre-flight runs OAuth discovery, `/token` round-trip, and MCP initialize against the remote before writing config. Re-run guard refuses without `--force` when `~/.gbrain/config.json` already has `remote_mcp` set, so scripted setup-loops can't silently re-create a local DB on a thin-client machine.
+- `gbrain remote ping` (`src/commands/remote.ts`) — submits an `autopilot-cycle` job on the remote via `submit_job` MCP op, polls `get_job` with backoff (1s × 30s, then 5s × 5min, then 10s), exits when terminal. Default cap 15min, override with `--timeout 5m` or `--timeout 30m`. NO `repo` arg passed — autopilot uses the host's configured brain repo, no caller-controlled paths.
+- `gbrain remote doctor` (`src/commands/remote.ts`) — calls the new `run_doctor` MCP op, renders the DoctorReport. Exit 0/1 based on status.
+
+**New config field**:
+
+- `remote_mcp: {issuer_url, mcp_url, oauth_client_id, oauth_client_secret}` on `GBrainConfig`. Two URLs because OAuth discovery + `/token` live at the issuer root while tool dispatch is at `/mcp` — they compose from a common base in practice but reverse-proxy setups need them explicit. `GBRAIN_REMOTE_CLIENT_SECRET` env var overrides the config-file value for headless agents; secrets supplied via env stay out of disk.
+- `isThinClient(config)` helper in `src/core/config.ts` — single source of truth for the "is this install a thin client?" check used by the CLI dispatch guard, doctor branch, and remote subcommands.
+
+**New CLI dispatch guard** (`src/cli.ts`):
+
+- Single top-level check refuses 9 DB-bound commands with a canonical error naming the remote `mcp_url` when `remote_mcp` is set. Runs BEFORE `connectEngine` so commands never enter the engine factory only to fail late. Doctor branches to a new `runRemoteDoctor` for thin-client installs.
+- `engine` field on `GBrainConfig` stays as today (`postgres | pglite`) — thin-client mode is a separate code path, NOT an engine kind extension.
+
+**New thin-client doctor** (`src/core/doctor-remote.ts`, ~180 LOC):
+
+- Five outbound HTTP probes scoped to "is the remote MCP we configured actually reachable?": config_integrity (URL fields well-formed), oauth_credentials (secret resolvable), oauth_discovery, oauth_token, mcp_smoke. Output shape matches the local doctor's Check surface (`schema_version: 2`) so JSON consumers can union the two without conditional logic.
+
+**New focused server-side doctor** (`src/commands/doctor.ts:doctorReportRemote`):
+
+- Used by the new `run_doctor` MCP op for `gbrain remote doctor`. Five checks: connection (engine reachable), schema_version (current vs latest), brain_score (5-component composite), sync_failures (file-plane JSONL count), queue_health (Postgres-only stalled-job sweep). Engine-agnostic — uses `engine.executeRaw` + `engine.getConfig` + `engine.getHealth`. Local doctor (`runDoctor`) is unchanged; operators on the host still get the full check set.
+- New `DoctorReport` interface + `computeDoctorReport(checks)` exported for shared status/score math.
+
+**New MCP op** (`src/core/operations.ts`):
+
+- `run_doctor` (`scope: 'admin'`, `localOnly: false`, `mutating: false`) wraps `doctorReportRemote()` and returns the structured DoctorReport. First read-only diagnostic op exposed over HTTP MCP. Doctor only — generalizing to lint/integrity/orphans is filed as follow-up pending demand.
+
+**New outbound HTTP MCP client** (`src/core/mcp-client.ts`, ~210 LOC):
+
+- Wraps the official `@modelcontextprotocol/sdk` `Client` + `StreamableHTTPClientTransport` with OAuth `client_credentials` minting, in-process token caching (Map keyed by `mcp_url`, expires_at with 30s safety margin), and refresh-on-401 retry semantics. Initial-credentials-fail surfaces immediately as `RemoteMcpError(auth)` — retry only fires when a previously-good token gets rejected mid-session. Auth-fail-after-refresh produces a structured error pointing the operator at `gbrain auth register-client`.
+- Probe helpers in `src/core/remote-mcp-probe.ts` (`discoverOAuth`, `mintClientCredentialsToken`, `smokeTestMcp`) — pure `fetch`-based, no SDK dep, used by both init's setup smoke and the thin-client doctor.
+
+**New documentation**:
+
+- `docs/architecture/topologies.md` — three topology diagrams (single brain, cross-machine thin client, split-engine per-worktree) with concrete setup recipes. Honest about Topology 3's manual-alias routing (wrong alias = silent wrong-brain writes).
+- `skills/setup/SKILL.md` — new Phase A.5 walks the user through which topology fits before running `gbrain init`. Thin-client path skips Phases B/C/C.5/H entirely.
+
+**Tests** (72 new test cases across 6 new files):
+
+- `test/init-mcp-only.test.ts` (15 cases) — happy path, env-var-supplied secret stays out of disk, all four required-flag missing-error paths, three pre-flight smoke-failure paths, network-unreachable, four re-run-guard variants.
+- `test/cli-dispatch-thin-client.test.ts` (14 cases) — 9 refused commands × canonical error, 2 safe commands still work, doctor routes to runRemoteDoctor, regression for local config.
+- `test/doctor-remote.test.ts` (12 cases) — 5 thin-client checks against in-process HTTP fixture, every probe failure mode (404/parse/auth/network/server-error), env-var override of secret.
+- `test/doctor-report-remote.test.ts` (11 cases) — 5 PGLite checks, computeDoctorReport math.
+- `test/mcp-client.test.ts` (13 cases) — token cache, force-refresh, every error reason path, unpackToolResult parse failures.
+- `test/e2e/thin-client.test.ts` (7 cases against real Postgres + `gbrain serve --http`) — full cross-machine flow: init → doctor → sync refused → remote doctor → remote ping → re-run-guard → scope-mismatch regression.
+
+All tests use async `Bun.spawn` for subprocess invocation rather than `execFileSync`, which deadlocks against in-process HTTP fixtures because the parent's event loop can't accept connections while sync-blocked.
+
+## [0.29.1] - 2026-05-05
+
+**Recency and salience as two orthogonal options. Agent in charge.**
+**Two ranking knobs, smart heuristic, no default behavior change for existing callers.**
+
+v0.29 made the brain tell you what's hot. v0.29.1 lets the agent ask for
+recency or salience independently — two orthogonal axes on the regular
+`query` op, both opt-in, both with smart auto-detection from query text.
+"What's going on with widget-co" auto-fires both. "Who is widget-ceo"
+keeps both off. The agent overrides per query.
+
+The two axes:
+
+- **`salience: 'off' | 'on' | 'strong'`** — boost pages with high
+  `emotional_weight` + many active takes. NO time component. Use for
+  "what matters about X."
+- **`recency: 'off' | 'on' | 'strong'`** — per-prefix age decay. NO
+  mattering signal. `concepts/`, `originals/`, `writing/` stay
+  evergreen; `daily/`, `media/x/`, `chat/` decay aggressively. Use for
+  "what's new on X."
+
+Plus `since` / `until` date filters (replacing PR #618's `afterDate` /
+`beforeDate` with proper PGLite parity), a new `pages.effective_date`
+column populated from frontmatter precedence (immune to auto-link
+`updated_at` churn), and `gbrain reindex-frontmatter` for explicit
+recompute. Existing callers (no new params) get UNCHANGED behavior.
+
+### What this means for you
+
+A v0.29.0 caller upgrading to v0.29.1 with no code changes gets
+identical query results. The new axes are pure opt-in. The agent
+reads the new tool descriptions on every `tools/list` poll and learns
+when to pass each value.
+
+Pass `salience='on'` for meeting prep, conversation recall, "what's
+going on with X." Pass `recency='on'` for "latest" / "this week" /
+"recent updates." Pass `recency='strong'` for "today" / "right now."
+Omit and gbrain auto-detects via the layered classifier in
+`src/core/search/query-intent.ts` (canonical patterns win over
+current-state EXCEPT when explicit temporal bounds like "today" /
+"this week" / "since X" are present).
+
+### Itemized changes
+
+**Schema** (additive only, NDJSON schema_version stays at 1):
+- Migration v38 adds 4 nullable columns to `pages`: `effective_date`,
+  `effective_date_source`, `import_filename`, `salience_touched_at`.
+- Migration v39 adds 7 nullable columns to `eval_candidates` for
+  agent-explicit recency capture (replay reproducibility per D11).
+- Expression index `pages_coalesce_date_idx` for `since`/`until` filters.
+
+**Engine methods** (composite-keyed for multi-source isolation):
+- `getEffectiveDates(refs)` returns `COALESCE(effective_date,
+  updated_at, created_at)`. Map keyed by `${source_id}::${slug}`.
+- `getSalienceScores(refs)` returns `emotional_weight × 5 + ln(1 +
+  take_count)`. Same composite key.
+
+**Search pipeline**:
+- New `runPostFusionStages` wrapper consolidates backlink + salience +
+  recency. Called from ALL THREE `hybridSearch` return paths so
+  keyless installs and embed failures get the same boost surface.
+- `applySalienceBoost` — pure mattering. `applyRecencyBoost` — pure
+  age decay. Truly orthogonal.
+- `buildRecencyComponentSql` shared SQL builder with typed `NowExpr`
+  enum (no SQL injection).
+
+**Query op**: gains `salience`, `recency`, `since`, `until` with
+load-bearing tool descriptions. `get_recent_salience` gains
+`recency_bias: 'flat' | 'on'` (default `'flat'` = v0.29.0 verbatim).
+
+**Back-compat**: `afterDate`/`beforeDate`/`recencyBoost` from PR #618
+remain as deprecated aliases. Stderr warning fires once per process.
+Removed in v0.30.
+
+**Heuristic**: `query-intent.ts` replaces `intent.ts`. Single regex
+pass returning `{intent, suggestedDetail, suggestedSalience,
+suggestedRecency}`. Canonical-wins + narrow temporal-bound exception.
+English-only in v0.29.1.
+
+**Doctor**: `effective_date_health` + `salience_health` checks. Both
+gracefully skip on pre-v0.29.1 brains.
+
+**CLI**: `gbrain reindex-frontmatter` — recovery / explicit-rebuild
+path mirroring `gbrain reindex-code`.
+
+**Tests**: `test/effective-date.test.ts` (21 cases),
+`test/recency-decay.test.ts` (25 cases), `test/query-intent.test.ts`
+(21 cases).
+
+### To take advantage of v0.29.1
+
+`gbrain upgrade` runs the full migration chain automatically. Verify:
+
+1. **Confirm upgrade**:
+   ```bash
+   gbrain --version    # 0.29.1
+   ```
+
+2. **Recompute emotional weights** (one-time after upgrade):
+   ```bash
+   gbrain dream --phase recompute_emotional_weight
+   ```
+
+3. **Verify health checks**:
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name == "salience_health" or .name == "effective_date_health")'
+   ```
+
+4. **Try the new axes**:
+   ```bash
+   gbrain query "what's been going on with X" --explain --json | jq '._resolved'
+   # expected: salience='on', recency='on'
+
+   gbrain query "who is X" --explain --json | jq '._resolved'
+   # expected: salience='off', recency='off'
+   ```
+
+5. **If anything looks wrong** — `gbrain doctor --json` output and
+   `~/.gbrain/upgrade-errors.jsonl` (if present) on a Github issue:
+   https://github.com/garrytan/gbrain/issues
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Wintermute <wintermute@garrytan.com>
+
+## [0.29.0] - 2026-05-03
+
+**The brain tells you what's hot without being asked.**
+**Salience + anomaly detection ship. Search rewards hypotheses; salience surfaces them.**
+
+Search rewards pre-formed hypotheses. To find the wedding cluster you
+already had to know to type "wedding". v0.29 inverts that: three new MCP
+ops surface what is unusual and emotionally charged in your brain without
+needing a search term. Ask "anything crazy happening lately?" and the
+agent reaches for `get_recent_salience` instead of running `query("crazy")`
+and missing the cluster of pages all sharing one tag.
+
+Three primitives. `get_recent_salience` ranks pages touched in the window
+by a deterministic emotional + activity score (no LLM call). `find_anomalies`
+detects cohort-level activity bursts vs a 30-day baseline densified with
+`generate_series` zero-fill (so rare cohorts stop looking "normally
+active"). `get_recent_transcripts` returns one-line summaries of the raw
+`.txt` transcripts from the dream-cycle corpus dirs, gated to local CLI
+only — MCP and HTTP cannot reach raw conversation text.
+
+Plus a new dream-cycle phase, `recompute_emotional_weight`, that batches
+weight computation in two SQL round-trips total — `WITH page_tags AS ...
+WITH page_takes AS ...` so the page × N tags × M takes cartesian product
+never happens; `UPDATE pages FROM unnest(...) USING (slug, source_id)` so
+multi-source brains can't accidentally fan out across sources. 1000 pages
+backfill in ~1.4s on PGLite; 50K pages should land under 60s on Postgres.
+
+### The numbers that matter
+
+Surface area added vs v0.28. Numbers from `git diff master..HEAD --stat`
+on this branch:
+
+| Surface | Before | After | Δ |
+|---|---|---|---|
+| Engine methods on BrainEngine | 50 | 54 | +4 (`batchLoadEmotionalInputs`, `setEmotionalWeightBatch`, `getRecentSalience`, `findAnomalies`) |
+| MCP operations | 44 | 47 | +3 (`get_recent_salience`, `find_anomalies`, `get_recent_transcripts`) |
+| Subagent tool allow-list | 11 | 13 | +2 (transcripts intentionally excluded — local-only via remote=false gate) |
+| Cycle phases | 8 | 9 | +`recompute_emotional_weight` between extract/synthesize and embed |
+| New SQL columns | — | 1 | `pages.emotional_weight REAL DEFAULT 0.0` (no index — score is computed) |
+| Schema migrations | v39 | v40 | +1 (column-only, ADD COLUMN IF NOT EXISTS, instant) |
+| `list_pages` params | 3 | 5 | +`updated_after`, +`sort` enum (engine ORDER BY threading; was hardcoded DESC) |
+| New unit + e2e tests | — | 75+ | 14 emotional-weight, 13 anomalies, 8 transcripts, 21 descriptions, 7 phase, 5 salience-pglite, 4 anomalies-pglite, 4 multi-source, 3 cycle e2e, 6 list_pages, 1 perf, +12 LLM routing eval (Tier 2) |
+
+**What this means for you:** ask "what's been going on with me?" and the
+agent finds the cluster on the first tool call instead of the fifth.
+A cluster of pages sharing a tag, all touched the same day, surface at the top of
+`gbrain salience --days 7`. A burst of 15 pages tagged `family` shows up
+in `gbrain anomalies` as a 3σ outlier vs a 0.3/day baseline. The brain
+stops being a search engine and starts being an aide who notices.
+
+## To take advantage of v0.29.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if
+`gbrain doctor` warns about an incomplete migration:
+
+1. **Run the migration** (mechanical schema-only ALTER TABLE):
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Backfill emotional_weight on every page** (one-time, deterministic;
+   ~1s per 1000 pages on PGLite, ~60s for 50K pages on Postgres):
+   ```bash
+   gbrain dream --phase recompute_emotional_weight
+   ```
+3. **Try the Garry test** to verify routing changed:
+   ```bash
+   gbrain salience --days 14
+   gbrain anomalies
+   gbrain transcripts recent --days 7
+   ```
+   The salience output should rank pages with high-emotion tags (family,
+   wedding, loss, mental-health) above pages with the same recency but
+   no emotional content.
+4. **(Optional) Tune the high-emotion tag list** if you keep a brain
+   that's mostly work-life. The default list is anglocentric +
+   personal-life-biased; override with the tags that drive *your*
+   emotional weight:
+   ```bash
+   gbrain config set emotional_weight.high_tags '["family","health","grief","custom-tag"]'
+   gbrain dream --phase recompute_emotional_weight
+   ```
+   Tag matching is case-insensitive. The override goes through the same
+   formula, just with your tag set.
+5. **If any step fails or salience returns nothing,** file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - output of `gbrain salience --json --days 30`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+
+### Itemized changes
+
+#### Schema (migration v40)
+
+- **`pages.emotional_weight REAL NOT NULL DEFAULT 0.0`** — column-only,
+  no index. Default 0.0 so freshly imported pages don't pollute salience
+  ranking before the cycle phase populates real values.
+- **No `idx_pages_emotional_weight`** — the salience query orders by a
+  computed score (`emotional_weight × 5 + ln(1+takes) + recency_decay`),
+  not raw weight. Adding the index later requires a separate migration.
+
+#### New cycle phase: `recompute_emotional_weight`
+
+- Runs **after** extract + synthesize, **before** embed/orphans. Sees fresh
+  tag + take state for every page touched in the cycle.
+- Two SQL round-trips total regardless of brain size:
+  1. CTE-shaped `batchLoadEmotionalInputs` with per-table aggregates that
+     avoid the page × N tags × M takes cartesian product.
+  2. `setEmotionalWeightBatch` with `UPDATE FROM unnest($1::text[],
+     $2::text[], $3::real[])` keyed on `(slug, source_id)` so multi-source
+     brains can't fan out.
+- Selectable via `gbrain dream --phase recompute_emotional_weight` for
+  targeted backfills (initial upgrade path).
+- Incremental mode in routine cycles: union of `syncPagesAffected` +
+  `synthesizeWrittenSlugs`, so only the pages touched this cycle get
+  recomputed. Full mode walks every page.
+
+#### New MCP ops + CLI
+
+- **`get_recent_salience`** / `gbrain salience [--days N] [--limit N]
+  [--kind PREFIX] [--json]` — Pages ranked by `(emotional_weight × 5) +
+  ln(1 + active_take_count) + recency_decay`. Time boundary computed in
+  JS and bound as TIMESTAMPTZ so the SQL is identical across PGLite +
+  Postgres.
+- **`find_anomalies`** / `gbrain anomalies [--since YYYY-MM-DD]
+  [--lookback-days N] [--sigma N] [--json]` — Cohort-level activity
+  outliers. Two cohort kinds in v1: tag, type. Year cohort deferred to
+  v0.30 pending proper frontmatter date detection. Baseline densified with
+  `generate_series` zero-fill so rare cohorts get correct `(mean, stddev)`
+  instead of biased upward by sparse-day omission. Zero-stddev fallback:
+  cohort fires when `count > mean + 1` (no NaN sigma).
+- **`get_recent_transcripts`** / `gbrain transcripts recent [--days N]
+  [--full] [--json]` — Reads `.txt` files from `dream.synthesize.session_corpus_dir`
+  + `dream.synthesize.meeting_transcripts_dir`. Skips dream-generated
+  outputs via `isDreamOutput` (v0.23.2 self-consumption guard). **Local-only:**
+  rejects `ctx.remote === true` callers with `permission_denied`. Not in
+  the subagent allow-list (subagent calls always run with `remote=true`,
+  so it would always reject — a footgun if visible).
+
+#### Tool description redirects (zero-cost routing nudges)
+
+- `query`, `search`, `list_pages` descriptions now redirect personal /
+  emotional / "what's recent" intents to the new ops. Descriptions
+  extracted to `src/core/operations-descriptions.ts` so they're pinnable
+  in tests.
+- `query` description warns the LLM not to assume words like "crazy",
+  "notable", or "big" mean impressive — they often mean difficult or
+  emotionally charged.
+- `list_pages` gains `updated_after` (string ISO) and `sort` enum
+  (`updated_desc | updated_asc | created_desc | slug`, default
+  `updated_desc`). Engines threaded — they previously hardcoded
+  `ORDER BY updated_at DESC`.
+
+#### Subagent allow-list
+
+- `get_recent_salience` + `find_anomalies` added (read-only, no
+  schema-shaping needed).
+- `get_recent_transcripts` deliberately excluded — see codex C3 finding
+  reflected in `BRAIN_TOOL_ALLOWLIST` comments.
+
+#### Tests
+
+- 14 unit tests for the formula (`test/emotional-weight.test.ts`).
+- 13 unit tests for the anomaly stats helpers + zero-stddev fallback
+  (`test/anomalies.test.ts`).
+- 21 unit tests pinning the description constants + allow-list invariants
+  (`test/operations-descriptions.test.ts`).
+- 7 unit tests for the cycle phase orchestration with a fake engine
+  (`test/recompute-emotional-weight.test.ts`).
+- 8 unit tests for `listRecentTranscripts` covering trust gate, mtime
+  window, summary truncation, dream-output skip, no corpus_dir
+  (`test/transcripts.test.ts`).
+- E2E PGLite (no DATABASE_URL needed):
+  - `salience-pglite.test.ts` (Garry test — 7 wedding pages outrank 100 random)
+  - `anomalies-pglite.test.ts` (cohort burst > 3σ vs zero baseline)
+  - `multi-source-emotional-weight-pglite.test.ts` (codex C4#3 regression
+    guard for `(slug, source_id)` composite key)
+  - `cycle-recompute-emotional-weight-pglite.test.ts` (phase wiring +
+    dry-run)
+  - `list-pages-regression.test.ts` (IRON RULE — old call shape still
+    works; new sort + updated_after threaded)
+  - `backfill-perf-pglite.test.ts` (1000-page fixture under 5s budget)
+- E2E Postgres-gated:
+  - `engine-parity-salience.test.ts` (PGLite ↔ Postgres top-result and
+    cohort parity)
+- Tier-2 LLM routing eval (`ANTHROPIC_API_KEY` gated):
+  - `salience-llm-routing.test.ts` — calls Claude with v0.29 tool
+    descriptions and 12 personal-query phrasings, asserts routing lands
+    in `{get_recent_salience, find_anomalies, get_recent_transcripts}`.
+    ~$0.10/CI run. **Tests the actual ship criterion** — replaces the
+    discarded substring-match routing-eval fixtures (codex correctly
+    flagged those as fake coverage).
+
+#### For contributors
+
+- v0.23 routing-eval framework (`routing-eval.ts`) is **not** the right
+  surface for testing MCP tool-description routing. It's a substring
+  matcher over `skills/<name>/triggers:` frontmatter — useful for skill
+  resolver coverage, not LLM tool selection. Use the Tier-2 LLM eval
+  pattern in `test/e2e/salience-llm-routing.test.ts` for any future
+  feature whose value prop depends on the LLM choosing the right tool.
+- All v0.29 SQL was reviewed for cross-engine parity. Where postgres.js
+  and PGLite handle parameter binding differently (e.g., `$1::interval`
+  vs computing the boundary in JS), v0.29 always picks the parity-safe
+  path. See engine-parity-salience.test.ts for the smoke.
+
+
+## [0.28.12] - 2026-05-07
+
+**gbrain hits 97.60% retrieval recall on the public LongMemEval benchmark.
+Beats MemPalace raw by a point, ties or beats it on 5 of 6 question types,
+no LLM in the retrieval loop, no benchmark tuning. Full report at
+[gbrain-evals](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-07-longmemeval-s.md).**
+
+LongMemEval is the public benchmark people cite for AI memory systems —
+500 questions across six question types, ground-truth labels per question,
+~50 distractor sessions per haystack. We ran the full split four different
+ways and published the numbers honestly:
+
+| Adapter | R@5 | Cost / 1000 questions | LLM in retrieval? |
+|---|---|---|---|
+| **gbrain-hybrid** | **97.60%** | ~$1 | no |
+| **gbrain-hybrid + Haiku query expansion** | **97.60%** | ~$3 | yes (Haiku) |
+| **gbrain-vector (OpenAI embeddings only)** | **97.40%** | ~$1 | no |
+| MemPalace raw (ChromaDB) | 96.6% | n/a (their published) | no |
+| gbrain-keyword (BM25 baseline) | 19.80% | $0 | no |
+
+The category-level wins:
+
+| Question type | gbrain-hybrid | MemPalace raw | Δ |
+|---|---|---|---|
+| single-session-assistant | **100%** | 92.9% | **+7.1** |
+| multi-session | **100%** | 98.5% | +1.5 |
+| knowledge-update | **100%** | 99.0% | +1.0 |
+| single-session-user | 95.7% | 95.7% | tie |
+| single-session-preference | 93.3% | 93.3% | tie |
+| temporal-reasoning | 94.7% | 96.2% | -1.5 |
+
+The +7.1pt single-session-assistant lift is where gbrain's hybrid stack
+earns its keep: questions where the user asks in their voice and the
+answer lives in an assistant turn that uses different vocabulary.
+Keyword search finds 1 out of 56. gbrain-hybrid finds all 56.
+
+Two findings worth publishing:
+
+1. **Vector-only is essentially as good as hybrid at K=5 (97.4 vs 97.6).**
+   If your app only needs top-5 recall over conversational data, you can
+   ship pure vector retrieval and skip the BM25-plus-RRF complexity. The
+   hybrid pipeline earns its lift at smaller K and on text where keyword
+   overlap genuinely helps (code, named entities, structured data).
+
+2. **Query expansion via Haiku is a clean null result on this benchmark
+   (97.60% with vs without).** `text-embedding-3-large` already bridges
+   most user-voice / answer-voice gaps. Expansion's value lives on
+   different question shapes.
+
+### What you can do now
+
+```sh
+# Run LongMemEval against gbrain (one CLI command)
+gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s.json
+```
+
+`gbrain eval longmemeval <dataset.jsonl>` runs the benchmark against
+gbrain's hybrid retrieval. Each question gets a clean in-memory brain;
+your `~/.gbrain` is never touched. Output is JSONL in the exact shape
+LongMemEval's published `evaluate_qa.py` evaluator consumes — hand it
+the file and you have a real QA-accuracy number.
+
+Flags: `--limit N`, `--model M`, `--retrieval-only`, `--keyword-only`,
+`--expansion`, `--top-k K`, `--output FILE`. Get the dataset at
+[xiaowu0162/longmemeval](https://huggingface.co/datasets/xiaowu0162/longmemeval).
+
+### Built-in retrieval safety
+
+Retrieved chat content gets the same prompt-injection defense that protects
+takes: pattern-strip + structural `<chat_session>` framing. The same
+`INJECTION_PATTERNS` defend both surfaces, so any future pattern addition
+covers benchmarks AND production retrieval automatically.
+
+### What's coming
+
+The full 4-adapter report at [gbrain-evals](https://github.com/garrytan/gbrain-evals)
+documents the methodology and ships the runner so anyone can reproduce. We
+have the LongMemEval `_m` split (200 distractor sessions per haystack) and
+ConvoMem on the roadmap; timeline-aware ranking to close the
+temporal-reasoning gap is filed as a v0.29 follow-up.
+
+## To take advantage of v0.28.12
+
+`gbrain upgrade` does this automatically.
+
+```sh
+# Reproduce the published 97.60% number (warm cache: ~2 min, $0)
+git clone https://github.com/garrytan/gbrain-evals
+cd gbrain-evals && bun install
+mkdir -p ~/datasets/longmemeval
+curl -Lo ~/datasets/longmemeval/longmemeval_s.json \
+  https://huggingface.co/datasets/xiaowu0162/longmemeval/resolve/main/longmemeval_s
+export OPENAI_API_KEY="sk-..."
+bash eval/runner/longmemeval-batch.sh
+```
+
+Or run the harness in-tree with one command:
+
+```sh
+gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s.json \
+  --top-k 5 --output /tmp/hypothesis.jsonl
+```
+
+If anything looks off, file at https://github.com/garrytan/gbrain/issues
+with `gbrain doctor` output.
+
+
+
+
+## [0.28.11] - 2026-05-07
+
+**Mix providers: OpenAI for text, Voyage for images. One brain, two embedding pipelines.**
+**Multimodal model routing finally has its own knob.**
+
+v0.28.9 shipped multimodal image embeddings via Voyage, but the gateway hardcoded
+`embedMultimodal()` to the brain's primary `embedding_model`. Brains using OpenAI
+`text-embedding-3-large` (1536-dim) for text could not use Voyage `voyage-multimodal-3`
+(1024-dim) for images without flipping the entire pipeline. The dual-column schema
+already supported different dimensions per touchpoint; the routing was the missing piece.
+
+You can now set a separate model just for multimodal:
+
+```bash
+gbrain config set embedding_multimodal true
+gbrain config set embedding_multimodal_model voyage:voyage-multimodal-3
+export VOYAGE_API_KEY=...
+gbrain sync
+```
+
+Text embeddings go to OpenAI (1536-dim, `embedding` column). Image embeddings go to
+Voyage (1024-dim, `embedding_image` column). Same brain, side by side.
+
+When unset, `embedMultimodal()` falls back to `embedding_model` so existing
+single-provider setups keep working unchanged.
+
+### Hardening from review
+
+The /codex outside-voice review on the original PR caught a real footgun the
+recipe-level validation missed: Voyage shares `supports_multimodal: true` across
+all 12 of its embedding models, but only `voyage-multimodal-3` accepts image input
+at `/multimodalembeddings`. Pointing the new key at any other Voyage model would
+have failed at the endpoint with HTTP 400, which the gateway misclassified as
+transient and retried indefinitely.
+
+This release closes the gap with model-level validation. `EmbeddingTouchpoint`
+gains an optional `multimodal_models?: string[]` allow-list. Voyage declares
+`['voyage-multimodal-3']`. `embedMultimodal()` validates the resolved model
+against the allow-list and throws `AIConfigError` with the supported model in
+the fix hint, before any HTTP call. The 4xx-misclassified-as-transient bug is
+filed as a separate TODO under v0.28.x.
+
+### Itemized changes
+
+#### Added
+- `embedding_multimodal_model` config key (env: `GBRAIN_EMBEDDING_MULTIMODAL_MODEL`,
+  DB: `gbrain config set embedding_multimodal_model <provider>:<model>`). Standard
+  env > file > DB > undefined precedence via `loadConfigWithEngine` (#719).
+- `EmbeddingTouchpoint.multimodal_models?: string[]` model-level allow-list for
+  recipes that mix text-only and multimodal models under the same touchpoint
+  (#719, hardening from /codex review).
+- `getMultimodalModel()` gateway accessor mirroring `getEmbeddingModel` /
+  `getChatModel` (#719).
+
+#### Changed
+- `connectEngine()` in `src/cli.ts` now extracts a file-local
+  `buildGatewayConfig(c: GBrainConfig)` helper. Both pre-connect and
+  post-DB-merge `configureGateway` call sites pass through the helper, so adding
+  a new gateway-relevant config field touches one place (#719).
+- The post-DB-merge `configureGateway` call is no longer gated on a specific
+  field name. Re-config now always fires when `loadConfigWithEngine` returns
+  non-null. Removes temporal coupling between the trigger and the field set so
+  future DB-mutable gateway fields auto-flow without remembering to update the
+  gate (#719).
+- `embedMultimodal()` enforces model-level multimodal capability when the
+  recipe declares `multimodal_models`. Recipe-level `supports_multimodal` stays
+  as a fast-fail for non-multimodal providers (Anthropic, OpenAI today) (#719).
+
+#### Tests
+- 4 new cases in `test/loadConfig-merge.test.ts` for env > file > DB precedence
+  on `embedding_multimodal_model`.
+- 4 new cases in `test/voyage-multimodal.test.ts` for model preference
+  (multimodal_model over embedding_model), fallback regression, AIConfigError on
+  cross-recipe non-multimodal pointer, AIConfigError on Voyage text-only model
+  (the /codex F1 model-level validation gap).
+- New `test/cli-multimodal-integration.test.ts` (3 cases) covering the cli.ts
+  re-config glue itself via PGLite. Closes the "mechanical glue" gap that unit
+  tests of the surrounding APIs leave behind.
+
+#### Documentation
+- 3 new TODOs filed: `gbrain doctor` warns for misconfigured multimodal
+  setups; reclassify Voyage HTTP 4xx as `AIConfigError` (closes the
+  retry-storm-on-config-bug class); `gbrain config unset <key>` so users can
+  clear DB-set keys without direct SQL.
+
+## To take advantage of v0.28.11
+
+`gbrain upgrade` should do this automatically. To use the new routing on an
+existing brain:
+
+1. **Configure the multimodal model:**
+   ```bash
+   gbrain config set embedding_multimodal true
+   gbrain config set embedding_multimodal_model voyage:voyage-multimodal-3
+   export VOYAGE_API_KEY=$(... your key ...)
+   ```
+2. **Verify the gateway sees it:**
+   ```bash
+   gbrain config get embedding_multimodal_model
+   ```
+3. **Drop an image into your brain repo and sync:**
+   ```bash
+   gbrain sync
+   ```
+   The image lands in `content_chunks.embedding_image` (1024-dim) via Voyage;
+   text content keeps using your primary `embedding_model`.
+4. **If anything misconfigures,** the gateway throws `AIConfigError` with a
+   clear fix hint before any HTTP call. No silent retry storms.
+
 ## [0.28.10] - 2026-05-07
 
 **`/health` stops being slow. Stops triggering restart cascades.**

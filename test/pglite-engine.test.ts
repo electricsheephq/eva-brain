@@ -263,6 +263,36 @@ describe('PGLiteEngine: Search', () => {
     expect(results.length).toBeGreaterThan(0);
   });
 
+  test('searchKeyword keeps duplicate slugs distinct across sources', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('kb-search', 'kb-search', '{"federated": true}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage('docs/setup', {
+      type: 'note',
+      title: 'Default Setup',
+      compiled_truth: 'sharedneedle default setup instructions',
+    });
+    await engine.upsertChunks('docs/setup', [
+      { chunk_index: 0, chunk_text: 'sharedneedle default setup instructions', chunk_source: 'compiled_truth' },
+    ]);
+    await engine.putPage('docs/setup', {
+      type: 'note',
+      title: 'KB Setup',
+      compiled_truth: 'sharedneedle support knowledge setup instructions',
+    }, { sourceId: 'kb-search' });
+    await engine.upsertChunks('docs/setup', [
+      { chunk_index: 0, chunk_text: 'sharedneedle support knowledge setup instructions', chunk_source: 'compiled_truth' },
+    ], { sourceId: 'kb-search' });
+
+    const results = await engine.searchKeyword('sharedneedle', { limit: 10 });
+    const sourceIds = results
+      .filter(r => r.slug === 'docs/setup')
+      .map(r => r.source_id)
+      .sort();
+    expect(sourceIds).toEqual(['default', 'kb-search']);
+  });
+
   test('searchVector returns empty when no embeddings', async () => {
     const fakeEmbedding = new Float32Array(1536);
     const results = await engine.searchVector(fakeEmbedding);
