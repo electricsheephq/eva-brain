@@ -92,6 +92,23 @@ describe('postgres-engine / search path timeout isolation', () => {
     expect(keyword).not.toMatch(/SET\s+statement_timeout\s*=\s*['"]?0/);
     expect(vector).not.toMatch(/SET\s+statement_timeout\s*=\s*['"]?0/);
   });
+
+  test('keyword search dedupes by source_id + slug, not bare slug', () => {
+    const keyword = extractMethod(SRC, 'searchKeyword');
+    expect(keyword).toContain('DISTINCT ON (source_id, slug)');
+    expect(keyword).toContain('ORDER BY source_id, slug, score DESC');
+    expect(keyword).not.toContain('DISTINCT ON (slug)');
+  });
+
+  test('date filters use effective_date parity with PGLite', () => {
+    const keyword = extractMethod(SRC, 'searchKeyword');
+    const chunks = extractMethod(SRC, 'searchKeywordChunks');
+    const vector = extractMethod(SRC, 'searchVector');
+    for (const fn of [keyword, chunks, vector]) {
+      expect(fn).toContain('COALESCE(p.effective_date, p.updated_at, p.created_at)');
+      expect(fn).not.toContain('COALESCE(p.updated_at, p.created_at)');
+    }
+  });
 });
 
 function stripComments(s: string): string {

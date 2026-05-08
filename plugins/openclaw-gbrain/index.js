@@ -92,9 +92,12 @@ function readEnvFile(envFile) {
     for (const rawLine of text.split(/\r?\n/u)) {
       const line = rawLine.trim();
       if (!line || line.startsWith("#")) continue;
-      const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/u);
-      if (!match) continue;
-      env[match[1]] = unquoteEnvValue(match[2].trim());
+      const assignment = line.replace(/^export\s+/u, "");
+      const idx = assignment.indexOf("=");
+      if (idx <= 0) continue;
+      const key = assignment.slice(0, idx).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key)) continue;
+      env[key] = parseEnvValue(assignment.slice(idx + 1));
     }
     return env;
   } catch {
@@ -102,14 +105,37 @@ function readEnvFile(envFile) {
   }
 }
 
-function unquoteEnvValue(value) {
-  if (
-    (value.startsWith('"') && value.endsWith('"')) ||
-    (value.startsWith("'") && value.endsWith("'"))
-  ) {
-    return value.slice(1, -1);
+function parseEnvValue(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const quote = raw[0];
+  if (quote !== "'" && quote !== '"') return stripInlineComment(raw);
+
+  let out = "";
+  for (let i = 1; i < raw.length; i += 1) {
+    const char = raw[i];
+    if (char === quote) return out;
+    if (quote === '"' && char === "\\" && i + 1 < raw.length) {
+      const next = raw[i + 1];
+      if (next === "n") out += "\n";
+      else if (next === "r") out += "\r";
+      else if (next === "t") out += "\t";
+      else out += next;
+      i += 1;
+      continue;
+    }
+    out += char;
   }
-  return value;
+  return out;
+}
+
+function stripInlineComment(raw) {
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw[i] !== "#") continue;
+    const prev = raw[i - 1];
+    if (prev === " " || prev === "\t") return raw.slice(0, i).trimEnd();
+  }
+  return raw.trimEnd();
 }
 
 function commandEnv(config) {

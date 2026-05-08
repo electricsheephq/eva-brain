@@ -1217,6 +1217,55 @@ describe('migration v34 — destructive_guard_columns', () => {
   });
 });
 
+describe('migration v41 — pages_emotional_weight (v0.29)', () => {
+  // Eva already owns v40 for source-scoped files.storage_path uniqueness.
+  // Upstream v0.29 salience lands at v41 in the fork so both migration lines
+  // remain append-only and existing Eva brains keep their source-safety patch.
+  test('exists with the expected name', () => {
+    const v41 = MIGRATIONS.find(m => m.version === 41);
+    expect(v41).toBeDefined();
+    expect(v41?.name).toBe('pages_emotional_weight');
+  });
+
+  test('adds emotional_weight REAL NOT NULL DEFAULT 0.0 to pages', () => {
+    const v41 = MIGRATIONS.find(m => m.version === 41);
+    const sql = v41!.sql || '';
+    expect(sql).toContain('ALTER TABLE pages');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS emotional_weight');
+    expect(sql).toContain('REAL');
+    expect(sql).toContain('NOT NULL DEFAULT 0.0');
+  });
+
+  test('does NOT create an idx_pages_emotional_weight index (eng review D6)', () => {
+    // Salience query orders by computed score, not raw weight; the index
+    // would never be used. Adding it later requires a separate migration.
+    const v41 = MIGRATIONS.find(m => m.version === 41);
+    const sql = v41!.sql || '';
+    expect(sql).not.toContain('idx_pages_emotional_weight');
+    expect(sql).not.toContain('CREATE INDEX');
+  });
+
+  test('LATEST_VERSION caught up to 43', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(43);
+  });
+});
+
+describe('migration v42 — pages_recency_columns', () => {
+  test('Postgres invalid-index cleanup does not run DROP INDEX CONCURRENTLY inside DO block', () => {
+    const src = readFileSync(resolve('src/core/migrate.ts'), 'utf-8');
+    const v42Start = src.indexOf("name: 'pages_recency_columns'");
+    expect(v42Start).toBeGreaterThan(-1);
+    const v42Block = src.slice(v42Start, v42Start + 5000);
+    expect(v42Block).toContain('DROP INDEX CONCURRENTLY IF EXISTS pages_coalesce_date_idx');
+    const doBlockStart = v42Block.indexOf('DO $$');
+    if (doBlockStart !== -1) {
+      const doBlockEnd = v42Block.indexOf('END $$', doBlockStart);
+      const doBlock = v42Block.slice(doBlockStart, doBlockEnd === -1 ? v42Block.length : doBlockEnd);
+      expect(doBlock).not.toContain('DROP INDEX CONCURRENTLY');
+    }
+  });
+});
+
 // ─────────────────────────────────────────────────────────────────
 // PR #363 regression guards — session timeouts via startup parameters
 // resolveSessionTimeouts — GBRAIN_*_TIMEOUT env overrides

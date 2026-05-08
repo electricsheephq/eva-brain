@@ -4,7 +4,9 @@ import { installSigchldHandler } from './core/zombie-reap.ts';
 installSigchldHandler();
 
 import { readFileSync } from 'fs';
-import { loadConfig, loadConfigWithEngine, loadGbrainEnv, toEngineConfig } from './core/config.ts';
+import { loadConfig, loadConfigWithEngine, loadGbrainEnv, toEngineConfig, isThinClient } from './core/config.ts';
+import type { GBrainConfig } from './core/config.ts';
+import type { AIGatewayConfig } from './core/ai/types.ts';
 import type { BrainEngine } from './core/engine.ts';
 import { operations, OperationError } from './core/operations.ts';
 import type { Operation, OperationContext } from './core/operations.ts';
@@ -22,7 +24,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer.
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'import-media', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex-code', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'ingest-media', 'pages', 'takes', 'think']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'import-media', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'ingest-media', 'pages', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'remote']);
 
 async function main() {
   // Parse global flags (--quiet / --progress-json / --progress-interval)
@@ -324,7 +326,39 @@ function formatResult(opName: string, result: unknown): string {
   }
 }
 
+/**
+ * Multi-topology v1: thin-client refusal set. These commands require a local
+ * engine; if `~/.gbrain/config.json` has `remote_mcp` set, the dispatch guard
+ * refuses them with a canonical error pointing at the remote host. The check
+ * runs before per-command dispatch so the error message is consistent.
+ *
+ * `serve` is in this set because `gbrain serve` (stdio or http) requires a
+ * local engine to expose. Thin clients don't have one to expose.
+ *
+ * `doctor` is intentionally NOT in this set — task 4 routes it to
+ * `runRemoteDoctor` for thin-client installs.
+ */
+const THIN_CLIENT_REFUSED_COMMANDS = new Set([
+  'sync', 'embed', 'extract', 'migrate', 'apply-migrations',
+  'repair-jsonb', 'orphans', 'integrity', 'serve',
+]);
+
 async function handleCliOnly(command: string, args: string[]) {
+  // Thin-client guard: refuse DB-bound commands cleanly with a single
+  // canonical message instead of letting them fail later inside connectEngine
+  // or mid-handler. See `THIN_CLIENT_REFUSED_COMMANDS` above.
+  if (THIN_CLIENT_REFUSED_COMMANDS.has(command)) {
+    const cfg = loadConfig();
+    if (isThinClient(cfg)) {
+      const url = cfg!.remote_mcp!.mcp_url;
+      console.error(
+        `\`gbrain ${command}\` requires a local engine. This install is a thin client of ${url}.\n` +
+        `Run \`${command}\` on the remote host, or use the corresponding MCP tool from your agent.`,
+      );
+      process.exit(1);
+    }
+  }
+
   // Commands that don't need a database connection
   if (command === 'init') {
     const { runInit } = await import('./commands/init.ts');
@@ -334,6 +368,13 @@ async function handleCliOnly(command: string, args: string[]) {
   if (command === 'auth') {
     const { runAuth } = await import('./commands/auth.ts');
     await runAuth(args);
+    return;
+  }
+  if (command === 'remote') {
+    // Multi-topology v1 (Tier B): thin-client-only convenience commands.
+    // `runRemote` self-checks for remote_mcp config and exits 1 if local-only.
+    const { runRemote } = await import('./commands/remote.ts');
+    await runRemote(args);
     return;
   }
   if (command === 'upgrade') {
@@ -457,6 +498,17 @@ async function handleCliOnly(command: string, args: string[]) {
     return;
   }
   if (command === 'doctor') {
+    // Multi-topology v1: thin-client doctor. When `~/.gbrain/config.json`
+    // has remote_mcp set, every DB-bound check is irrelevant. Route to the
+    // outbound-HTTP probe set in `src/core/doctor-remote.ts` and return
+    // before any local-engine work.
+    const cfgForDoctor = loadConfig();
+    if (isThinClient(cfgForDoctor)) {
+      const { runRemoteDoctor } = await import('./core/doctor-remote.ts');
+      await runRemoteDoctor(cfgForDoctor!, args);
+      return;
+    }
+
     // Doctor runs filesystem checks first (no DB needed), then DB checks.
     // --fast skips DB checks entirely.
     const { runDoctor } = await import('./commands/doctor.ts');
@@ -521,6 +573,15 @@ async function handleCliOnly(command: string, args: string[]) {
   if (command === 'eval' && args[0] === 'cross-modal') {
     const { runEvalCrossModal } = await import('./commands/eval-cross-modal.ts');
     process.exit(await runEvalCrossModal(args.slice(1)));
+  }
+
+  // v0.28.12: longmemeval brings its own in-memory PGLite. Bypassing
+  // connectEngine here keeps `gbrain eval longmemeval --help` and benchmark
+  // runs working on machines that have no `~/.gbrain/config.json` configured.
+  if (command === 'eval' && args[0] === 'longmemeval') {
+    const { runEvalLongMemEval } = await import('./commands/eval-longmemeval.ts');
+    await runEvalLongMemEval(args.slice(1));
+    return;
   }
 
   // All remaining CLI-only commands need a DB connection
@@ -637,6 +698,22 @@ async function handleCliOnly(command: string, args: string[]) {
         await runOrphans(engine, args);
         break;
       }
+      // v0.29 — Salience + Anomaly Detection
+      case 'salience': {
+        const { runSalience } = await import('./commands/salience.ts');
+        await runSalience(engine, args);
+        break;
+      }
+      case 'anomalies': {
+        const { runAnomalies } = await import('./commands/anomalies.ts');
+        await runAnomalies(engine, args);
+        break;
+      }
+      case 'transcripts': {
+        const { runTranscripts } = await import('./commands/transcripts.ts');
+        await runTranscripts(engine, args);
+        break;
+      }
       case 'takes': {
         const { runTakes } = await import('./commands/takes.ts');
         await runTakes(engine, args);
@@ -681,6 +758,16 @@ async function handleCliOnly(command: string, args: string[]) {
         await runReindexCodeCli(engine, args);
         break;
       }
+      case 'reindex-frontmatter': {
+        // v0.29.1: recovery / explicit-rebuild path for pages.effective_date.
+        // Mirror of reindex-code shape. Wraps the shared library function in
+        // src/core/backfill-effective-date.ts (same code path the v0.29.1
+        // migration orchestrator uses). The orchestrator runs once on
+        // upgrade; this command is for after-the-fact frontmatter edits.
+        const { reindexFrontmatterCli } = await import('./commands/reindex-frontmatter.ts');
+        await reindexFrontmatterCli(args);
+        return; // reindexFrontmatterCli handles its own engine lifecycle
+      }
       case 'code-callers': {
         // v0.20.0 Cathedral II Layer 10 (C4): "who calls <symbol>?"
         const { runCodeCallers } = await import('./commands/code-callers.ts');
@@ -711,6 +798,25 @@ async function handleCliOnly(command: string, args: string[]) {
   }
 }
 
+// Build the AIGatewayConfig payload from a GBrainConfig. File-local; not
+// exported. Both configureGateway sites in connectEngine() pass through this
+// helper so adding a new field touches one place. Adding a field to one site
+// but not the other previously required remembering to mirror the change;
+// the helper makes that structural.
+function buildGatewayConfig(c: GBrainConfig, env: Record<string, string | undefined> = loadGbrainEnv()): AIGatewayConfig {
+  return {
+    embedding_model: c.embedding_model,
+    embedding_dimensions: c.embedding_dimensions,
+    embedding_multimodal_model: c.embedding_multimodal_model,
+    expansion_model: c.expansion_model,
+    chat_model: c.chat_model,
+    chat_fallback_chain: c.chat_fallback_chain,
+    base_urls: c.provider_base_urls,
+    provider_auth: c.provider_auth,
+    env,
+  };
+}
+
 async function connectEngine(): Promise<BrainEngine> {
   const env = loadGbrainEnv();
   const config = loadConfig(env);
@@ -722,16 +828,7 @@ async function connectEngine(): Promise<BrainEngine> {
   // Configure the AI gateway BEFORE engine connect — initSchema needs embedding dims.
   // Env is read once here; the gateway never reads process.env at call time (Codex C3).
   const { configureGateway } = await import('./core/ai/gateway.ts');
-  configureGateway({
-    embedding_model: config.embedding_model,
-    embedding_dimensions: config.embedding_dimensions,
-    expansion_model: config.expansion_model,
-    chat_model: config.chat_model,
-    chat_fallback_chain: config.chat_fallback_chain,
-    base_urls: config.provider_base_urls,
-    provider_auth: config.provider_auth,
-    env,
-  });
+  configureGateway(buildGatewayConfig(config, env));
 
   const { createEngine } = await import('./core/engine-factory.ts');
   const engine = await createEngine(toEngineConfig(config));
@@ -766,11 +863,10 @@ async function connectEngine(): Promise<BrainEngine> {
   try {
     const merged = await loadConfigWithEngine(engine, config);
     if (merged) {
-      // Only re-configure when a runtime-relevant DB flag actually overrode
-      // a pre-connect default. Today the only consumer is the import-image
-      // path; the gateway itself doesn't read these flags. The stash on
-      // process.env preserves the contract for downstream readers without
-      // changing the gateway's signature.
+      // Stash gate flags on process.env for downstream readers (import-file.ts
+      // dispatches on GBRAIN_EMBEDDING_MULTIMODAL, OCR consumer reads
+      // GBRAIN_EMBEDDING_IMAGE_OCR_*). The gateway itself doesn't read these
+      // flags; this preserves the contract without changing the gateway shape.
       if (merged.embedding_multimodal !== undefined) {
         process.env.GBRAIN_EMBEDDING_MULTIMODAL = String(merged.embedding_multimodal);
       }
@@ -780,6 +876,12 @@ async function connectEngine(): Promise<BrainEngine> {
       if (merged.embedding_image_ocr_model !== undefined) {
         process.env.GBRAIN_EMBEDDING_IMAGE_OCR_MODEL = merged.embedding_image_ocr_model;
       }
+      // Always re-configure with merged values when DB merge succeeded. The
+      // trigger used to be field-name-gated (only when embedding_multimodal_model
+      // was set); that coupled the gate to the field set and would silently
+      // miss future DB-mutable gateway fields. One extra cache+shrinkState
+      // clear per startup is microseconds, no hot path.
+      configureGateway(buildGatewayConfig(merged, env));
     }
   } catch {
     // Non-fatal. Pre-v39 brains may not have a usable config table yet.
@@ -884,6 +986,9 @@ TOOLS
   check-backlinks <check|fix> [dir]  Find/fix missing back-links across brain
   lint <dir|file> [--fix]            Catch LLM artifacts, placeholder dates, bad frontmatter
   orphans [--json] [--count]         Find pages with no inbound wikilinks
+  salience [--days N] [--kind P]     v0.29: pages ranked by emotional + activity salience
+  anomalies [--since D] [--sigma N]  v0.29: cohort-based statistical anomalies (tag, type)
+  transcripts recent [--days N]      v0.29: recent raw .txt transcripts (local-only)
   dream [--dry-run] [--json]         Run the overnight maintenance cycle once (cron-friendly).
                                      See also: autopilot --install (continuous daemon).
   check-resolvable [--json] [--fix]  Validate skill tree (reachability/MECE/DRY)

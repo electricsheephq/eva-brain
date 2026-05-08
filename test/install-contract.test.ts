@@ -90,4 +90,14 @@ describe('Eva Brain install contract', () => {
     expect(readme).toContain('Do not point `gbrainBin` at a');
     expect(readme).toContain("PGLite's `pglite.data`");
   });
+
+  test('OpenClaw plugin env parser mirrors core gbrain.env inline-comment and quote behavior', () => {
+    const plugin = readFileSync(join(root, 'plugins/openclaw-gbrain/index.js'), 'utf8');
+
+    expect(plugin).toContain('function parseEnvValue');
+    expect(plugin).toContain('function stripInlineComment');
+    expect(plugin).toContain('if (char === quote) return out');
+    expect(plugin).toContain("if (prev === \" \" || prev === \"\\t\") return raw.slice(0, i).trimEnd()");
+    expect(plugin).not.toContain('function unquoteEnvValue');
+  });
 });

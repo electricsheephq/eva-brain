@@ -20,6 +20,175 @@ export interface Check {
 }
 
 /**
+ * Structured doctor report. Stable shape consumed by:
+ *   - gbrain doctor --json (CLI)
+ *   - run_doctor MCP op (remote callers)
+ *   - gbrain remote doctor (renders this from the MCP op response)
+ *
+ * schema_version=2 was set when --json output stabilized; bump only for
+ * breaking field changes.
+ */
+export interface DoctorReport {
+  schema_version: 2;
+  status: 'healthy' | 'warnings' | 'unhealthy';
+  health_score: number;
+  checks: Check[];
+}
+
+/**
+ * Compute the {status, health_score} headline from a list of checks.
+ * Mirrors the calculation in outputResults() so remote callers and the
+ * existing CLI front-end agree on what "healthy" means.
+ */
+export function computeDoctorReport(checks: Check[]): DoctorReport {
+  const hasFail = checks.some(c => c.status === 'fail');
+  const hasWarn = checks.some(c => c.status === 'warn');
+  let score = 100;
+  for (const c of checks) {
+    if (c.status === 'fail') score -= 20;
+    else if (c.status === 'warn') score -= 5;
+  }
+  score = Math.max(0, score);
+  const status: DoctorReport['status'] = hasFail ? 'unhealthy' : hasWarn ? 'warnings' : 'healthy';
+  return { schema_version: 2, status, health_score: score, checks };
+}
+
+/**
+ * Focused doctor for `run_doctor` MCP op + `gbrain remote doctor` CLI.
+ *
+ * Runs five checks scoped to "what does a remote operator need to know about
+ * this brain right now?":
+ *   - connection (engine reachable + page count)
+ *   - schema_version (current vs latest)
+ *   - brain_score (the 5-component health composite)
+ *   - sync_failures (unacked parse failures)
+ *   - queue_health (Postgres-only: stalled-forever active jobs)
+ *
+ * Deliberately a focused subset of the local doctor surface, NOT a full
+ * mirror. Generalizing to lint/integrity/orphans is filed as follow-up work
+ * pending demand. Local doctor is unchanged — operators on the host machine
+ * still get the full check set.
+ */
+export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorReport> {
+  const checks: Check[] = [];
+
+  // 1. Connection
+  let pageCount = 0;
+  try {
+    const stats = await engine.getStats();
+    pageCount = stats.page_count ?? 0;
+    checks.push({
+      name: 'connection',
+      status: 'ok',
+      message: `Connected, ${pageCount} pages`,
+    });
+  } catch (e) {
+    checks.push({
+      name: 'connection',
+      status: 'fail',
+      message: e instanceof Error ? e.message : String(e),
+    });
+    // Without a connection, every other check is meaningless — short-circuit.
+    return computeDoctorReport(checks);
+  }
+
+  // 2. Schema version. Uses engine.getConfig('version') — the same engine-
+  // agnostic API the local doctor uses, works on both Postgres and PGLite.
+  try {
+    const versionStr = await engine.getConfig('version');
+    const version = parseInt(versionStr || '0', 10);
+    if (version >= LATEST_VERSION) {
+      checks.push({ name: 'schema_version', status: 'ok', message: `Version ${version} (latest: ${LATEST_VERSION})` });
+    } else if (version === 0) {
+      checks.push({
+        name: 'schema_version',
+        status: 'fail',
+        message: `No schema version recorded. Migrations never ran. Run \`gbrain apply-migrations --yes\` on the host.`,
+      });
+    } else {
+      checks.push({
+        name: 'schema_version',
+        status: 'warn',
+        message: `Version ${version}, latest is ${LATEST_VERSION}. Run \`gbrain apply-migrations --yes\` on the host.`,
+      });
+    }
+  } catch {
+    checks.push({ name: 'schema_version', status: 'warn', message: 'Could not check schema version' });
+  }
+
+  // 3. Brain score
+  try {
+    const health = await engine.getHealth();
+    const score = health.brain_score ?? 0;
+    checks.push({
+      name: 'brain_score',
+      status: score >= 70 ? 'ok' : score >= 50 ? 'warn' : 'fail',
+      message: `Brain score ${score}/100`,
+    });
+  } catch (e) {
+    checks.push({
+      name: 'brain_score',
+      status: 'warn',
+      message: `Could not compute: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  }
+
+  // 4. Sync failures (file-plane state, not in-DB; see src/core/sync.ts).
+  // Read the JSONL file directly at the canonical path; cheap and engine-agnostic.
+  try {
+    const { readFileSync, existsSync } = await import('fs');
+    const { gbrainPath } = await import('../core/config.ts');
+    const path = gbrainPath('sync-failures.jsonl');
+    let unacked = 0;
+    if (existsSync(path)) {
+      const lines = readFileSync(path, 'utf-8').split('\n').filter(l => l.trim());
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line) as { acknowledged_at?: string | null };
+          if (!entry.acknowledged_at) unacked++;
+        } catch { /* skip malformed line */ }
+      }
+    }
+    checks.push({
+      name: 'sync_failures',
+      status: unacked === 0 ? 'ok' : 'warn',
+      message: unacked === 0
+        ? 'No unacked failures'
+        : `${unacked} unacked failure(s) — run \`gbrain sync --skip-failed\` on the host to acknowledge`,
+    });
+  } catch {
+    checks.push({ name: 'sync_failures', status: 'ok', message: 'No failures recorded' });
+  }
+
+  // 5. Queue health (Postgres-only). PGLite has no minion_jobs in the same
+  // shape; skip the check there with an informational message.
+  if (engine.kind === 'postgres') {
+    try {
+      const rows = await engine.executeRaw<{ stalled: string | number }>(
+        `SELECT COUNT(*) AS stalled FROM minion_jobs
+          WHERE state = 'active'
+            AND started_at IS NOT NULL
+            AND started_at < NOW() - INTERVAL '1 hour'`,
+      );
+      const stalled = Number(rows[0]?.stalled ?? 0);
+      checks.push({
+        name: 'queue_health',
+        status: stalled === 0 ? 'ok' : 'warn',
+        message: stalled === 0
+          ? 'No stalled active jobs'
+          : `${stalled} active job(s) stalled > 1h — \`gbrain jobs cancel <id>\` or \`gbrain jobs retry <id>\` on the host`,
+      });
+    } catch {
+      checks.push({ name: 'queue_health', status: 'ok', message: 'No queue activity' });
+    }
+  } else {
+    checks.push({ name: 'queue_health', status: 'ok', message: 'PGLite — no queue to check' });
+  }
+
+  return computeDoctorReport(checks);
+}
+
+/**
  * Run doctor with filesystem-first, DB-second architecture.
  * Filesystem checks (resolver, conformance) run without engine.
  * DB checks run only if engine is provided.
@@ -976,6 +1145,114 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
         status: 'warn',
         message: `Could not read eval_capture_failures: ${(err as Error)?.message ?? String(err)}`,
       });
+    }
+  }
+
+  // 11a-2. effective_date_health (v0.29.1).
+  //
+  // Detects pages where computeEffectiveDate fell back to updated_at even
+  // though parseable frontmatter dates are present (codex pass-1 #5
+  // resolution: the sentinel column lets us catch "wrong but populated"
+  // rows that look healthy at first glance).
+  //
+  // Sample 1000 random rows by default to keep the check fast on 200K-page
+  // brains. The expression index pages_coalesce_date_idx makes the future-
+  // date and pre-1990 scans cheap; the parseable-fm-date scan reads
+  // frontmatter JSONB and is the slow path.
+  progress.heartbeat('effective_date_health');
+  try {
+    const result = await engine.executeRaw<{ kind: string; count: string }>(
+      `WITH sample AS (
+         SELECT slug, frontmatter, effective_date, effective_date_source
+           FROM pages
+          ORDER BY id DESC
+          LIMIT 1000
+       )
+       SELECT 'fallback_with_fm_date' AS kind, COUNT(*)::text AS count
+         FROM sample
+        WHERE effective_date_source = 'fallback'
+          AND (frontmatter ? 'event_date' OR frontmatter ? 'date' OR frontmatter ? 'published')
+       UNION ALL
+       SELECT 'future_dated', COUNT(*)::text FROM sample
+        WHERE effective_date IS NOT NULL AND effective_date > NOW() + INTERVAL '1 year'
+       UNION ALL
+       SELECT 'pre_1990', COUNT(*)::text FROM sample
+        WHERE effective_date IS NOT NULL AND effective_date < TIMESTAMPTZ '1990-01-01'`,
+    );
+    const counts = new Map(result.map(r => [r.kind, Number(r.count)]));
+    const fallbackWithFm = counts.get('fallback_with_fm_date') ?? 0;
+    const future = counts.get('future_dated') ?? 0;
+    const pre1990 = counts.get('pre_1990') ?? 0;
+    if (fallbackWithFm > 0 || future > 0 || pre1990 > 0) {
+      const parts: string[] = [];
+      if (fallbackWithFm > 0) parts.push(`${fallbackWithFm} fell back to updated_at despite parseable frontmatter date`);
+      if (future > 0) parts.push(`${future} dated > NOW() + 1y`);
+      if (pre1990 > 0) parts.push(`${pre1990} pre-1990`);
+      checks.push({
+        name: 'effective_date_health',
+        status: 'warn',
+        message: `${parts.join('; ')} (sample of last 1000 pages). Run \`gbrain reindex-frontmatter\` to recompute.`,
+      });
+    } else {
+      checks.push({
+        name: 'effective_date_health',
+        status: 'ok',
+        message: 'Sample of last 1000 pages clean (no fallback-with-parseable-fm-date, no future-dated, no pre-1990)',
+      });
+    }
+  } catch (err) {
+    const code = (err as { code?: string } | null)?.code;
+    if (code === '42703') {
+      // column doesn't exist — pre-v0.29.1 brain
+      checks.push({ name: 'effective_date_health', status: 'ok', message: 'Skipped (effective_date column unavailable — run gbrain apply-migrations)' });
+    } else {
+      checks.push({ name: 'effective_date_health', status: 'warn', message: `Could not read pages: ${(err as Error)?.message ?? String(err)}` });
+    }
+  }
+
+  // 11a-3. salience_health (v0.29.1).
+  //
+  // Detects pages with active takes (so emotional_weight should be > 0)
+  // whose recompute_emotional_weight phase hasn't yet run, plus the
+  // brain-average emotional_weight as an informational signal.
+  progress.heartbeat('salience_health');
+  try {
+    const result = await engine.executeRaw<{ kind: string; n: string }>(
+      `SELECT 'zero_weight_with_takes' AS kind, COUNT(DISTINCT p.id)::text AS n
+         FROM pages p
+         JOIN takes t ON t.page_id = p.id AND t.active = TRUE
+        WHERE COALESCE(p.emotional_weight, 0) = 0
+       UNION ALL
+       SELECT 'nonzero_weight', COUNT(*)::text FROM pages WHERE COALESCE(emotional_weight, 0) > 0`,
+    );
+    const counts = new Map(result.map(r => [r.kind, Number(r.n)]));
+    const zeroWithTakes = counts.get('zero_weight_with_takes') ?? 0;
+    const nonzero = counts.get('nonzero_weight') ?? 0;
+    if (zeroWithTakes > 0) {
+      checks.push({
+        name: 'salience_health',
+        status: 'warn',
+        message: `${zeroWithTakes} pages with active takes have emotional_weight=0. Run \`gbrain dream --phase recompute_emotional_weight\` to populate. Brain has ${nonzero} pages with non-zero emotional_weight.`,
+      });
+    } else if (nonzero === 0) {
+      checks.push({
+        name: 'salience_health',
+        status: 'ok',
+        message: 'Skipped (no pages have emotional_weight > 0; either fresh install or recompute hasn\'t run yet)',
+      });
+    } else {
+      checks.push({
+        name: 'salience_health',
+        status: 'ok',
+        message: `${nonzero} pages have non-zero emotional_weight; no take/weight mismatches detected`,
+      });
+    }
+  } catch (err) {
+    const code = (err as { code?: string } | null)?.code;
+    if (code === '42703' || code === '42P01') {
+      checks.push({ name: 'salience_health', status: 'ok', message: 'Skipped (emotional_weight or takes table unavailable — pre-v0.29 brain)' });
+    } else {
+      checks.push({ name: 'salience_health', status: 'warn', message: `Could not read pages: ${(err as Error)?.message ?? String(err)}` });
     }
   }
 

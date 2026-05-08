@@ -14,6 +14,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runReindexCode } from '../src/commands/reindex-code.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 
 describe('Layer 13 E2 — runReindexCode', () => {
   let engine: PGLiteEngine;
@@ -62,6 +63,7 @@ describe('Layer 13 E2 — runReindexCode', () => {
   });
 
   afterAll(async () => {
+    resetGateway();
     await engine.disconnect();
   }, 30_000);
 
@@ -77,7 +79,20 @@ describe('Layer 13 E2 — runReindexCode', () => {
     expect(result.reindexed).toBe(0);
     expect(result.totalTokens).toBeGreaterThan(0);
     expect(result.costUsd).toBeGreaterThanOrEqual(0);
-    expect(result.model).toBe('text-embedding-3-large');
+    expect(result.model).toBe('openai:text-embedding-3-large');
+  });
+
+  test('dry-run uses configured provider pricing and label', async () => {
+    configureGateway({
+      embedding_model: 'voyage:voyage-4-large',
+      embedding_dimensions: 2048,
+      env: {},
+    });
+    const result = await runReindexCode(engine, { dryRun: true, noEmbed: true });
+    expect(result.status).toBe('dry_run');
+    expect(result.model).toBe('voyage:voyage-4-large');
+    expect(result.costUsd).toBeCloseTo((result.totalTokens / 1_000_000) * 0.18, 8);
+    resetGateway();
   });
 
   test('reindex walks every code page, failures counted per-slug', async () => {
@@ -109,5 +124,43 @@ describe('Layer 13 E2 — runReindexCode', () => {
       batchSize: 1,
     });
     expect(result.codePages).toBe(3);
+  });
+
+  test('source-scoped reindex preserves duplicate slugs in other sources', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('kb-code', 'kb-code', '{"federated": true}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage('src-shared-ts', {
+      type: 'code',
+      page_kind: 'code',
+      title: 'src/shared.ts (typescript)',
+      compiled_truth: 'export const source = "default";',
+      timeline: '',
+      frontmatter: { language: 'typescript', file: 'src/shared.ts' },
+    });
+    await engine.putPage('src-shared-ts', {
+      type: 'code',
+      page_kind: 'code',
+      title: 'src/shared.ts (typescript)',
+      compiled_truth: 'export const source = "kb";',
+      timeline: '',
+      frontmatter: { language: 'typescript', file: 'src/shared.ts' },
+      source_id: 'kb-code',
+    }, { sourceId: 'kb-code' });
+
+    const result = await runReindexCode(engine, {
+      sourceId: 'kb-code',
+      force: true,
+      noEmbed: true,
+      batchSize: 1,
+    });
+
+    expect(result.status).toBe('ok');
+    expect(result.codePages).toBe(1);
+    const defaultPage = await engine.getPage('src-shared-ts');
+    const kbPage = await engine.getPage('src-shared-ts', { sourceId: 'kb-code' });
+    expect(defaultPage?.compiled_truth).toBe('export const source = "default";');
+    expect(kbPage?.compiled_truth).toBe('export const source = "kb";');
   });
 });
