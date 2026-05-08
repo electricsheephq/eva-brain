@@ -66,7 +66,8 @@ needed:
           "maxConcurrentExtractions": 1,
           "extractionQueueLimit": 8,
           "extractionQueueTimeoutMs": 30000,
-          "minExtractionIntervalMs": 0
+          "minExtractionIntervalMs": 0,
+          "maxExtractionFileBytes": 8000000
         }
       }
     }
@@ -88,6 +89,8 @@ not bundle PGLite's `pglite.data` runtime asset.
 Extraction is intentionally conservative by default: one active extraction at a
 time, up to eight queued requests, and a 30s queue wait. Increase those values
 only after the local OpenClaw/Codex runtime is proven to tolerate the extra load.
+The route also rejects decoded file payloads larger than 8,000,000 bytes by
+default; the hard plugin cap is 20 MiB.
 
 ## Smoke
 
