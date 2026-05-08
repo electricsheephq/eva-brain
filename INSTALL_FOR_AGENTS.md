@@ -93,6 +93,14 @@ The plugin provides:
 - `gbrain_query`
 - `/plugins/gbrain/extract` for OAuth-backed extraction through OpenClaw/Codex
 
+Media boundary: upstream GBrain owns native image indexing through image pages,
+file records, multimodal embeddings, OCR, and `query --image`. Eva's OpenClaw
+plugin owns OAuth-backed enrichment/extraction and returns
+`gbrain.media-extraction.v1` as an adapter payload. The `import-media` and
+`ingest-media --extract openclaw` commands are transitional compatibility paths
+for turning that payload into searchable pages while the plugin boundary
+continues to shrink toward upstream-native writes.
+
 If OpenClaw is not installed, skip this step and keep the CLI/MCP path.
 
 ## Step 3.6: Install The OpenClaw Support KB

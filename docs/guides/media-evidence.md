@@ -4,15 +4,33 @@
 
 Make screenshots, PDFs, audio, and video searchable in GBrain through canonical media artifacts, resolver-based extraction, and evidence-backed match reasons.
 
-## Current Shipping Boundary
+## Thin-Fork Boundary
 
-This fork's current MVP is **text-backed media evidence**:
+Eva Brain should not grow a permanent competing media subsystem inside GBrain
+core. Upstream GBrain owns native media storage and retrieval primitives:
+image pages, the `files` table, multimodal embeddings, OCR, and image-aware
+query surfaces.
+
+Eva's durable responsibility is the OpenClaw adapter layer:
+
+- the OpenClaw plugin performs OAuth-backed extraction/enrichment
+- the adapter interchange payload is `gbrain.media-extraction.v1`
+- core GBrain receives normalized content, files, pages, chunks, and raw data
+
+The current fork-local MVP remains available as **transitional compatibility**:
 
 - `import-media` imports normalized evidence JSON and materializes it into normal pages, chunks, and raw data.
-- `ingest-media --extract openclaw` is a text extraction bridge for text-backed inputs and host-provided extraction output.
+- `ingest-media --extract openclaw` calls the OpenClaw plugin extraction route and imports the returned evidence.
 - Search can find media-derived OCR, captions, transcripts, summaries, tags, and match reasons once they are present in the normalized payload.
 
-This MVP does not claim direct binary image/video understanding inside core GBrain. Native image, video, audio, and frame extraction should live behind resolver or adapter boundaries so the upstream core stays provider-neutral.
+Treat those commands as bridge commands while the OpenClaw plugin learns to
+write upstream-native image pages/files/evidence directly. They should not be
+used as evidence that Eva core owns a separate long-term media model.
+
+This MVP does not claim direct binary video/audio/PDF understanding inside core
+GBrain. Native image indexing should follow upstream GBrain primitives; binary
+video/audio/PDF understanding should stay behind host, resolver, or provider
+adapters until it is live-smoked end to end.
 
 ## What the User Gets
 
@@ -46,17 +64,17 @@ The explanation shown to the user for why a result matched.
 
 ```text
 file or URL
-  -> media artifact
-  -> media segments
-  -> media resolvers or external extraction adapters
-  -> normalized media evidence JSON
-  -> searchable page/chunk materialization
-  -> result card with match reason
+  -> upstream GBrain file/image page when native support exists
+  -> OpenClaw extraction adapter when OAuth-backed enrichment is needed
+  -> gbrain.media-extraction.v1 interchange JSON
+  -> upstream-native page/file/chunk/raw-data writes
+  -> search result with provenance or match reason
 ```
 
 ## Fast Fork-Local MVP
 
-If you need user value immediately, keep it simple:
+If you need user value immediately through the transitional commands, keep it
+simple:
 
 1. Preserve the original binary or URL outside the normalized evidence payload.
 2. Create a normal page for the media item.
@@ -64,7 +82,9 @@ If you need user value immediately, keep it simple:
 4. Materialize extracted text into searchable content.
 5. Return media-aware results with a locator and match reason when available.
 
-This is intentionally pragmatic. It does not require a new vector backend or a full schema redesign.
+This is intentionally pragmatic. It does not require a new vector backend or a
+full schema redesign, and it should shrink as upstream native media support
+covers more of the path.
 
 ## Upstream-Friendly Seam
 

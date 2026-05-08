@@ -1,8 +1,21 @@
 # Content and Media Ingestion
 
-## Current Shipping Boundary
+## Thin-Fork Boundary
 
-This fork currently ships a media evidence path:
+Upstream GBrain owns the long-term media core: native image pages, file
+records, multimodal embeddings, OCR, and image-aware query behavior. Eva Brain
+should use those primitives rather than keeping a separate fork-local media
+storage model.
+
+Eva's OpenClaw-specific value lives at the adapter boundary:
+
+- `/plugins/gbrain/extract` performs OAuth-backed extraction through the
+  OpenClaw/Codex runtime
+- the plugin returns `gbrain.media-extraction.v1`
+- GBrain core imports normalized content into pages, chunks, files, and raw
+  data
+
+The fork currently keeps these transitional compatibility commands:
 
 - normalized media evidence JSON can be imported with `gbrain import-media`
 - text-backed extraction can be bridged through `gbrain ingest-media --extract openclaw`
@@ -14,6 +27,10 @@ The `--extract openclaw` adapter prefers `GBRAIN_OPENCLAW_GATEWAY_URL` or
 `/plugins/gbrain/extract` and supports text plus the current image MVP. The
 `GBRAIN_OPENCLAW_COMPLETION_COMMAND` fallback remains text-only and is meant for
 local host adapters that cannot accept file media.
+
+Do not treat `import-media` / `ingest-media` as a permanent competing GBrain
+media subsystem. They are bridge commands until the OpenClaw plugin can write
+the upstream-native media representation directly.
 
 Direct binary video/audio/PDF understanding is the next adapter milestone. Keep
 binary extraction behind host, resolver, or provider adapters; do not present it

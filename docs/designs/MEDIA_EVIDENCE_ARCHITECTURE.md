@@ -1,10 +1,10 @@
 # Media Evidence Architecture
 
-Status: Draft upstream architecture note
+Status: Draft upstream architecture note, kept as an adapter vocabulary
 
 Audience: downstream implementers and upstream GBrain maintainers
 
-Updated: 2026-05-04
+Updated: 2026-05-08
 
 ## Why This Exists
 
@@ -18,7 +18,13 @@ This document frames that gap in upstream-friendly terms:
 - **media resolvers** as the extraction boundary
 - **match reasons** as the retrieval explanation surface
 
-The intent is to let a downstream fork ship a practical text-backed MVP now without locking upstream into fork-local branding, storage choices, or provider choices.
+The intent is to let a downstream fork ship a practical OpenClaw extraction
+adapter now without locking upstream into fork-local branding, storage choices,
+or provider choices. Upstream GBrain's native image pages, file records,
+multimodal embeddings, OCR, and image-aware query behavior are the canonical
+long-term storage and retrieval path. `gbrain.media-extraction.v1` is the
+interchange payload an adapter can hand to GBrain, not a replacement for
+upstream-native media primitives.
 
 ## Problem Statement
 
@@ -54,9 +60,10 @@ Examples:
 - a local video file
 - a hosted YouTube URL once normalized into a tracked source object
 
-Current runtime contract: `gbrain.media-extraction.v1`.
+Current adapter interchange contract: `gbrain.media-extraction.v1`.
 
-The shipped text-backed MVP accepts normalized extraction payloads with these fields:
+The transitional OpenClaw adapter accepts normalized extraction payloads with
+these fields:
 
 ```ts
 interface MediaExtraction {
