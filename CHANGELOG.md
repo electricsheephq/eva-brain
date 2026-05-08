@@ -2,6 +2,129 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.30.0] - 2026-05-07
+
+**Calibration scorecards land. Find out if your bets are actually as good as you think.**
+**Brier scores, prediction accuracy, calibration curves — for every bet you ever wrote down.**
+
+This is the v0.30 wave's first ship: the calibration core. Resolve your bets with three
+states (correct, incorrect, partial) instead of just true/false. Run a scorecard against
+any holder, any domain prefix, any date window, and see your accuracy + Brier score in
+seconds. The calibration curve shows whether your "I'm 80% confident" bets actually come
+in at 80% — the thing Daniel Kahneman spent a career studying, now a query.
+
+```bash
+gbrain takes resolve companies/some-yc-co --row 3 --quality correct --evidence "Series A closed at $50M"
+gbrain takes scorecard garry
+gbrain takes calibration garry --bucket-size 0.1
+```
+
+The scorecard prints `correct/incorrect/partial`, accuracy, Brier (lower is better; 0.25
+is the always-50% baseline), and a `partial_rate` line. When more than 20% of resolved
+bets are "partial," the scorecard prints `[!] partial_rate is high — calibration may be
+optimistic`. Hedged bets escape the Brier denominator, so the warning surfaces hedging
+behavior as its own signal even though it doesn't enter the math.
+
+### The math that matters
+
+| Field | Meaning | Math |
+|-------|---------|------|
+| `accuracy` | correct / (correct + incorrect) | partial excluded |
+| `brier` | mean((weight − outcome)²) over correct ∨ incorrect | lower is better; 0 = perfect; 0.25 = always-50% baseline |
+| `partial_rate` | partial / resolved | hedging signal; warns at >20% |
+
+Brier excludes partial deliberately. Codex pointed out that counting partial as 0.5 in
+the math would reward hedging into ambiguity; instead, partial bets leave the calibration
+denominator entirely AND surface as a separate counter. You can see whether you're
+miscalibrated AND whether you're hedging, side by side.
+
+### Privacy: aggregate queries fail-closed
+
+Scorecard and calibration are MCP-callable read ops (`takes_scorecard`,
+`takes_calibration`). Both engine methods take `takesHoldersAllowList` as a REQUIRED
+TypeScript parameter — the compiler is the first line of defense against accidentally
+exposing therapy-page takes to an MCP-bound agent via aggregate counts. Hidden-holder
+rows contribute zero to the math. Local CLI callers see all holders.
+
+### Markdown stays canonical (and the silent-data-loss bug is dead)
+
+Resolution metadata renders into the takes-fence on disk: `resolved | quality |
+evidence | value | unit | by` columns appear ONLY when at least one row on the page is
+resolved. Pages with no resolved rows keep the narrow 7-column shape exactly as before.
+
+A codex consult on the v0.30 plan caught a real bug in the original draft: the v0.28
+parser/renderer had no concept of resolution columns. Without an explicit fix, every
+`gbrain takes update` after a `takes resolve` would silently delete the resolution
+data on the next disk write. The new round-trip preservation tests
+(`test/takes-fence.test.ts` v0.30 section) are the regression gate; they fail loudly
+if the data-loss bug returns.
+
+### To take advantage of v0.30.0
+
+`gbrain upgrade` runs the schema migration automatically. If `gbrain doctor` warns
+about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Resolve a bet you already have:**
+   ```bash
+   gbrain takes resolve <slug> --row N --quality correct|incorrect|partial --evidence "..."
+   ```
+3. **Run your first scorecard:**
+   ```bash
+   gbrain takes scorecard garry
+   ```
+4. **Existing v0.28-resolved bets are auto-backfilled.** The migration maps legacy
+   `resolved_outcome=true` → `resolved_quality='correct'`, `false` → `'incorrect'`.
+   No manual reclassification needed.
+5. **The `--outcome true|false` flag still works** as a back-compat alias on `takes
+   resolve`, with a stderr deprecation warning. Cannot express partial; mutually
+   exclusive with `--quality`.
+
+If any step fails or the numbers look wrong, file an issue:
+https://github.com/garrytan/gbrain/issues with output of `gbrain doctor` and
+`~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+### Itemized changes
+
+#### Added
+- New CLI: `gbrain takes scorecard [<holder>] [--domain <prefix>] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--json]` — calibration scorecard.
+- New CLI: `gbrain takes calibration [<holder>] [--bucket-size 0.1] [--json]` — calibration curve binned by stated weight.
+- New flag: `--quality correct|incorrect|partial` on `gbrain takes resolve`. Primary input.
+- New flag: `--evidence "..."` on `gbrain takes resolve` — semantic alias for `--source`.
+- New MCP ops: `takes_scorecard` (read scope) + `takes_calibration` (read scope), both honoring per-token allow-list.
+- Schema migration v44 in Eva Brain (`takes_resolved_quality_and_drift_decisions`):
+  - `takes.resolved_quality TEXT` with CHECK `(IN ('correct','incorrect','partial'))`.
+  - `takes_resolution_consistency` CHECK constraint enforces (quality, outcome) tuple consistency at the DB layer.
+  - Backfill: legacy `resolved_outcome=true` → `resolved_quality='correct'`; `false` → `'incorrect'`.
+  - Partial index `idx_takes_scorecard ON takes (holder, kind, resolved_quality) WHERE resolved_quality IS NOT NULL` — scorecard hot path.
+  - New table `drift_decisions` (audit log for the upcoming v0.30.3 drift LLM judge; defined now so C1 carries no migration).
+- New module `src/core/takes-resolution.ts` — pure helpers (`deriveResolutionTuple`, `finalizeScorecard`, `PARTIAL_RATE_WARNING_THRESHOLD`) shared between Postgres + PGLite engines.
+
+#### Changed
+- `gbrain takes resolve` now writes both `resolved_outcome` (boolean) and `resolved_quality` (text) on every resolution. Schema CHECK is the defense-in-depth backstop.
+- `--outcome true|false` becomes a back-compat alias with a stderr deprecation warning. Mutually exclusive with `--quality`. Cannot express partial.
+- `Take` interface (`src/core/engine.ts`) adds `resolved_quality: 'correct' | 'incorrect' | 'partial' | null`.
+- `TakeResolution` adds optional `quality` field. `outcome` stays as the back-compat input. When both set and inconsistent, throws `TAKE_RESOLUTION_INVALID` instead of silently overwriting.
+- `BrainEngine` interface gains `getScorecard(opts, allowList)` and `getCalibrationCurve(opts, allowList)`. Both implemented in `postgres-engine.ts` + `pglite-engine.ts` with SQL-level `WHERE holder = ANY($allowList)` filtering inside the GROUP BY.
+- `ParsedTake` (`src/core/takes-fence.ts`) extended with optional `resolvedAt`, `resolvedQuality`, `resolvedOutcome`, `resolvedEvidence`, `resolvedValue`, `resolvedUnit`, `resolvedBy`. Parser detects v0.30-shape headers; renderer emits resolution columns only when at least one row has `resolvedQuality !== undefined`.
+- `cmdResolve` mirrors resolution metadata into the takes-fence on disk via the page-lock-aware path. Round-trip preservation keeps resolution data intact across unrelated edits.
+
+#### Tests
+53 new cases (34 unit + 19 E2E):
+- 11 cases in `test/takes-fence.test.ts` for v0.30 resolution columns, round-trip preservation (the codex F3 regression gate), narrow-shape preservation, partial rendering, `upsertTakeRow` and `supersedeRow` resolution preservation.
+- 16 cases in `test/takes-resolution.test.ts` for `deriveResolutionTuple` and `finalizeScorecard` Brier math (n=0, hand-calculated 4-bet reference at Brier=0.205, partial-exclusion contract, partial_rate threshold).
+- 7 cases in `test/takes-engine.test.ts` for v0.30 quality semantics on PGLite, contradictory-input rejection, scorecard hand-calc against the same 4-bet fixture, n=0 handling, SQL-level allow-list privacy filter.
+- 11 cases in `test/e2e/takes-scorecard-parity.test.ts` (NEW) — same fixture into Postgres + PGLite, asserts `getScorecard` and `getCalibrationCurve` return byte-identical results across engines, and that the SQL-level allow-list filter strictly subtracts hidden-holder rows on both engines.
+- 8 cases extended in `test/e2e/takes-postgres.test.ts` — `--quality correct/partial/back-compat` writes the expected (quality, outcome) tuple on real PG; the `takes_resolution_consistency` CHECK constraint actively rejects contradictory raw `UPDATE`s; scorecard + calibration coherent shape; PRIVACY allow-list filter on real PG; MCP dispatch path for `takes_scorecard` + `takes_calibration`.
+
+The E2E parity test caught two real bugs PGLite tolerated: postgres.js was sending `${bucketSize}` as a string and `FLOOR(weight / '0.1')` was throwing `invalid input syntax for type integer`; even after the type cast, IEEE 754 made `FLOOR(0.7 / 0.1)` return 6 on real PG and 7 on PGLite, so calibration buckets diverged at boundaries. Both fixed with `weight::numeric / $N::numeric` (exact decimal arithmetic, engine-agnostic).
+
+#### Migration ordering
+- All wave schema (resolved_quality, CHECK, partial index, drift_decisions table) bundled into migration v44 in Eva Brain (Garry upstream renumbered it from v40 to v43 on master merge; Eva keeps an additional v40 source-safety migration, so the same upstream schema lands one slot later here). Migration runner sorts by version number, so the rename is mechanical — no semantic change. Slices A2/B1/C1 (trajectory + annual-review, meeting extraction CLI, drift judge) add no migrations of their own.
+
 ## [0.29.2] - 2026-05-07
 
 **Thin-client mode: install gbrain on a laptop without a local DB and have it consume a remote brain over MCP.**
@@ -541,9 +664,6 @@ gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s.json \
 
 If anything looks off, file at https://github.com/garrytan/gbrain/issues
 with `gbrain doctor` output.
-
-
-
 
 ## [0.28.11] - 2026-05-07
 

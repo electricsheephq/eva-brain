@@ -255,6 +255,9 @@ export function takeRowToTake(row: Record<string, unknown>): Take {
     active: Boolean(row.active),
     resolved_at: isoOrNull(row.resolved_at),
     resolved_outcome: row.resolved_outcome == null ? null : Boolean(row.resolved_outcome),
+    resolved_quality: row.resolved_quality == null
+      ? null
+      : (String(row.resolved_quality) as 'correct' | 'incorrect' | 'partial'),
     resolved_value: row.resolved_value == null ? null : Number(row.resolved_value),
     resolved_unit: row.resolved_unit == null ? null : String(row.resolved_unit),
     resolved_source: row.resolved_source == null ? null : String(row.resolved_source),
