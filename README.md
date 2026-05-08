@@ -94,6 +94,73 @@ GBrain exposes 30+ MCP tools via stdio:
 
 Add to `~/.claude/server.json` (Claude Code), Settings > MCP Servers (Cursor), or your client's MCP config.
 
+### Codex Desktop plugin
+
+GBrain also ships a Codex Desktop plugin package at `plugins/gbrain-codex/`.
+
+This is a thin local adapter, not a second server implementation:
+
+- Codex launches `node ./scripts/launch-gbrain-serve.mjs`
+- the launcher resolves a local `gbrain` executable
+- then it runs the canonical upstream server via `gbrain serve`
+
+Repo-local smoke path:
+
+```bash
+bun install
+test -x "$HOME/.bun/bin/gbrain" || bun link
+node plugins/gbrain-codex/scripts/rehearsal.mjs
+```
+
+Manual local install for Codex Desktop:
+
+1. Symlink the plugin into your local Codex plugins directory:
+
+```bash
+mkdir -p ~/plugins ~/.agents/plugins
+ln -sfn /absolute/path/to/gbrain/plugins/gbrain-codex ~/plugins/gbrain-codex
+```
+
+2. Create or update `~/.agents/plugins/marketplace.json`:
+
+```json
+{
+  "name": "local",
+  "interface": {
+    "displayName": "Local Plugins"
+  },
+  "plugins": [
+    {
+      "name": "gbrain-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/gbrain-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Engineering"
+    }
+  ]
+}
+```
+
+3. Restart Codex Desktop.
+
+What the plugin expects:
+
+- a working local GBrain install
+- either a repo-local `bin/gbrain`, `gbrain` on `PATH`, or `GBRAIN_CODEX_BIN`
+- the plugin bundles the full checked-in GBrain skill tree and exposes the same
+  stdio MCP tool surface GBrain already serves to other hosts
+
+If Codex Desktop cannot see your linked CLI on GUI PATH, point it directly:
+
+```bash
+export GBRAIN_CODEX_BIN=/absolute/path/to/gbrain
+```
+
 ### Remote MCP with OAuth 2.1 (ChatGPT, Claude Desktop, Cowork, Perplexity)
 
 `gbrain serve --http` starts a production-grade OAuth 2.1 server with an embedded admin dashboard. Zero external infrastructure. Every major AI client connects, every request is scoped, every action is logged.

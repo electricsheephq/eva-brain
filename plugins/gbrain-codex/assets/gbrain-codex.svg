@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">GBrain Codex Plugin</title>
+  <desc id="desc">Blue rounded square with layered nodes representing the GBrain knowledge graph.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1d4ed8"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="24" fill="url(#bg)"/>
+  <g fill="none" stroke="#e0f2fe" stroke-linecap="round" stroke-linejoin="round" stroke-width="8">
+    <path d="M36 36h24l16 16h16"/>
+    <path d="M36 92h24l16-16h16"/>
+    <path d="M36 64h56"/>
+  </g>
+  <g fill="#f8fafc">
+    <circle cx="32" cy="36" r="10"/>
+    <circle cx="32" cy="64" r="10"/>
+    <circle cx="32" cy="92" r="10"/>
+    <circle cx="96" cy="36" r="10"/>
+    <circle cx="96" cy="64" r="10"/>
+    <circle cx="96" cy="92" r="10"/>
+  </g>
+</svg>
