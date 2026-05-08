@@ -373,8 +373,6 @@ async function initRemoteMcp(opts: {
       mode: 'thin-client',
       issuer_url: config.remote_mcp!.issuer_url,
       mcp_url: config.remote_mcp!.mcp_url,
-      oauth_client_id: '[configured]',
-      oauth_client_id_configured: Boolean(config.remote_mcp!.oauth_client_id),
       oauth_secret_in_config: 'oauth_client_secret' in config.remote_mcp!,
     }));
   } else {
