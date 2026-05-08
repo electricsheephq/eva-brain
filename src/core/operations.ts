@@ -267,9 +267,14 @@ export interface OperationContext {
    * by the MCP HTTP/stdio dispatch layer from `access_tokens.permissions.takes_holders`.
    *
    * When set (i.e., this OperationContext came from an MCP-bound token),
-   * `takes_list`, `takes_search`, and `query` (when it returns takes) MUST
-   * apply `WHERE holder = ANY($takesHoldersAllowList)`. This is the
-   * server-side filter that backs the v0.28 visibility model.
+   * `takes_list`, `takes_search`, `takes_scorecard`, `takes_calibration`,
+   * and `query` (when it returns takes) MUST apply `WHERE holder = ANY($takesHoldersAllowList)`.
+   * This is the server-side filter that backs the v0.28+ visibility model.
+   *
+   * v0.30.0: aggregate ops (`takes_scorecard`, `takes_calibration`) require
+   * the allow-list as a TS-required engine method param (fail-closed by
+   * compiler). Hidden-holder rows contribute zero to aggregates. The CLI
+   * callers (local + trusted) leave it undefined.
    *
    * Default behavior when unset: local CLI callers see all holders. v0.28
    * MCP dispatch sets it to `['world']` for tokens with no permissions row
@@ -1030,6 +1035,62 @@ const takes_search: Operation = {
     });
   },
   cliHints: { name: 'takes-search', positional: ['query'] },
+};
+
+/**
+ * v0.30.0 (Slice A1): aggregate calibration scorecard. Pure SQL aggregation.
+ *
+ * Privacy (D4 fail-closed): the engine method REQUIRES the takesHoldersAllowList
+ * param. The handler threads it from the OperationContext so MCP-bound callers
+ * see only their permitted holders' aggregate counts. Local CLI callers
+ * (ctx.takesHoldersAllowList=undefined) get the full scorecard.
+ */
+const takes_scorecard: Operation = {
+  name: 'takes_scorecard',
+  description: 'Calibration scorecard for resolved bets: counts, accuracy, Brier (correct ∨ incorrect only), partial_rate.',
+  scope: 'read',
+  params: {
+    holder: { type: 'string', description: 'Filter to this holder (world|garry|brain|<slug>)' },
+    domain_prefix: { type: 'string', description: 'Slug prefix (e.g. companies/) to scope the scorecard' },
+    since: { type: 'string', description: 'Window start (YYYY-MM-DD)' },
+    until: { type: 'string', description: 'Window end (YYYY-MM-DD)' },
+  },
+  handler: async (ctx, p) => {
+    return ctx.engine.getScorecard(
+      {
+        holder: p.holder as string | undefined,
+        domainPrefix: p.domain_prefix as string | undefined,
+        since: p.since as string | undefined,
+        until: p.until as string | undefined,
+      },
+      ctx.takesHoldersAllowList,
+    );
+  },
+  cliHints: { name: 'takes-scorecard' },
+};
+
+/**
+ * v0.30.0 (Slice A1): calibration curve binned by stated weight. Pure SQL.
+ * Same allow-list contract as takes_scorecard.
+ */
+const takes_calibration: Operation = {
+  name: 'takes_calibration',
+  description: 'Calibration curve: resolved correct/incorrect bets binned by stated weight; observed vs predicted per bucket.',
+  scope: 'read',
+  params: {
+    holder: { type: 'string', description: 'Filter to this holder' },
+    bucket_size: { type: 'number', description: 'Bucket width in (0,1]; default 0.1' },
+  },
+  handler: async (ctx, p) => {
+    return ctx.engine.getCalibrationCurve(
+      {
+        holder: p.holder as string | undefined,
+        bucketSize: p.bucket_size as number | undefined,
+      },
+      ctx.takesHoldersAllowList,
+    );
+  },
+  cliHints: { name: 'takes-calibration' },
 };
 
 const think: Operation = {
@@ -2197,6 +2258,8 @@ export const operations: Operation[] = [
   find_orphans,
   // v0.28: Takes + think
   takes_list, takes_search, think,
+  // v0.30: calibration aggregates over takes
+  takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
   whoami, sources_add, sources_list, sources_remove, sources_status,
   // v0.29: Salience + anomalies + recent transcripts

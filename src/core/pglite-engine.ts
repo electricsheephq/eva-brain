@@ -10,6 +10,7 @@ import type {
   FileSpec, FileRow,
   TakeBatchInput, Take, TakesListOpts, TakeHit, StaleTakeRow,
   TakeResolution, SynthesisEvidenceInput,
+  TakesScorecard, TakesScorecardOpts, CalibrationBucket, CalibrationCurveOpts,
 } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { runMigrations } from './migrate.ts';
@@ -32,6 +33,7 @@ import type {
   EmotionalWeightInputRow, EmotionalWeightWriteRow,
 } from './types.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, takeRowToTake } from './utils.ts';
+import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { GBrainError, PAGE_SORT_SQL } from './types.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
@@ -1962,25 +1964,111 @@ export class PGLiteEngine implements BrainEngine {
     if (existing.resolved_at) {
       throw new GBrainError('TAKE_ALREADY_RESOLVED', `take ${pageId}#${rowNum} already resolved`, 'resolution is immutable; add a new take to record a new outcome');
     }
+    // v0.30.0: derive (quality, outcome) tuple. quality wins when both set.
+    const { quality, outcome } = deriveResolutionTuple(resolution);
     await this.db.query(
       `UPDATE takes SET
          resolved_at      = now(),
-         resolved_outcome = $3,
-         resolved_value   = $4::real,
-         resolved_unit    = $5::text,
-         resolved_source  = $6::text,
-         resolved_by      = $7,
+         resolved_quality = $3::text,
+         resolved_outcome = $4,
+         resolved_value   = $5::real,
+         resolved_unit    = $6::text,
+         resolved_source  = $7::text,
+         resolved_by      = $8,
          updated_at       = now()
        WHERE page_id = $1 AND row_num = $2`,
       [
         pageId, rowNum,
-        resolution.outcome,
+        quality,
+        outcome,
         resolution.value ?? null,
         resolution.unit ?? null,
         resolution.source ?? null,
         resolution.resolvedBy,
       ]
     );
+  }
+
+  /**
+   * v0.30.0: aggregate scorecard. SQL-level allow-list filter (D4 fail-closed).
+   * Hidden-holder rows contribute zero to aggregates.
+   */
+  async getScorecard(opts: TakesScorecardOpts, allowList: string[] | undefined): Promise<TakesScorecard> {
+    // Build the WHERE clause with positional params. PGLite (postgres-via-WASM)
+    // shares the SQL dialect with real Postgres so the math expressions match.
+    const params: unknown[] = [];
+    const clauses: string[] = [];
+    if (opts.holder !== undefined) { params.push(opts.holder); clauses.push(`AND holder = $${params.length}`); }
+    if (opts.domainPrefix !== undefined) {
+      params.push(opts.domainPrefix + '%');
+      clauses.push(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND p.slug LIKE $${params.length})`);
+    }
+    if (opts.since !== undefined) { params.push(opts.since); clauses.push(`AND since_date >= $${params.length}`); }
+    if (opts.until !== undefined) { params.push(opts.until); clauses.push(`AND since_date <= $${params.length}`); }
+    if (allowList !== undefined) { params.push(allowList); clauses.push(`AND holder = ANY($${params.length}::text[])`); }
+    const where = clauses.join(' ');
+    const res = await this.db.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE kind = 'bet')::int                            AS total_bets,
+         COUNT(*) FILTER (WHERE resolved_quality IS NOT NULL)::int            AS resolved,
+         COUNT(*) FILTER (WHERE resolved_quality = 'correct')::int            AS correct,
+         COUNT(*) FILTER (WHERE resolved_quality = 'incorrect')::int          AS incorrect,
+         COUNT(*) FILTER (WHERE resolved_quality = 'partial')::int            AS partial,
+         AVG(
+           CASE WHEN resolved_quality IN ('correct','incorrect')
+                THEN POWER(weight - (CASE resolved_quality WHEN 'correct' THEN 1 ELSE 0 END), 2)
+           END
+         )::float                                                              AS brier
+       FROM takes
+       WHERE 1=1 ${where}`,
+      params,
+    );
+    const r = res.rows[0] as { total_bets: number; resolved: number; correct: number; incorrect: number; partial: number; brier: number | null };
+    return finalizeScorecard(r);
+  }
+
+  /**
+   * v0.30.0: calibration curve. Bins resolved correct/incorrect bets by stated weight.
+   */
+  async getCalibrationCurve(opts: CalibrationCurveOpts, allowList: string[] | undefined): Promise<CalibrationBucket[]> {
+    const bucketSize = opts.bucketSize && opts.bucketSize > 0 && opts.bucketSize <= 1 ? opts.bucketSize : 0.1;
+    const maxIdx = Math.floor(1 / bucketSize) - 1;
+    const params: unknown[] = [bucketSize, maxIdx];
+    const clauses: string[] = [];
+    if (opts.holder !== undefined) { params.push(opts.holder); clauses.push(`AND holder = $${params.length}`); }
+    if (allowList !== undefined) { params.push(allowList); clauses.push(`AND holder = ANY($${params.length}::text[])`); }
+    const where = clauses.join(' ');
+    // NUMERIC casts for exact decimal arithmetic — keeps PGLite + Postgres
+    // bucket boundaries identical at FP-edge weights (e.g. 0.7/0.1).
+    // See parity test in test/e2e/takes-scorecard-parity.test.ts.
+    const res = await this.db.query(
+      `WITH binned AS (
+         SELECT
+           LEAST(FLOOR(weight::numeric / $1::numeric)::int, $2::int)::int AS bucket_idx,
+           weight,
+           (resolved_quality = 'correct')::int            AS hit
+         FROM takes
+         WHERE resolved_quality IN ('correct','incorrect')
+           ${where}
+       )
+       SELECT
+         (bucket_idx::numeric * $1::numeric)::float        AS bucket_lo,
+         ((bucket_idx + 1)::numeric * $1::numeric)::float  AS bucket_hi,
+         COUNT(*)::int                                     AS n,
+         AVG(hit)::float                                   AS observed,
+         AVG(weight)::float                                AS predicted
+       FROM binned
+       GROUP BY bucket_idx
+       ORDER BY bucket_idx`,
+      params,
+    );
+    return (res.rows as { bucket_lo: number; bucket_hi: number; n: number; observed: number | null; predicted: number | null }[]).map(r => ({
+      bucket_lo: r.bucket_lo,
+      bucket_hi: r.bucket_hi,
+      n: r.n,
+      observed: r.n > 0 ? r.observed : null,
+      predicted: r.n > 0 ? r.predicted : null,
+    }));
   }
 
   async addSynthesisEvidence(rowsIn: SynthesisEvidenceInput[]): Promise<number> {

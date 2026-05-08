@@ -173,6 +173,14 @@ export interface Take {
   active: boolean;
   resolved_at: string | null;
   resolved_outcome: boolean | null;
+  /**
+   * v0.30.0: 3-state outcome label. Sits alongside `resolved_outcome` for
+   * back-compat. New writes populate both; legacy v0.28-resolved rows have
+   * `resolved_quality` backfilled by the v0.30 migration (v44 in Eva).
+   * Null on unresolved rows. Schema CHECK enforces (quality, outcome) consistency:
+   * `correct` ↔ `outcome=true`, `incorrect` ↔ `outcome=false`, `partial` ↔ `outcome=NULL`.
+   */
+  resolved_quality: 'correct' | 'incorrect' | 'partial' | null;
   resolved_value: number | null;
   resolved_unit: string | null;
   resolved_source: string | null;
@@ -220,11 +228,71 @@ export interface StaleTakeRow {
 
 /** Resolution metadata for resolveTake. */
 export interface TakeResolution {
-  outcome: boolean;
+  /**
+   * v0.30.0: primary 3-state input. When set, takes precedence over `outcome`
+   * and the engine writes both columns (quality directly; outcome derived:
+   * `correct→true`, `incorrect→false`, `partial→null`).
+   */
+  quality?: 'correct' | 'incorrect' | 'partial';
+  /**
+   * v0.28 back-compat input. Keep submitting for v0.28 callers; the engine
+   * derives quality (`true→correct`, `false→incorrect`). When `quality` is
+   * also set, `quality` wins. When neither is set, the engine throws.
+   * Mutually-exclusive with `quality === 'partial'` because partial isn't
+   * binary.
+   */
+  outcome?: boolean;
   value?: number;
   unit?: string;       // 'usd' | 'pct' | 'count' | other
   source?: string;
   resolvedBy: string;  // slug or 'garry'
+}
+
+/** v0.30.0: scorecard aggregate. */
+export interface TakesScorecard {
+  total_bets: number;
+  resolved: number;
+  correct: number;
+  incorrect: number;
+  partial: number;
+  /** Accuracy = correct / (correct + incorrect). NULL when n=0. */
+  accuracy: number | null;
+  /**
+   * Brier score over rows where `resolved_quality IN ('correct','incorrect')`.
+   * Maps `correct→1`, `incorrect→0`, computes `mean((weight − outcome)²)`.
+   * Lower is better; 0 = perfect; 0.25 = always-50% baseline.
+   * Excludes partial — that label hides hedging behavior; `partial_rate`
+   * surfaces it as a separate signal. NULL when no correct+incorrect rows.
+   */
+  brier: number | null;
+  /** partial / resolved. NULL when n=0. */
+  partial_rate: number | null;
+}
+
+export interface TakesScorecardOpts {
+  holder?: string;
+  domainPrefix?: string; // e.g. 'companies/' to scope the scorecard
+  since?: string;        // ISO date 'YYYY-MM-DD'
+  until?: string;        // ISO date 'YYYY-MM-DD'
+}
+
+/** v0.30.0: calibration curve bucket. */
+export interface CalibrationBucket {
+  /** Lower bound of the weight bucket, inclusive. */
+  bucket_lo: number;
+  /** Upper bound, exclusive (except for the final bucket which is inclusive of 1.0). */
+  bucket_hi: number;
+  /** Count of resolved correct+incorrect bets falling in this weight range. */
+  n: number;
+  /** correct / n. NULL when n=0. */
+  observed: number | null;
+  /** mean(weight) within the bucket — what was predicted on average. NULL when n=0. */
+  predicted: number | null;
+}
+
+export interface CalibrationCurveOpts {
+  holder?: string;
+  bucketSize?: number; // default 0.1
 }
 
 /** Synthesis evidence row input (provenance from think synthesis pages). */
@@ -568,8 +636,38 @@ export interface BrainEngine {
   /**
    * Resolve a bet (or take). Sets resolved_* columns. Immutable: re-resolve
    * attempts throw `TAKE_ALREADY_RESOLVED`. Use supersede to express a new bet.
+   *
+   * v0.30.0: accepts either `quality` (3-state, primary) or `outcome` (boolean,
+   * back-compat). When both set, `quality` wins. The engine writes BOTH columns
+   * derived from whichever input was given: `quality='correct'/'incorrect'` →
+   * `outcome=true/false`; `quality='partial'` → `outcome=NULL`. The schema
+   * `takes_resolution_consistency` CHECK constraint catches contradictory
+   * states at the DB layer as a defense-in-depth backstop.
    */
   resolveTake(pageId: number, rowNum: number, resolution: TakeResolution): Promise<void>;
+
+  /**
+   * v0.30.0: aggregate calibration scorecard. Pure SQL aggregation; no LLM.
+   * Counts resolved bets, computes accuracy, Brier score (correct+incorrect
+   * only), and `partial_rate`. Filtering: `holder` scopes to one identity;
+   * `domainPrefix` scopes to a slug-prefix (e.g. `companies/`); `since`/`until`
+   * scope to a `since_date` window.
+   *
+   * Privacy (D4 from plan): `allowList` is REQUIRED in the TS signature.
+   * The engine applies `WHERE holder = ANY($allowList)` INSIDE the GROUP BY
+   * so hidden-holder rows contribute zero to aggregates. Pass an empty array
+   * to enforce zero-results; pass `undefined` only from server-side trusted
+   * callers that have already verified the request is unrestricted.
+   */
+  getScorecard(opts: TakesScorecardOpts, allowList: string[] | undefined): Promise<TakesScorecard>;
+
+  /**
+   * v0.30.0: calibration curve. Bins resolved correct+incorrect bets by stated
+   * weight (default bucket size 0.1) and reports observed vs predicted frequency
+   * per bucket. Same allow-list contract as `getScorecard`. Excludes partial
+   * (consistent with Brier — partial has no binary outcome to compare against).
+   */
+  getCalibrationCurve(opts: CalibrationCurveOpts, allowList: string[] | undefined): Promise<CalibrationBucket[]>;
 
   /** Persist think provenance. ON CONFLICT DO NOTHING; returns rows inserted. */
   addSynthesisEvidence(rows: SynthesisEvidenceInput[]): Promise<number>;

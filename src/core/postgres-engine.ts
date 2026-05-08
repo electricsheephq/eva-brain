@@ -7,8 +7,10 @@ import type {
   FileSpec, FileRow,
   TakeBatchInput, Take, TakesListOpts, TakeHit, StaleTakeRow,
   TakeResolution, SynthesisEvidenceInput,
+  TakesScorecard, TakesScorecardOpts, CalibrationBucket, CalibrationCurveOpts,
 } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
+import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { runMigrations } from './migrate.ts';
 import { SCHEMA_SQL } from './schema-embedded.ts';
 import { verifySchema } from './schema-verify.ts';
@@ -2009,10 +2011,14 @@ export class PostgresEngine implements BrainEngine {
     if ((existing as { resolved_at?: unknown }).resolved_at) {
       throw new GBrainError('TAKE_ALREADY_RESOLVED', `take ${pageId}#${rowNum} already resolved`, 'resolution is immutable; add a new take to record a new outcome');
     }
+    // v0.30.0: derive (quality, outcome) tuple. quality wins when both set.
+    // Schema CHECK enforces consistency as a defense-in-depth backstop.
+    const { quality, outcome } = deriveResolutionTuple(resolution);
     await sql`
       UPDATE takes SET
         resolved_at      = now(),
-        resolved_outcome = ${resolution.outcome},
+        resolved_quality = ${quality}::text,
+        resolved_outcome = ${outcome},
         resolved_value   = ${resolution.value ?? null}::real,
         resolved_unit    = ${resolution.unit ?? null}::text,
         resolved_source  = ${resolution.source ?? null}::text,
@@ -2020,6 +2026,89 @@ export class PostgresEngine implements BrainEngine {
         updated_at       = now()
       WHERE page_id = ${pageId} AND row_num = ${rowNum}
     `;
+  }
+
+  /**
+   * v0.30.0: aggregate scorecard. SQL-level allow-list filter (D4 fail-closed).
+   * Hidden-holder rows contribute zero to aggregates. NULL allowList means
+   * trusted caller (no filtering). Empty array → zero results.
+   */
+  async getScorecard(opts: TakesScorecardOpts, allowList: string[] | undefined): Promise<TakesScorecard> {
+    const sql = this.sql;
+    const allowed = allowList ? sql`AND holder = ANY(${allowList}::text[])` : sql``;
+    const holderClause = opts.holder ? sql`AND holder = ${opts.holder}` : sql``;
+    const domainClause = opts.domainPrefix
+      ? sql`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND p.slug LIKE ${opts.domainPrefix + '%'})`
+      : sql``;
+    const sinceClause = opts.since ? sql`AND since_date >= ${opts.since}` : sql``;
+    const untilClause = opts.until ? sql`AND since_date <= ${opts.until}` : sql``;
+    const rows = await sql`
+      SELECT
+        COUNT(*) FILTER (WHERE kind = 'bet')::int                              AS total_bets,
+        COUNT(*) FILTER (WHERE resolved_quality IS NOT NULL)::int              AS resolved,
+        COUNT(*) FILTER (WHERE resolved_quality = 'correct')::int              AS correct,
+        COUNT(*) FILTER (WHERE resolved_quality = 'incorrect')::int            AS incorrect,
+        COUNT(*) FILTER (WHERE resolved_quality = 'partial')::int              AS partial,
+        AVG(
+          CASE WHEN resolved_quality IN ('correct','incorrect')
+               THEN POWER(weight - (CASE resolved_quality WHEN 'correct' THEN 1 ELSE 0 END), 2)
+          END
+        )::float                                                               AS brier
+      FROM takes
+      WHERE 1=1 ${holderClause} ${domainClause} ${sinceClause} ${untilClause} ${allowed}
+    `;
+    const r = rows[0] as { total_bets: number; resolved: number; correct: number; incorrect: number; partial: number; brier: number | null };
+    return finalizeScorecard(r);
+  }
+
+  /**
+   * v0.30.0: calibration curve. Bins resolved correct/incorrect bets by stated
+   * weight. Same allow-list contract as getScorecard.
+   *
+   * Real-Postgres-via-postgres.js sends scalar params as text by default, so
+   * `${bucketSize}` arrives as the string `'0.1'`. Without explicit `::float`
+   * casts the FLOOR/LEAST/multiplication contexts try to coerce text to int
+   * and bomb with `invalid input syntax for type integer: "0.1"`. PGLite is
+   * more permissive — caught at e2e parity by takes-scorecard-parity.test.ts.
+   */
+  async getCalibrationCurve(opts: CalibrationCurveOpts, allowList: string[] | undefined): Promise<CalibrationBucket[]> {
+    const sql = this.sql;
+    const bucketSize = opts.bucketSize && opts.bucketSize > 0 && opts.bucketSize <= 1 ? opts.bucketSize : 0.1;
+    const maxIdx = Math.floor(1 / bucketSize) - 1;
+    const allowed = allowList ? sql`AND holder = ANY(${allowList}::text[])` : sql``;
+    const holderClause = opts.holder ? sql`AND holder = ${opts.holder}` : sql``;
+    // Bucketing uses NUMERIC for exact decimal arithmetic. Going through
+    // FLOAT introduces IEEE 754 rounding (e.g. 0.7/0.1 = 6.9999..., FLOOR=6
+    // instead of the expected 7), which makes Postgres and PGLite diverge
+    // at bucket boundaries. NUMERIC is exact, so the bucket index is
+    // engine-agnostic and the parity test holds.
+    const rows = await sql`
+      WITH binned AS (
+        SELECT
+          LEAST(FLOOR(weight::numeric / ${bucketSize}::numeric)::int, ${maxIdx}::int)::int AS bucket_idx,
+          weight,
+          (resolved_quality = 'correct')::int AS hit
+        FROM takes
+        WHERE resolved_quality IN ('correct','incorrect')
+          ${holderClause} ${allowed}
+      )
+      SELECT
+        (bucket_idx::numeric * ${bucketSize}::numeric)::float       AS bucket_lo,
+        ((bucket_idx + 1)::numeric * ${bucketSize}::numeric)::float AS bucket_hi,
+        COUNT(*)::int                                                AS n,
+        AVG(hit)::float                                              AS observed,
+        AVG(weight)::float                                           AS predicted
+      FROM binned
+      GROUP BY bucket_idx
+      ORDER BY bucket_idx
+    `;
+    return (rows as unknown as { bucket_lo: number; bucket_hi: number; n: number; observed: number | null; predicted: number | null }[]).map(r => ({
+      bucket_lo: r.bucket_lo,
+      bucket_hi: r.bucket_hi,
+      n: r.n,
+      observed: r.n > 0 ? r.observed : null,
+      predicted: r.n > 0 ? r.predicted : null,
+    }));
   }
 
   async addSynthesisEvidence(rowsIn: SynthesisEvidenceInput[]): Promise<number> {

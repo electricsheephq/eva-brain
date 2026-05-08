@@ -254,7 +254,7 @@ test('initSchema migrates a v40 brain before pages.effective_date existed', asyn
       );
       expect(rows.length).toBeGreaterThan(0);
     }
-    expect(await engine.getConfig('version')).toBe('43');
+    expect(await engine.getConfig('version')).toBe('44');
   } finally {
     await engine.disconnect();
   }
