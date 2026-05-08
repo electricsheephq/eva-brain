@@ -152,22 +152,26 @@ Do not reuse a 1536d brain and expect the dimension mismatch to self-heal.
 If gbrain receives embeddings whose length does not match the configured dimension, it fails closed with an embedding-dimension error.
 That is expected and correct.
 
-## Host OAuth adapter for extraction
+## OpenClaw OAuth adapter for extraction
 
-This part is a **host-side dependency**.
+This part is a **host-side plugin dependency**, not a GBrain core embedding
+dependency.
 
 What we can safely document here today:
 - the fork's fresh 2048d install path is independent of host OAuth
-- the durable host OAuth auth propagation work is tracked in the downstream adapter issue
-- today's media support is text-backed normalized evidence import/search
-- production extraction that relies on host-managed OAuth should be considered dependent on a rebuilt, live-smoked adapter PR
+- the OpenClaw plugin exposes `/plugins/gbrain/extract`
+- the plugin routes extraction through OpenClaw's logged-in Codex runtime
+- the plugin owns extraction concurrency, queue, timeout, interval, and file-size policy
+- today's adapter payload is `gbrain.media-extraction.v1`
+- upstream GBrain native image pages/files/multimodal embeddings remain the canonical long-term media storage and indexing path
+- `import-media` and `ingest-media --extract openclaw` are transitional compatibility commands for materializing adapter output into searchable pages
 
 ### Recommended integrated rollout
 
 1. complete the fresh 2048d brain install first
 2. verify it with `gbrain doctor --json` and `gbrain stats`
-3. separately complete the host OAuth adapter/auth flow
-4. verify extraction on the host side
+3. install and enable `plugins/openclaw-gbrain`
+4. verify extraction on the host side through `/plugins/gbrain/extract`
 5. only then start customer imports / syncs
 
 ### Verification expectation for the OAuth half
@@ -177,10 +181,10 @@ Because the auth adapter is host-side, the verification should also be host-side
 - the extraction command/path should stop failing on missing auth
 - no secret values should be printed during verification
 
-Until the downstream adapter issue is proven with a live host runtime smoke, the safe fallback is:
+Until a live host runtime smoke has passed on the target machine, the safe fallback is:
 - use the documented 2048d embedding provider
 - use normalized media evidence JSON or text-backed extraction paths where applicable
-- do not claim fully supported no-extra-key host-managed OAuth extraction yet
+- do not claim binary video/audio/PDF understanding beyond the provider paths actually smoke-tested
 
 ## Post-init verification
 
