@@ -108,7 +108,10 @@ describe('collectRemoteDoctorReport', () => {
     expect(checkNames).toContain('oauth_token');
     expect(checkNames).toContain('mcp_smoke');
     expect(report.checks.every(c => c.status === 'ok')).toBe(true);
-    expect(report.oauth_scope).toBe('read write admin');
+    expect(report.oauth_scope).toBe('[granted]');
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain('test-client');
+    expect(serialized).not.toContain('read write admin');
   });
 
   test('discovery 404 — fails with reason=http and short-circuits', async () => {

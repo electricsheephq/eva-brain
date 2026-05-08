@@ -171,7 +171,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
     expect(checkNames).toContain('oauth_discovery');
     expect(checkNames).toContain('oauth_token');
     expect(checkNames).toContain('mcp_smoke');
-    expect(report.oauth_scope).toContain('admin');
+    expect(report.oauth_scope).toBe('[granted]');
   });
 
   test('sync is refused with canonical thin-client error', async () => {

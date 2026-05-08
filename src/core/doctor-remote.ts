@@ -28,6 +28,11 @@ export interface RemoteDoctorReport {
   status: 'ok' | 'warn' | 'fail';
   mcp_url: string;
   issuer_url: string;
+  /**
+   * Redacted presence marker. The raw OAuth client id and granted scope can
+   * identify a remote brain tenant, so doctor output reports health without
+   * echoing those values into logs or automation transcripts.
+   */
   oauth_client_id: string;
   oauth_scope?: string;
   checks: RemoteCheck[];
@@ -76,7 +81,7 @@ export async function collectRemoteDoctorReport(config: GBrainConfig): Promise<R
       status: 'fail',
       mcp_url: '',
       issuer_url: '',
-      oauth_client_id: '',
+      oauth_client_id: '[missing]',
       checks,
     };
   }
@@ -117,7 +122,7 @@ export async function collectRemoteDoctorReport(config: GBrainConfig): Promise<R
       status: 'fail',
       mcp_url: remote.mcp_url,
       issuer_url: remote.issuer_url,
-      oauth_client_id: remote.oauth_client_id,
+      oauth_client_id: redactedClientId(remote),
       checks,
     };
   }
@@ -125,7 +130,7 @@ export async function collectRemoteDoctorReport(config: GBrainConfig): Promise<R
   checks.push({
     name: 'oauth_credentials',
     status: 'ok',
-    message: `client_id=${remote.oauth_client_id}, secret_source=${clientSecretSource}`,
+    message: `client_id=${redactedClientId(remote)}, secret_source=${clientSecretSource}`,
   });
 
   // 2. OAuth discovery
@@ -159,8 +164,8 @@ export async function collectRemoteDoctorReport(config: GBrainConfig): Promise<R
   checks.push({
     name: 'oauth_token',
     status: 'ok',
-    message: `${tokenRes.token.token_type ?? 'bearer'} (scope=${tokenRes.token.scope ?? 'unspecified'}, expires_in=${tokenRes.token.expires_in ?? '?'})`,
-    detail: { scope: tokenRes.token.scope ?? null, expires_in: tokenRes.token.expires_in ?? null },
+    message: `${tokenRes.token.token_type ?? 'bearer'} (scope=${redactedScope(tokenRes.token.scope)}, expires_in=${tokenRes.token.expires_in ?? '?'})`,
+    detail: { scope: redactedScope(tokenRes.token.scope), expires_in: tokenRes.token.expires_in ?? null },
   });
 
   // 4. MCP smoke
@@ -199,10 +204,18 @@ function finalize(
     status,
     mcp_url: remote.mcp_url,
     issuer_url: remote.issuer_url,
-    oauth_client_id: remote.oauth_client_id,
-    ...(scope ? { oauth_scope: scope } : {}),
+    oauth_client_id: redactedClientId(remote),
+    ...(scope ? { oauth_scope: redactedScope(scope) } : {}),
     checks,
   };
+}
+
+function redactedClientId(remote: NonNullable<GBrainConfig['remote_mcp']>): string {
+  return remote.oauth_client_id ? '[configured]' : '[missing]';
+}
+
+function redactedScope(scope: string | undefined): string {
+  return scope ? '[granted]' : '[unspecified]';
 }
 
 function printHumanReport(report: RemoteDoctorReport): void {
@@ -211,8 +224,8 @@ function printHumanReport(report: RemoteDoctorReport): void {
   console.log(`Mode:        ${report.mode}`);
   console.log(`Issuer URL:  ${report.issuer_url}`);
   console.log(`MCP URL:     ${report.mcp_url}`);
-  console.log(`Client ID:   ${report.oauth_client_id}`);
-  if (report.oauth_scope) console.log(`OAuth scope: ${report.oauth_scope}`);
+  console.log(`Client ID:   ${report.oauth_client_id} (redacted)`);
+  if (report.oauth_scope) console.log(`OAuth scope: ${report.oauth_scope} (redacted)`);
   console.log('');
 
   for (const c of report.checks) {

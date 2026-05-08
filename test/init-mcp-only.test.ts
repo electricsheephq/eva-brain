@@ -151,6 +151,9 @@ describe('gbrain init --mcp-only — happy path', () => {
     const parsed = JSON.parse(r.stdout.trim().split('\n').pop()!);
     expect(parsed.status).toBe('success');
     expect(parsed.mode).toBe('thin-client');
+    expect(parsed.oauth_client_id).toBe('[configured]');
+    expect(parsed.oauth_client_id_configured).toBe(true);
+    expect(r.stdout).not.toContain('"oauth_client_id":"cid"');
   });
 
   test('env-var-supplied secret is NOT persisted to config file', async () => {
