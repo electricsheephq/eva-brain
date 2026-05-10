@@ -1,5 +1,5 @@
 export const DEFAULT_CODEX_EXTRACTION_MODEL = 'openai-codex/gpt-5.4-mini';
-const DEFAULT_OPENCLAW_COMPLETION_PATH = '/plugins/gbrain/complete';
+const LEGACY_OPENCLAW_COMPLETION_PATH = '/plugins/gbrain/complete';
 const DEFAULT_OPENCLAW_EXTRACT_PATH = '/plugins/gbrain/extract';
 
 export interface CodexExtractionRequest {
@@ -47,7 +47,7 @@ export function createConfiguredCodexExtractionClient(env: CodexExtractionEnv = 
     return new OpenClawGatewayCodexExtractionClient({
       gatewayUrl,
       gatewayToken,
-      completionPath: env.GBRAIN_OPENCLAW_COMPLETION_PATH?.trim() || DEFAULT_OPENCLAW_COMPLETION_PATH,
+      completionPath: env.GBRAIN_OPENCLAW_COMPLETION_PATH?.trim() || undefined,
       extractPath: env.GBRAIN_OPENCLAW_EXTRACT_PATH?.trim() || DEFAULT_OPENCLAW_EXTRACT_PATH,
     });
   }
@@ -62,12 +62,12 @@ export class OpenClawGatewayCodexExtractionClient implements CodexExtractionClie
   constructor(private readonly options: { gatewayUrl: string; gatewayToken?: string; completionPath?: string; extractPath?: string }) {}
 
   async completeText(request: CodexExtractionRequest): Promise<string> {
-    const reply = await this.callBridge(request, false);
+    const reply = await this.callLegacyCompletionBridge(request, false);
     return coerceTextReply(JSON.stringify(reply));
   }
 
   async completeJson<T = unknown>(request: CodexExtractionRequest): Promise<T> {
-    const reply = await this.callBridge(request, true);
+    const reply = await this.callLegacyCompletionBridge(request, true);
     if (isRecord(reply) && reply.json !== undefined) return reply.json as T;
     return parseCodexJsonReply(JSON.stringify(reply)) as T;
   }
@@ -99,8 +99,17 @@ export class OpenClawGatewayCodexExtractionClient implements CodexExtractionClie
     return parsed as T;
   }
 
-  private async callBridge(request: CodexExtractionRequest, json: boolean): Promise<unknown> {
-    const url = new URL(this.options.completionPath ?? DEFAULT_OPENCLAW_COMPLETION_PATH, normalizeGatewayUrl(this.options.gatewayUrl));
+  private async callLegacyCompletionBridge(request: CodexExtractionRequest, json: boolean): Promise<unknown> {
+    const completionPath = this.options.completionPath?.trim();
+    if (!completionPath) {
+      throw new Error(
+        'OpenClaw gateway generic completion is not enabled on the default /plugins/gbrain/extract route. ' +
+        'Use extractMedia() for OAuth-backed media extraction, or use GBRAIN_OPENCLAW_COMPLETION_COMMAND for text-only fallback. ' +
+        `Set GBRAIN_OPENCLAW_COMPLETION_PATH=${LEGACY_OPENCLAW_COMPLETION_PATH} only when targeting a legacy completion bridge.`,
+      );
+    }
+
+    const url = new URL(completionPath, normalizeGatewayUrl(this.options.gatewayUrl));
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.options.gatewayToken) headers.authorization = `Bearer ${this.options.gatewayToken}`;
     const res = await fetch(url, {
@@ -115,9 +124,9 @@ export class OpenClawGatewayCodexExtractionClient implements CodexExtractionClie
       signal: request.signal,
     });
     const text = await res.text();
-    if (!res.ok) throw new Error(`OpenClaw completion bridge failed (${res.status}): ${text || res.statusText}`);
-    const parsed = parseJson(text, 'OpenClaw completion bridge returned non-JSON output');
-    if (isRecord(parsed) && parsed.ok === false) throw new Error(`OpenClaw completion bridge failed: ${String(parsed.error ?? 'unknown error')}`);
+    if (!res.ok) throw new Error(`OpenClaw legacy completion bridge failed (${res.status}): ${text || res.statusText}`);
+    const parsed = parseJson(text, 'OpenClaw legacy completion bridge returned non-JSON output');
+    if (isRecord(parsed) && parsed.ok === false) throw new Error(`OpenClaw legacy completion bridge failed: ${String(parsed.error ?? 'unknown error')}`);
     return parsed;
   }
 }
