@@ -337,7 +337,61 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
     checks.push({ name: 'queue_health', status: 'ok', message: 'PGLite — no queue to check' });
   }
 
+  // v0.31.12 subagent runtime enforcement (Layer 3 of 3 — Codex F13).
+  // The subagent loop is Anthropic-only. If models.tier.subagent or
+  // models.default is explicitly set to a non-Anthropic provider, warn here
+  // so the user sees it at the next `gbrain doctor` run instead of at the
+  // next subagent job submission. (Layers 1+2 also enforce — this is the
+  // surfacing layer.)
+  checks.push(await checkSubagentProvider(engine));
+
   return computeDoctorReport(checks);
+}
+
+/**
+ * v0.31.12 — surface a warn when models.tier.subagent or models.default
+ * resolves to a non-Anthropic provider. The subagent loop in
+ * src/core/minions/handlers/subagent.ts uses Anthropic Messages API with
+ * prompt caching on system + tools; non-Anthropic providers would break
+ * the loop at runtime. This check makes the configuration drift visible
+ * before a job is submitted.
+ */
+async function checkSubagentProvider(engine: BrainEngine): Promise<Check> {
+  try {
+    const { isAnthropicProvider } = await import('../core/model-config.ts');
+    const tierSubagent = await engine.getConfig('models.tier.subagent');
+    const modelsDefault = await engine.getConfig('models.default');
+
+    // Tier-explicit override loses fail-loud since the user clearly meant it.
+    if (tierSubagent && !isAnthropicProvider(tierSubagent)) {
+      return {
+        name: 'subagent_provider',
+        status: 'warn',
+        message:
+          `models.tier.subagent is "${tierSubagent}" but the subagent loop is Anthropic-only. ` +
+          `Runtime will fall back to claude-sonnet-4-6. Fix: ` +
+          `\`gbrain config set models.tier.subagent anthropic:claude-sonnet-4-6\`.`,
+      };
+    }
+    // models.default sneaking subagent into a non-Anthropic provider.
+    if (!tierSubagent && modelsDefault && !isAnthropicProvider(modelsDefault)) {
+      return {
+        name: 'subagent_provider',
+        status: 'warn',
+        message:
+          `models.default is "${modelsDefault}" which would route subagent jobs to a non-Anthropic provider. ` +
+          `Runtime falls back to claude-sonnet-4-6 for subagent only. ` +
+          `Fix: \`gbrain config set models.tier.subagent anthropic:claude-sonnet-4-6\` to lock it in.`,
+      };
+    }
+    return { name: 'subagent_provider', status: 'ok', message: 'Subagent tier resolves to Anthropic' };
+  } catch (e) {
+    return {
+      name: 'subagent_provider',
+      status: 'warn',
+      message: `Could not check subagent provider: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
 }
 
 /**
@@ -1117,6 +1171,39 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     });
   }
 
+  // 8c. Alternative provider advisory (v0.32 D11=C / Codex finding #2 wire-through).
+  // Walks listRecipes() and surfaces any recipe whose required env vars are ALL
+  // set in the process env but is not the currently configured provider. Helps
+  // users discover that, e.g., OPENAI_API_KEY=x DASHSCOPE_API_KEY=y means they
+  // have a Chinese-region alternative ready to go without setup.
+  progress.heartbeat('alternative_providers');
+  try {
+    const { listRecipes } = await import('../core/ai/recipes/index.ts');
+    const { getEmbeddingModel } = await import('../core/ai/gateway.ts');
+    const configuredId = (getEmbeddingModel() || '').split(':')[0];
+    const alternatives: string[] = [];
+    for (const r of listRecipes()) {
+      if (r.id === configuredId) continue;
+      const required = r.auth_env?.required ?? [];
+      // Skip recipes with no required env (they're "always available" — not a
+      // useful signal) and recipes that require env we don't have.
+      if (required.length === 0) continue;
+      const allPresent = required.every(k => !!process.env[k]);
+      if (!allPresent) continue;
+      // Skip recipes without an embedding touchpoint (chat-only — not an
+      // embedding alternative).
+      if (!r.touchpoints.embedding) continue;
+      alternatives.push(r.id);
+    }
+    if (alternatives.length > 0) {
+      checks.push({
+        name: 'alternative_providers',
+        status: 'ok',
+        message: `Detected ${alternatives.length} alternative embedding provider${alternatives.length > 1 ? 's' : ''} ready to use: ${alternatives.join(', ')}. Run \`gbrain providers list\` to switch.`,
+      });
+    }
+  } catch { /* listRecipes / gateway not available — silent */ }
+
   // 9. Graph health (link + timeline coverage on entity pages).
   // dead_links removed in v0.10.1: ON DELETE CASCADE on link FKs makes it always 0.
   //
@@ -1766,6 +1853,14 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
       queueHealthHb();
     }
   }
+
+  // 11.4 subagent_provider (v0.31.12 — Codex F13 layer 3 of 3). Surfaces a
+  // warn when models.tier.subagent or models.default points at a non-Anthropic
+  // provider. Layers 1 (queue.ts submit-time) and 2 (handler runtime) also
+  // enforce; this is the surfacing layer so users see the config drift before
+  // a job is submitted.
+  progress.heartbeat('subagent_provider');
+  checks.push(await checkSubagentProvider(engine));
 
   // 11.5 facts_health (v0.31 hot memory). Surfaces per-source counters so
   // operators can see the extraction pipeline's pulse without raw SQL.

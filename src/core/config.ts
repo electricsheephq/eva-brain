@@ -38,7 +38,7 @@ export interface GBrainConfig {
   expansion_model?: string;
   /**
    * Default chat model for `gateway.chat()` callers (v0.27+).
-   * Default: "anthropic:claude-sonnet-4-6-20250929".
+   * Default: "anthropic:claude-sonnet-4-6" (dateless per Anthropic's v0.31.12+ model-ID format).
    */
   chat_model?: string;
   /**
@@ -154,6 +154,7 @@ export function loadConfig(env: Record<string, string | undefined> = loadGbrainE
     ...(dbUrl ? { database_url: dbUrl } : {}),
     ...(dbUrl ? { database_path: undefined } : {}),
     ...(env.OPENAI_API_KEY ? { openai_api_key: env.OPENAI_API_KEY } : {}),
+    ...(env.ANTHROPIC_API_KEY ? { anthropic_api_key: env.ANTHROPIC_API_KEY } : {}),
     ...(env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: env.GBRAIN_EMBEDDING_MODEL } : {}),
     ...(() => {
       const raw = env.GBRAIN_EMBEDDING_DIMENSIONS;

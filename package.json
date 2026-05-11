@@ -1,6 +1,6 @@
 {
   "name": "gbrain",
-  "version": "0.31.10",
+  "version": "0.32.0",
   "description": "Postgres-native personal knowledge brain with hybrid RAG search",
   "repository": {
     "type": "git",

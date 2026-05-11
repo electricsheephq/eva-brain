@@ -4,12 +4,14 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 
 import { redactAuthResolution, resolveProviderAuth } from '../../src/core/ai/auth.ts';
-import { configureGateway, isAvailable, resetGateway } from '../../src/core/ai/gateway.ts';
+import { applyResolveAuth, configureGateway, isAvailable, resetGateway } from '../../src/core/ai/gateway.ts';
 import { getRecipe } from '../../src/core/ai/recipes/index.ts';
 import type { AIGatewayConfig } from '../../src/core/ai/types.ts';
 
 const openai = getRecipe('openai');
 if (!openai) throw new Error('openai recipe missing');
+const azure = getRecipe('azure-openai');
+if (!azure) throw new Error('azure-openai recipe missing');
 
 describe('provider auth resolver', () => {
   let tempDir: string;
@@ -126,6 +128,22 @@ describe('provider auth resolver', () => {
       env: {},
     }));
     expect(isAvailable('embedding')).toBe(false);
+  });
+
+  test('OpenClaw auth source feeds upstream custom-header recipes without double auth', () => {
+    writeFileSync(authPath, JSON.stringify({ profiles: { 'openclaw-openai': { OPENAI_API_KEY: 'oc-secret' } } }));
+
+    const resolved = applyResolveAuth(azure, config({
+      embedding_model: 'azure-openai:text-embedding-3-large',
+      provider_auth: { 'azure-openai': { prefer: 'openclaw-openai', openclawAuthPath: authPath } },
+      env: {
+        AZURE_OPENAI_ENDPOINT: 'https://example.openai.azure.com',
+        AZURE_OPENAI_DEPLOYMENT: 'embeddings',
+      },
+    }), 'embedding');
+
+    expect(resolved).toEqual({ headers: { 'api-key': 'oc-secret' } });
+    expect(resolved.apiKey).toBeUndefined();
   });
 
 });
