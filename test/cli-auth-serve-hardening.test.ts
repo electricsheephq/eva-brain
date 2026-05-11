@@ -8,7 +8,9 @@ describe('CLI auth/serve hardening invariants', () => {
   });
 
   test('auth register-client only allows HTTP redirect URIs for loopback hosts', async () => {
-    const source = await Bun.file(new URL('../src/commands/auth.ts', import.meta.url)).text();
+    const authSource = await Bun.file(new URL('../src/commands/auth.ts', import.meta.url)).text();
+    const source = await Bun.file(new URL('../src/core/oauth-provider.ts', import.meta.url)).text();
+    expect(authSource).toContain('validateRedirectUri');
     expect(source).toContain("parsed.protocol !== 'https:'");
     expect(source).toContain("parsed.protocol === 'http:' && isLoopback");
     expect(source).toContain("parsed.hostname === 'localhost'");

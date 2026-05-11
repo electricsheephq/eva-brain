@@ -332,17 +332,22 @@ async function registerClient(name: string, args: string[]) {
   if (!name) { console.error('Usage: auth register-client <name> [--grant-types G] [--scopes S]'); process.exit(1); }
   const grantsIdx = args.indexOf('--grant-types');
   const scopesIdx = args.indexOf('--scopes');
+  const redirectsIdx = args.indexOf('--redirect-uris');
   const grantTypes = grantsIdx >= 0 && args[grantsIdx + 1]
     ? args[grantsIdx + 1].split(',').map(s => s.trim()).filter(Boolean)
     : ['client_credentials'];
   const scopes = scopesIdx >= 0 && args[scopesIdx + 1] ? args[scopesIdx + 1] : 'read';
+  const redirectUris = redirectsIdx >= 0 && args[redirectsIdx + 1]
+    ? args[redirectsIdx + 1].split(',').map(s => s.trim()).filter(Boolean)
+    : [];
 
   try {
     await withConfiguredSql(async (sql) => {
-      const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
+      const { GBrainOAuthProvider, validateRedirectUri } = await import('../core/oauth-provider.ts');
+      for (const uri of redirectUris) validateRedirectUri(uri);
       const provider = new GBrainOAuthProvider({ sql });
       const { clientId, clientSecret } = await provider.registerClientManual(
-        name, grantTypes, scopes, [],
+        name, grantTypes, scopes, redirectUris,
       );
       console.log(`OAuth client registered: "${name}"\n`);
       console.log(`  Client ID:     ${clientId}`);

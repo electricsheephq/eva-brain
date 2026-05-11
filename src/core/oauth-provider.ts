@@ -56,10 +56,10 @@ function pgArray(arr: string[]): string {
  * exceptions are loopback (127.0.0.1, ::1, localhost) which are unreachable
  * from the network. Throws a descriptive error on rejection.
  *
- * Used by the DCR (Dynamic Client Registration) path; the CLI registration
- * path trusts the operator and bypasses this gate.
+ * Used by the DCR (Dynamic Client Registration) path and the CLI manual
+ * registration path so localhost is the only accepted plaintext redirect.
  */
-function validateRedirectUri(uri: string): void {
+export function validateRedirectUri(uri: string): void {
   let parsed: URL;
   try {
     parsed = new URL(uri);
@@ -70,11 +70,13 @@ function validateRedirectUri(uri: string): void {
     || parsed.hostname === '127.0.0.1'
     || parsed.hostname === '[::1]'
     || parsed.hostname === '::1';
-  if (parsed.protocol === 'https:') return;
   if (parsed.protocol === 'http:' && isLoopback) return;
-  throw new Error(
-    `redirect_uri must use https:// (or http://localhost for loopback): ${uri}`,
-  );
+  if (parsed.protocol !== 'https:') {
+    throw new Error(
+      `redirect_uri must use https:// (or http://localhost for loopback): ${uri}`,
+    );
+  }
+  return;
 }
 
 /**

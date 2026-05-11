@@ -303,6 +303,8 @@ export interface ExtractOpts {
    * Pass undefined or omit for a full walk (CLI / first-run path).
    */
   slugs?: string[];
+  /** Source identity for multi-source brains. */
+  sourceId?: string;
 }
 
 /**
@@ -330,7 +332,7 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
       // Nothing changed — skip entirely.
       return result;
     }
-    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode);
+    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, { sourceId: opts.sourceId });
     result.links_created = r.links_created;
     result.timeline_entries_created = r.timeline_created;
     result.pages_processed = r.pages;
@@ -339,12 +341,12 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
 
   // Full walk path: CLI `gbrain extract` or first-run.
   if (opts.mode === 'links' || opts.mode === 'all') {
-    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode);
+    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode, { sourceId: opts.sourceId });
     result.links_created = r.created;
     result.pages_processed = r.pages;
   }
   if (opts.mode === 'timeline' || opts.mode === 'all') {
-    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode);
+    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode, { sourceId: opts.sourceId });
     result.timeline_entries_created = r.created;
     result.pages_processed = Math.max(result.pages_processed, r.pages);
   }
@@ -374,6 +376,8 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   const typeFilter = (typeIdx >= 0 && typeIdx + 1 < args.length) ? (args[typeIdx + 1] as PageType) : undefined;
   const sinceIdx = args.indexOf('--since');
   const since = (sinceIdx >= 0 && sinceIdx + 1 < args.length) ? args[sinceIdx + 1] : undefined;
+  const sourceIdIdx = args.indexOf('--source-id');
+  const sourceId = sourceIdIdx >= 0 && sourceIdIdx + 1 < args.length ? args[sourceIdIdx + 1] : undefined;
   const dryRun = args.includes('--dry-run');
   const jsonMode = args.includes('--json');
   // --include-frontmatter: v0.13 flag. Default OFF for back-compat. The
@@ -391,6 +395,10 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
       console.error(`Invalid --since date: "${since}". Must be a parseable date (e.g., "2026-01-15" or full ISO timestamp).`);
       process.exit(1);
     }
+  }
+  if (sourceIdIdx >= 0 && (sourceId === undefined || sourceId.startsWith('--'))) {
+    console.error('--source-id requires a source id value.');
+    process.exit(1);
   }
 
   if (!subcommand || !['links', 'timeline', 'all'].includes(subcommand)) {
@@ -435,12 +443,12 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
       // can opt in via mode + source.
       result = { links_created: 0, timeline_entries_created: 0, pages_processed: 0 };
       if (subcommand === 'links' || subcommand === 'all') {
-        const r = await extractLinksFromDB(engine, dryRun, jsonMode, typeFilter, since, { includeFrontmatter });
+        const r = await extractLinksFromDB(engine, dryRun, jsonMode, typeFilter, since, { includeFrontmatter, sourceId });
         result.links_created = r.created;
         result.pages_processed = r.pages;
       }
       if (subcommand === 'timeline' || subcommand === 'all') {
-        const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since);
+        const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, { sourceId });
         result.timeline_entries_created = r.created;
         result.pages_processed = Math.max(result.pages_processed, r.pages);
       }
@@ -450,6 +458,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
         dir: brainDir,
         dryRun,
         jsonMode,
+        sourceId,
       });
     }
   } catch (e) {
@@ -481,6 +490,7 @@ async function extractForSlugs(
   mode: 'links' | 'timeline' | 'all',
   dryRun: boolean,
   jsonMode: boolean,
+  opts?: { sourceId?: string },
 ): Promise<{ links_created: number; timeline_created: number; pages: number }> {
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
   const allFiles = walkMarkdownFiles(brainDir);
@@ -539,7 +549,12 @@ async function extractForSlugs(
             if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
             linksCreated++;
           } else {
-            linkBatch.push(link);
+            linkBatch.push({
+              ...link,
+              from_source_id: opts?.sourceId,
+              to_source_id: opts?.sourceId,
+              origin_source_id: opts?.sourceId,
+            });
             if (linkBatch.length >= BATCH_SIZE) await flushLinks();
           }
         }
@@ -553,7 +568,7 @@ async function extractForSlugs(
             if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
             timelineCreated++;
           } else {
-            timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+            timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail, source_id: opts?.sourceId });
             if (timelineBatch.length >= BATCH_SIZE) await flushTimeline();
           }
         }
@@ -578,6 +593,7 @@ async function extractForSlugs(
 
 async function extractLinksFromDir(
   engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean,
+  opts?: { sourceId?: string },
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
   const allSlugs = new Set(files.map(f => pathToSlug(f.relPath)));
@@ -622,7 +638,12 @@ async function extractLinksFromDir(
           if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
           created++;
         } else {
-          batch.push(link);
+          batch.push({
+            ...link,
+            from_source_id: opts?.sourceId,
+            to_source_id: opts?.sourceId,
+            origin_source_id: opts?.sourceId,
+          });
           if (batch.length >= BATCH_SIZE) await flush();
         }
       }
@@ -641,6 +662,7 @@ async function extractLinksFromDir(
 
 async function extractTimelineFromDir(
   engine: BrainEngine, brainDir: string, dryRun: boolean, jsonMode: boolean,
+  opts?: { sourceId?: string },
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
 
@@ -680,7 +702,7 @@ async function extractTimelineFromDir(
           if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
           created++;
         } else {
-          batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+          batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail, source_id: opts?.sourceId });
           if (batch.length >= BATCH_SIZE) await flush();
         }
       }
@@ -765,7 +787,7 @@ async function extractLinksFromDB(
   jsonMode: boolean,
   typeFilter: PageType | undefined,
   since: string | undefined,
-  opts?: { includeFrontmatter?: boolean },
+  opts?: { includeFrontmatter?: boolean; sourceId?: string },
 ): Promise<{ created: number; pages: number; unresolved: UnresolvedFrontmatterRef[] }> {
   const includeFrontmatter = opts?.includeFrontmatter ?? false;
   // Batch resolver: pg_trgm + exact only, NO search fallback. Dodges the
@@ -777,7 +799,7 @@ async function extractLinksFromDB(
   const nullResolver = {
     resolve: async () => null as string | null,
   };
-  const allSlugs = await engine.getAllSlugs();
+  const allSlugs = await engine.getAllSlugs(opts?.sourceId ? { sourceId: opts.sourceId } : undefined);
   const slugList = Array.from(allSlugs);
   let processed = 0, created = 0;
 
@@ -806,7 +828,7 @@ async function extractLinksFromDB(
 
   for (let i = 0; i < slugList.length; i++) {
     const slug = slugList[i];
-    const page = await engine.getPage(slug);
+    const page = await engine.getPage(slug, opts?.sourceId ? { sourceId: opts.sourceId } : undefined);
     if (!page) continue;
     if (typeFilter && page.type !== typeFilter) continue;
     if (since) {
@@ -854,6 +876,9 @@ async function extractLinksFromDB(
           link_source: c.linkSource,
           origin_slug: c.originSlug,
           origin_field: c.originField,
+          from_source_id: opts?.sourceId,
+          to_source_id: opts?.sourceId,
+          origin_source_id: opts?.sourceId,
         });
         if (batch.length >= BATCH_SIZE) await flush();
       }
@@ -891,8 +916,9 @@ async function extractTimelineFromDB(
   jsonMode: boolean,
   typeFilter: PageType | undefined,
   since: string | undefined,
+  opts?: { sourceId?: string },
 ): Promise<{ created: number; pages: number }> {
-  const allSlugs = await engine.getAllSlugs();
+  const allSlugs = await engine.getAllSlugs(opts?.sourceId ? { sourceId: opts.sourceId } : undefined);
   const slugList = Array.from(allSlugs);
   let processed = 0, created = 0;
 
@@ -921,7 +947,7 @@ async function extractTimelineFromDB(
 
   for (let i = 0; i < slugList.length; i++) {
     const slug = slugList[i];
-    const page = await engine.getPage(slug);
+    const page = await engine.getPage(slug, opts?.sourceId ? { sourceId: opts.sourceId } : undefined);
     if (!page) continue;
     if (typeFilter && page.type !== typeFilter) continue;
     if (since) {
@@ -948,7 +974,7 @@ async function extractTimelineFromDB(
         }
         created++;
       } else {
-        batch.push({ slug, date: entry.date, summary: entry.summary, detail: entry.detail || '' });
+        batch.push({ slug, date: entry.date, summary: entry.summary, detail: entry.detail || '', source_id: opts?.sourceId });
         if (batch.length >= BATCH_SIZE) await flush();
       }
     }

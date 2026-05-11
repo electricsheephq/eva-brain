@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rea
 import { join, dirname, resolve } from 'path';
 import { VERSION } from '../version.ts';
 
-const GBRAIN_GITHUB_REPO = 'garrytan/gbrain';
+const GBRAIN_GITHUB_REPO = 'electricsheephq/eva-brain';
 
 export async function runUpgrade(args: string[]) {
   if (args.includes('--help') || args.includes('-h')) {
@@ -13,6 +13,7 @@ export async function runUpgrade(args: string[]) {
 
   // Capture old version BEFORE upgrading (Codex finding: old binary runs this code)
   const oldVersion = VERSION;
+  const upgradeFrom = oldVersion;
   const method = detectInstallMethod();
 
   console.log(`Detected install method: ${method}`);
@@ -198,6 +199,7 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
     console.log('Idempotent — safe to re-run any time.');
     return;
   }
+  let upgradeFrom = VERSION;
   // Cosmetic: print feature pitches for migrations newer than the prior binary.
   try {
     const statePath = join(process.env.HOME || '', '.gbrain', 'upgrade-state.json');
@@ -205,6 +207,7 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
       const state = JSON.parse(readFileSync(statePath, 'utf-8'));
       const from = state?.last_upgrade?.from;
       if (from) {
+        upgradeFrom = from;
         const { migrations } = await import('./migrations/index.ts');
         for (const m of migrations) {
           if (isNewerThan(m.version, from)) {
@@ -274,7 +277,9 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   try {
     const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
     const { VERSION } = await import('../version.ts');
-    printAdvisoryIfRecommended({ version: VERSION, context: 'upgrade' });
+    if (isNewerThan('0.25.1', upgradeFrom) && !isNewerThan('0.25.1', VERSION)) {
+      printAdvisoryIfRecommended({ version: VERSION, context: 'upgrade' });
+    }
   } catch {
     // Best-effort cosmetic surface; never block post-upgrade.
   }
@@ -439,8 +444,8 @@ function printSquatterRecovery(): void {
   console.warn('  Recovery options:');
   console.warn('    1. Install from source:');
   console.warn('         bun remove -g gbrain');
-  console.warn('         git clone https://github.com/garrytan/gbrain.git');
-  console.warn('         cd gbrain && bun install && bun link');
+  console.warn('         git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain');
+  console.warn('         cd ~/eva-brain && bun install && bun link');
   console.warn('');
   console.warn('    2. Download a release binary:');
   console.warn('         https://github.com/garrytan/gbrain/releases');

@@ -82,6 +82,11 @@ export async function runServe(
 
     const publicUrlIdx = args.indexOf('--public-url');
     const publicUrl = publicUrlIdx >= 0 ? args[publicUrlIdx + 1] : undefined;
+    const raw = publicUrl;
+    if (publicUrlIdx >= 0 && (!raw || raw.startsWith('--'))) {
+      console.error('--public-url requires a URL value.');
+      process.exit(1);
+    }
 
     // F8 escape hatch: --log-full-params writes raw payloads to mcp_request_log
     // and the admin SSE feed instead of redacted summaries. Off by default
