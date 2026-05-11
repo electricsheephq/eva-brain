@@ -1,9 +1,9 @@
-import { execSync } from 'child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync, lstatSync } from 'fs';
-import { join, dirname } from 'path';
+import { execSync, execFileSync } from 'child_process';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
+import { join, dirname, resolve } from 'path';
 import { VERSION } from '../version.ts';
 
-const GBRAIN_GITHUB_REPO = 'electricsheephq/eva-brain';
+const GBRAIN_GITHUB_REPO = 'garrytan/gbrain';
 
 export async function runUpgrade(args: string[]) {
   if (args.includes('--help') || args.includes('-h')) {
@@ -19,17 +19,23 @@ export async function runUpgrade(args: string[]) {
 
   let upgraded = false;
   switch (method) {
-    case 'bun-link':
-      // v0.28.5: bun-link installs are source clones. Pull + bun install
-      // is the upgrade path; npm/bun's update mechanism doesn't apply.
-      console.log('Upgrading via bun-link source clone...');
-      console.log('  cd into your gbrain checkout, then run:');
-      console.log('    git pull');
-      console.log('    bun install');
-      console.log('    bun link');
-      console.log('');
-      console.log('  (auto-detect can\'t do this for you because it doesn\'t know which checkout to update.)');
+    case 'bun-link': {
+      const linkInfo = detectBunLink();
+      if (!linkInfo) {
+        console.error('bun-link detected but could not resolve repo root.');
+        break;
+      }
+      console.log(`Upgrading bun-link source clone at ${linkInfo.repoRoot}...`);
+      try {
+        execFileSync('git', ['-C', linkInfo.repoRoot, 'pull', '--ff-only'], { stdio: 'inherit', timeout: 120_000 });
+        execFileSync('bun', ['install'], { cwd: linkInfo.repoRoot, stdio: 'inherit', timeout: 120_000 });
+        upgraded = true;
+      } catch {
+        console.error('Auto-upgrade failed. Try manually:');
+        console.error(`  cd ${linkInfo.repoRoot} && git pull && bun install`);
+      }
       break;
+    }
 
     case 'bun':
       console.log('Upgrading via bun...');
@@ -44,7 +50,7 @@ export async function runUpgrade(args: string[]) {
     case 'binary':
       console.log('Binary self-update not yet implemented.');
       console.log('Download the latest binary from GitHub Releases:');
-      console.log('  https://github.com/electricsheephq/eva-brain/releases');
+      console.log('  https://github.com/garrytan/gbrain/releases');
       break;
 
     case 'clawhub':
@@ -62,7 +68,7 @@ export async function runUpgrade(args: string[]) {
       console.log('Try one of:');
       console.log('  bun update gbrain');
       console.log('  clawhub update gbrain');
-      console.log('  Download from https://github.com/electricsheephq/eva-brain/releases');
+      console.log('  Download from https://github.com/garrytan/gbrain/releases');
   }
 
   if (upgraded) {
@@ -192,8 +198,6 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
     console.log('Idempotent — safe to re-run any time.');
     return;
   }
-  let upgradeFrom: string | null = null;
-
   // Cosmetic: print feature pitches for migrations newer than the prior binary.
   try {
     const statePath = join(process.env.HOME || '', '.gbrain', 'upgrade-state.json');
@@ -201,7 +205,6 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
       const state = JSON.parse(readFileSync(statePath, 'utf-8'));
       const from = state?.last_upgrade?.from;
       if (from) {
-        upgradeFrom = String(from);
         const { migrations } = await import('./migrations/index.ts');
         for (const m of migrations) {
           if (isNewerThan(m.version, from)) {
@@ -269,10 +272,9 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   // v0.25.1: agent-readable advisory listing recommended skills the
   // workspace hasn't installed yet. No-op when everything is installed.
   try {
-    if (upgradeFrom && isNewerThan('0.25.1', upgradeFrom) && !isNewerThan('0.25.1', VERSION)) {
-      const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
-      printAdvisoryIfRecommended({ version: VERSION, context: 'upgrade' });
-    }
+    const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
+    const { VERSION } = await import('../version.ts');
+    printAdvisoryIfRecommended({ version: VERSION, context: 'upgrade' });
   } catch {
     // Best-effort cosmetic surface; never block post-upgrade.
   }
@@ -302,10 +304,10 @@ export function detectInstallMethod(): 'bun' | 'bun-link' | 'binary' | 'clawhub'
   // resolves into a directory we can walk up from to find a .git/config
   // pointing at our repo.
   const bunLinkResult = detectBunLink();
-  if (bunLinkResult === 'bun-link') return 'bun-link';
+  if (bunLinkResult) return 'bun-link';
 
   // Check if running from node_modules (bun/npm install). Could be canonical
-  // (we publish under electricsheephq/eva-brain) OR the squatter (npm `gbrain@1.3.x`).
+  // (we publish under garrytan/gbrain) OR the squatter (npm `gbrain@1.3.x`).
   // Sub-classify and warn loudly on suspect installs (#658).
   if (execPath.includes('node_modules') || process.argv[1]?.includes('node_modules')) {
     const verdict = classifyBunInstall();
@@ -332,51 +334,39 @@ export function detectInstallMethod(): 'bun' | 'bun-link' | 'binary' | 'clawhub'
 }
 
 /**
- * v0.28.5 cluster D, signal 1 — bun-link detection (closes #656).
+ * Detect bun-link source-clone installs (closes #656, fixes #368).
  *
- * argv[1] is what `bun /path/to/cli.ts` was invoked with. When `bun link`
- * is in play, that path is typically a symlink (~/.bun/bin/gbrain) to
- * either the source repo's compiled binary or src/cli.ts directly.
- * Walk up from the realpath looking for a `.git/config` whose remote
- * url contains `electricsheephq/eva-brain` (case-insensitive substring).
+ * Walk up from argv[1] looking for a `.git/config` whose remote url
+ * contains `garrytan/gbrain` (case-insensitive substring).
  *
- * Returns 'bun-link' when we're confident; null otherwise (caller falls
- * through to the existing detection chain). Best-effort: forks, tarball
- * installs, detached source trees, and `.git`-less installs all fall
- * through, which is acceptable per codex's plan-review feedback.
+ * v0.28.5 gated on lstatSync(argv1).isSymbolicLink(), but bun resolves
+ * the entire symlink chain before setting process.argv[1], so the check
+ * always returned false and short-circuited detection. Now we skip the
+ * symlink check and use argv[1] directly — it is already the real path
+ * inside the checkout, which is exactly what the git-config walk needs.
+ *
+ * Returns { repoRoot } when confident; null otherwise (caller falls
+ * through to the existing detection chain).
  */
-function detectBunLink(): 'bun-link' | null {
+function detectBunLink(): { repoRoot: string } | null {
   try {
     const argv1 = process.argv[1];
     if (!argv1) return null;
 
-    // Symlink check first: `bun link` always creates one.
-    let isSymlink = false;
-    try {
-      isSymlink = lstatSync(argv1).isSymbolicLink();
-    } catch {
-      return null;
-    }
-    if (!isSymlink) return null;
-
-    const resolved = realpathSync(argv1);
-    let dir = dirname(resolved);
-    // Walk up at most 6 levels looking for .git/config.
+    let dir = dirname(resolve(argv1));
     for (let i = 0; i < 6; i++) {
       const gitConfigPath = join(dir, '.git', 'config');
       if (existsSync(gitConfigPath)) {
         try {
           const cfg = readFileSync(gitConfigPath, 'utf-8');
-          // Loose substring match: covers https://, git@, ssh://, fork URLs
-          // that mention upstream in [remote "upstream"], and case variants.
           if (cfg.toLowerCase().includes(GBRAIN_GITHUB_REPO.toLowerCase())) {
-            return 'bun-link';
+            return { repoRoot: dir };
           }
         } catch { /* unreadable config — not our case */ }
-        return null; // found .git/config but no match → not our repo
+        return null;
       }
       const parent = dirname(dir);
-      if (parent === dir) break; // reached filesystem root
+      if (parent === dir) break;
       dir = parent;
     }
     return null;
@@ -392,7 +382,7 @@ function detectBunLink(): 'bun-link' | null {
  * npm, the package is the squatter — an unrelated `gbrain@1.3.x` that
  * silently overwrites our binary. This function reads the install
  * directory's package.json and checks two non-spoofable signals:
- *   - `repository.url` contains `electricsheephq/eva-brain` (case-insensitive)
+ *   - `repository.url` contains `garrytan/gbrain` (case-insensitive)
  *   - the install dir contains a `src/cli.ts` file (squatter ships
  *     compiled binary, not source)
  *
@@ -400,7 +390,7 @@ function detectBunLink(): 'bun-link' | null {
  * recovery message. Codex's plan-review noted these signals are spoofable
  * by a determined squatter — accepted; this is best-effort warning, not
  * an assertion. The right structural fix is publishing under a scoped
- * name like `@electricsheephq/eva-brain` (tracked v0.29 follow-up).
+ * name like `@garrytan/gbrain` (tracked v0.29 follow-up).
  */
 function classifyBunInstall(): 'canonical' | 'suspect' {
   try {
@@ -442,18 +432,18 @@ function classifyBunInstall(): 'canonical' | 'suspect' {
 
 function printSquatterRecovery(): void {
   console.warn('');
-  console.warn('  WARNING: gbrain install does not appear to be from electricsheephq/eva-brain.');
+  console.warn('  WARNING: gbrain install does not appear to be from garrytan/gbrain.');
   console.warn('  This is likely the npm-name collision tracked in issue #658:');
   console.warn('    https://www.npmjs.com/package/gbrain (an unrelated package).');
   console.warn('');
   console.warn('  Recovery options:');
   console.warn('    1. Install from source:');
   console.warn('         bun remove -g gbrain');
-  console.warn('         git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain');
-  console.warn('         cd ~/eva-brain && bun install && bun link');
+  console.warn('         git clone https://github.com/garrytan/gbrain.git');
+  console.warn('         cd gbrain && bun install && bun link');
   console.warn('');
   console.warn('    2. Download a release binary:');
-  console.warn('         https://github.com/electricsheephq/eva-brain/releases');
+  console.warn('         https://github.com/garrytan/gbrain/releases');
   console.warn('');
   console.warn('  See docs/INSTALL_FOR_AGENTS.md for the canonical install paths.');
   console.warn('');

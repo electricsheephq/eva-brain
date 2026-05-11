@@ -77,10 +77,7 @@ export async function runReconcileLinks(
   // so filter at call time via page_kind. Not using getAllSlugs because we
   // also need compiled_truth + timeline for extractCodeRefs.
   const mdSlugs = (await engine.executeRaw<{ slug: string }>(
-    opts.sourceId
-      ? `SELECT slug FROM pages WHERE page_kind = 'markdown' AND source_id = $1 ORDER BY slug`
-      : `SELECT slug FROM pages WHERE page_kind = 'markdown' ORDER BY slug`,
-    opts.sourceId ? [opts.sourceId] : undefined,
+    `SELECT slug FROM pages WHERE page_kind = 'markdown' ORDER BY slug`,
   )).map(r => r.slug);
 
   progress.start('reconcile_links.scan', mdSlugs.length);
@@ -92,8 +89,16 @@ export async function runReconcileLinks(
   // Fetch pages one at a time via getPage (no bulk read helper exists yet).
   // On a 47K-page brain this is the slow path; a v0.20.x follow-up can add
   // getPagesBatch. For the typical 2K–5K markdown count it's fine.
+  // v0.18.0+ multi-source: source-scope getPage so reconcile picks up the
+  // intended-source row for `default`-vs-`<source>` ambiguity. The link
+  // edges below also propagate the same sourceId (Data R1 MED 1: opt was
+  // declared on ReconcileLinksOpts but ignored end-to-end).
+  const getPageOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
+  const linkOpts = opts.sourceId
+    ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
+    : undefined;
   for (const mdSlug of mdSlugs) {
-    const page = await engine.getPage(mdSlug, opts.sourceId ? { sourceId: opts.sourceId } : undefined);
+    const page = await engine.getPage(mdSlug, getPageOpts);
     if (!page) {
       progress.tick(1, mdSlug);
       continue;
@@ -114,15 +119,14 @@ export async function runReconcileLinks(
     for (const ref of refs) {
       const codeSlug = slugifyCodePath(ref.path);
       const ctx = ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path;
-      const linkSourceOpts = opts.sourceId
-        ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
-        : undefined;
       edgesAttempted++;
       try {
-        // Forward: guide documents code. addLink's inner SELECT drops
-        // silently if codeSlug isn't a page yet (benign — counted below).
-        await engine.addLink(mdSlug, codeSlug, ctx, 'documents', 'markdown', mdSlug, 'compiled_truth', linkSourceOpts);
-        await engine.addLink(codeSlug, mdSlug, ref.path, 'documented_by', 'markdown', mdSlug, 'compiled_truth', linkSourceOpts);
+        // Forward: guide documents code. addLink's inner JOIN drops silently
+        // if codeSlug isn't a page yet (benign — counted below). Source-
+        // qualified per opts.sourceId; same-source assumption mirrors the
+        // import-file.ts:303 doc↔impl auto-link.
+        await engine.addLink(mdSlug, codeSlug, ctx, 'documents', 'markdown', mdSlug, 'compiled_truth', linkOpts);
+        await engine.addLink(codeSlug, mdSlug, ref.path, 'documented_by', 'markdown', mdSlug, 'compiled_truth', linkOpts);
       } catch (e: unknown) {
         // Per-link errors don't abort the batch. Track them for the summary.
         const msg = e instanceof Error ? e.message : String(e);

@@ -58,6 +58,9 @@ const _modelCache = new Map<string, any>();
  */
 type EmbedManyFn = typeof embedMany;
 let _embedTransport: EmbedManyFn = embedMany;
+// Test-only seam for chat(). When set, chat() skips provider resolution and
+// returns this function's result directly. See __setChatTransportForTests.
+let _chatTransport: ((opts: ChatOpts) => Promise<ChatResult>) | null = null;
 
 /**
  * Per-recipe shrink-on-miss state. When a recipe's pre-split misses the
@@ -82,6 +85,18 @@ const SHRINK_HEAL_AFTER = 10;
 const DEFAULT_CHARS_PER_TOKEN = 4;
 /** Default safety factor when a recipe omits it. */
 const DEFAULT_SAFETY_FACTOR = 0.8;
+
+/**
+ * v0.31.8 (D2 + D10): hard ceiling on Voyage response size, sized as
+ * "unambiguously not a real Voyage response" rather than tight against
+ * typical batches. voyage-3-large × 16K embeddings ≈ 200 MB raw (3072
+ * dims × 4 bytes × 16K), which fits within this cap. Anything larger is
+ * unambiguously not legitimate. Layer 1 (Content-Length pre-check) and
+ * Layer 2 (per-embedding base64 cap) both compare against this constant.
+ */
+const MAX_VOYAGE_RESPONSE_BYTES = 256 * 1024 * 1024;
+
+class VoyageResponseSizeError extends Error {}
 
 /** Configure the gateway. Called by cli.ts#connectEngine. Clears cached models. */
 export function configureGateway(config: AIGatewayConfig): void {
@@ -143,6 +158,7 @@ export function resetGateway(): void {
   _modelCache.clear();
   _shrinkState.clear();
   _embedTransport = embedMany;
+  _chatTransport = null;
   _warnedRecipes.clear();
 }
 
@@ -157,6 +173,23 @@ export function resetGateway(): void {
  */
 export function __setEmbedTransportForTests(fn: EmbedManyFn | null): void {
   _embedTransport = fn ?? embedMany;
+}
+
+/**
+ * Test-only seam mirroring `__setEmbedTransportForTests`. When set,
+ * `chat()` skips provider resolution and SDK invocation and calls the
+ * transport directly. Pass `null` to restore real provider routing.
+ *
+ * Used by smoke + parser-pin tests in `test/facts-extract*.test.ts` to
+ * drive prompt-drift fixtures without spending real API tokens. The
+ * transport receives the resolved `ChatOpts` and returns a `ChatResult`.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function __setChatTransportForTests(
+  fn: ((opts: ChatOpts) => Promise<ChatResult>) | null,
+): void {
+  _chatTransport = fn;
 }
 
 function requireConfig(): AIGatewayConfig {
@@ -205,6 +238,12 @@ export function getChatFallbackChain(): string[] {
  * Replaces scattered `!process.env.OPENAI_API_KEY` checks (Codex C3).
  */
 export function isAvailable(touchpoint: TouchpointKind): boolean {
+  // Test seam: when a transport stub is installed for this touchpoint, the
+  // gateway is "available" for tests that exercise the whole pipeline without
+  // configuring real providers. See __setChatTransportForTests /
+  // __setEmbedTransportForTests.
+  if (touchpoint === 'chat' && _chatTransport) return true;
+
   if (!_config) return false;
   try {
     const modelStr =
@@ -227,15 +266,149 @@ export function isAvailable(touchpoint: TouchpointKind): boolean {
     // mean "operator must supply a model", not "provider unavailable".
     // resolveRecipe(modelStr) already proved a concrete provider:model was configured.
 
-    // For openai-compatible without auth requirements (Ollama/LiteLLM local), treat as available.
-    const resolution = resolveProviderAuth(recipe, _config!);
-    return resolution.isConfigured;
+    // For openai-compatible without auth requirements (Ollama/LiteLLM local),
+    // the auth resolver returns the unauthenticated source as configured.
+    return resolveProviderAuth(recipe, _config!).isConfigured;
   } catch {
     return false;
   }
 }
 
 // ---- Embedding ----
+
+/**
+ * Voyage AI compatibility shim. Voyage's `/v1/embeddings` endpoint is OpenAI-shaped
+ * but diverges on two parameters:
+ *   - `encoding_format` only accepts `'base64'` (the AI SDK sends `'float'` by default,
+ *     which makes Voyage respond with HTTP 400). Force `'base64'` so the SDK round-trip
+ *     parses correctly.
+ *   - OpenAI's `dimensions` parameter is rejected; Voyage uses `output_dimension`.
+ *     Translate the field name when the caller explicitly requested a dimension.
+ *
+ * The mutated body is what gets sent on the wire; the AI SDK still receives a
+ * base64-encoded response and decodes it as expected.
+ */
+// Cast through `unknown` because Bun's `typeof fetch` extends the standard
+// signature with a `preconnect` method that arrow functions can't provide.
+// The AI SDK only invokes the call signature; the Bun extension is irrelevant
+// here. Without this cast, `tsc --noEmit` fails:
+//   error TS2741: Property 'preconnect' is missing in type
+//   '(input: RequestInfo | URL, init: RequestInit | ...) => Promise<Response>'
+//   but required in type 'typeof fetch'.
+const voyageCompatFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  // OUTBOUND: rewrite request body for Voyage's actual API contract.
+  if (init?.body && typeof init.body === 'string') {
+    try {
+      const parsed = JSON.parse(init.body);
+      if (parsed && typeof parsed === 'object') {
+        let mutated = false;
+        // Voyage rejects 'float' (the SDK default). Force the value Voyage accepts.
+        if (parsed.encoding_format !== 'base64') {
+          parsed.encoding_format = 'base64';
+          mutated = true;
+        }
+        // Translate OpenAI's `dimensions` to Voyage's `output_dimension`.
+        if ('dimensions' in parsed) {
+          const dims = parsed.dimensions;
+          delete parsed.dimensions;
+          if (typeof dims === 'number') parsed.output_dimension = dims;
+          mutated = true;
+        }
+        if (mutated) {
+          const newBody = JSON.stringify(parsed);
+          // Drop Content-Length so fetch recomputes from the new body.
+          const headers = new Headers(init.headers ?? {});
+          headers.delete('content-length');
+          init = { ...init, body: newBody, headers };
+        }
+      }
+    } catch {
+      // Body wasn't JSON — pass through untouched.
+    }
+  }
+
+  const resp = await fetch(input, init);
+  if (!resp.ok) return resp;
+  const ct = resp.headers.get('content-type') ?? '';
+  if (!ct.toLowerCase().includes('application/json')) return resp;
+
+  // v0.31.8 (D2 + D10): Layer 1 — Content-Length pre-check BEFORE the
+  // body is parsed. The pre-fix code did `await resp.clone().json()`
+  // first, which fully parses arbitrary-size JSON into JS heap before
+  // any size check could fire. A compromised/malicious Voyage endpoint
+  // could OOM the worker on a single response. The 256 MB cap is sized
+  // as "unambiguously not a real Voyage response" — voyage-3-large at
+  // 3072 dims × 4 bytes × 16K embeddings (the plausible upper bound on
+  // realistic load) decodes to ~200 MB raw and fits. Anything bigger
+  // is unambiguously not legitimate.
+  //
+  // When Content-Length is missing (chunked transfer encoding), we
+  // proceed and rely on Layer 2 (per-embedding base64 length check)
+  // for OOM defense.
+  const contentLengthHeader = resp.headers.get('content-length');
+  if (contentLengthHeader) {
+    const len = parseInt(contentLengthHeader, 10);
+    if (Number.isFinite(len) && len > MAX_VOYAGE_RESPONSE_BYTES) {
+      throw new VoyageResponseSizeError(
+        `Voyage response Content-Length=${len} exceeds ${MAX_VOYAGE_RESPONSE_BYTES} bytes — ` +
+        `likely compromised endpoint or misconfiguration`,
+      );
+    }
+  }
+
+  // INBOUND: rewrite response so the AI SDK's Zod schema validates.
+  // Voyage diverges from OpenAI in two places that break the parser:
+  //   - `embedding` is a base64 string (SDK schema expects `number[]`)
+  //   - `usage` lacks `prompt_tokens` (SDK schema requires it when usage present)
+  try {
+    const json: any = await resp.clone().json();
+    if (!json || typeof json !== 'object') return resp;
+    let modified = false;
+    if (Array.isArray(json.data)) {
+      for (const item of json.data) {
+        if (item && typeof item.embedding === 'string') {
+          // v0.31.8 (D10 Layer 2): per-embedding cap. Catches the rare
+          // case where Layer 1 was skipped (no Content-Length on chunked
+          // encoding) AND a single embedding string is unreasonably large.
+          // Estimate decoded size as 0.75 × base64 length (the canonical
+          // base64 → bytes ratio).
+          const estDecoded = Math.ceil(item.embedding.length * 0.75);
+          if (estDecoded > MAX_VOYAGE_RESPONSE_BYTES) {
+            throw new VoyageResponseSizeError(
+              `Voyage embedding base64 exceeds ${MAX_VOYAGE_RESPONSE_BYTES} bytes ` +
+              `(estimated ${estDecoded} bytes from ${item.embedding.length} base64 chars)`,
+            );
+          }
+          // Voyage returns Float32 little-endian base64.
+          const bytes = Buffer.from(item.embedding, 'base64');
+          const floats = new Float32Array(
+            bytes.buffer,
+            bytes.byteOffset,
+            Math.floor(bytes.byteLength / 4),
+          );
+          item.embedding = Array.from(floats);
+          modified = true;
+        }
+      }
+    }
+    if (json.usage && typeof json.usage === 'object' && json.usage.prompt_tokens === undefined) {
+      json.usage.prompt_tokens = typeof json.usage.total_tokens === 'number'
+        ? json.usage.total_tokens
+        : 0;
+      modified = true;
+    }
+    if (!modified) return resp;
+    return new Response(JSON.stringify(json), {
+      status: resp.status,
+      statusText: resp.statusText,
+      headers: resp.headers,
+    });
+  } catch (err) {
+    if (err instanceof VoyageResponseSizeError) throw err;
+    // If parsing/transformation fails, fall back to the original response.
+    return resp;
+  }
+}) as unknown as typeof fetch;
 
 async function resolveEmbeddingProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
   const { parsed, recipe } = resolveRecipe(modelStr);
@@ -289,69 +462,22 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
         `${recipe.name} requires a base URL.`,
         recipe.setup_hint,
       );
-      // For openai-compatible, auth is optional (Ollama local) but pass a dummy key if unauthenticated.
+      // For openai-compatible, auth is optional (ollama local) but pass a dummy key if unauthenticated.
       const apiKey = auth.source === 'unauthenticated'
         ? 'unauthenticated'
         : requireAuth(auth, recipe, 'embedding');
-      // Voyage AI compatibility shim:
-      // 1. Rejects `encoding_format: "float"` (only accepts "base64" or omit).
-      //    The AI SDK hardcodes encoding_format: "float" for openai-compatible.
-      // 2. Returns `usage.total_tokens` instead of `usage.prompt_tokens`.
-      //    The AI SDK Zod schema requires `prompt_tokens` when usage is present.
-      const voyageOutputDimension = recipe.id === 'voyage'
-        ? dimsProviderOptions(
-            recipe.implementation,
-            modelId,
-            cfg.embedding_dimensions ?? DEFAULT_EMBEDDING_DIMENSIONS,
-          )?.openaiCompatible?.output_dimension
-        : undefined;
-      const voyageFetch = recipe.id === 'voyage'
-        ? async (url: string | URL | Request, init?: RequestInit) => {
-            if (init?.body && typeof init.body === 'string') {
-              try {
-                const parsed = JSON.parse(init.body);
-                delete parsed.encoding_format;
-                if (parsed.output_dimension == null && parsed.dimensions != null) {
-                  parsed.output_dimension = parsed.dimensions;
-                }
-                if (parsed.output_dimension == null && voyageOutputDimension != null) {
-                  parsed.output_dimension = voyageOutputDimension;
-                }
-                delete parsed.dimensions;
-                init = { ...init, body: JSON.stringify(parsed) };
-              } catch { /* not JSON, pass through */ }
-            }
-            const resp = await globalThis.fetch(url, init);
-            // Patch response to add prompt_tokens from total_tokens
-            const text = await resp.text();
-            try {
-              const json = JSON.parse(text);
-              if (json.usage && json.usage.total_tokens != null && json.usage.prompt_tokens == null) {
-                json.usage.prompt_tokens = json.usage.total_tokens;
-              }
-              return new Response(JSON.stringify(json), {
-                status: resp.status,
-                statusText: resp.statusText,
-                headers: resp.headers,
-              });
-            } catch {
-              return new Response(text, {
-                status: resp.status,
-                statusText: resp.statusText,
-                headers: resp.headers,
-              });
-            }
-          }
-        : undefined;
-      // SDK accepts a `fetch` override at runtime but the typed settings don't
-      // expose it on this version pin; cast so v0.28.5's #680 fetch-shim
-      // (Voyage encoding_format + usage normalization) typechecks.
       const client = createOpenAICompatible({
         name: recipe.id,
         baseURL: baseUrl,
-        apiKey,
-        ...(voyageFetch ? { fetch: voyageFetch } : {}),
-      } as Parameters<typeof createOpenAICompatible>[0]);
+        apiKey: apiKey ?? 'unauthenticated',
+        // Voyage AI's `/v1/embeddings` endpoint is "OpenAI-compatible" only in URL
+        // shape; it rejects `encoding_format=float` (only `base64` is accepted) and
+        // ignores OpenAI's `dimensions` parameter (Voyage uses `output_dimension`).
+        // The default openai-compatible client sends `encoding_format=float`, which
+        // makes Voyage respond with HTTP 400 "Bad Request". Strip those fields
+        // before forwarding when targeting Voyage.
+        fetch: recipe.id === 'voyage' ? voyageCompatFetch : undefined,
+      });
       return client.textEmbeddingModel(modelId);
     }
     default:
@@ -550,17 +676,19 @@ async function embedSubBatch(
     });
 
     if (!Array.isArray(result.embeddings) || result.embeddings.length !== texts.length) {
-      throw new AITransientError(
+      throw new AIConfigError(
         `Embedding provider returned ${result.embeddings?.length ?? 0} embedding(s) for ${texts.length} input(s).`,
+        `Retry the import after checking provider health; partial embedding responses are not safe to index.`,
       );
     }
 
-    const first = result.embeddings[0];
-    if (first && Array.isArray(first) && first.length !== expectedDims) {
-      throw new AIConfigError(
-        `Embedding dim mismatch: model ${modelId} returned ${first.length} but schema expects ${expectedDims}.`,
-        `Run \`gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${first.length}\` or change models.`,
-      );
+    for (const embedding of result.embeddings) {
+      if (Array.isArray(embedding) && embedding.length !== expectedDims) {
+        throw new AIConfigError(
+          `Embedding dim mismatch: model ${modelId} returned ${embedding.length} but schema expects ${expectedDims}.`,
+          `Run \`gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${embedding.length}\` or change models.`,
+        );
+      }
     }
 
     recordSubBatchSuccess(recipe);
@@ -886,10 +1014,10 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
   return (result.text ?? '').trim();
 }
 
-// ---- Chat ----
+// ---- Chat (commit 1) ----
 
 /**
- * Provider-neutral message shape stored in subagent persistence.
+ * Provider-neutral message shape stored in subagent persistence (commit 2a).
  * Vercel AI SDK's `generateText` accepts this directly via its `messages`
  * parameter; tool-use blocks are normalized across providers.
  */
@@ -997,15 +1125,18 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
 }
 
 /**
- * Map AI SDK's `finish_reason` and provider-specific signals to a provider-
- * neutral stop reason.
+ * Map AI SDK's `finish_reason` (and provider-specific signals) to a provider-
+ * neutral `stopReason`. This is the structural-signal layer that
+ * `chatWithFallback` (commit 3) consults BEFORE any regex heuristic (per D8).
  */
 function mapStopReason(
   finishReason: string | undefined,
   providerMetadata: Record<string, any> | undefined,
 ): ChatResult['stopReason'] {
+  // Anthropic: `stop_reason: 'refusal'` lands in providerMetadata.anthropic.
   const anthropicStop = providerMetadata?.anthropic?.stopReason ?? providerMetadata?.anthropic?.stop_reason;
   if (anthropicStop === 'refusal') return 'refusal';
+  // OpenAI: `finish_reason: 'content_filter'`.
   if (finishReason === 'content-filter' || finishReason === 'content_filter') return 'content_filter';
   if (finishReason === 'tool-calls' || finishReason === 'tool_calls') return 'tool_calls';
   if (finishReason === 'length' || finishReason === 'max-tokens') return 'length';
@@ -1017,14 +1148,27 @@ function mapStopReason(
  * Run one chat completion turn. Provider-neutral wrapper over Vercel AI SDK's
  * `generateText`. Tool-use blocks are normalized; cache_control markers are
  * applied only on Anthropic when `cacheSystem: true`.
+ *
+ * Crash-resumable replay is the caller's responsibility (subagent.ts persists
+ * blocks via the provider-neutral schema landing in commit 2a).
  */
 export async function chat(opts: ChatOpts): Promise<ChatResult> {
+  // Test seam: when a test transport is installed, route through it without
+  // touching provider resolution, AI SDK, or any network. See
+  // __setChatTransportForTests. Production paths see _chatTransport === null.
+  if (_chatTransport) {
+    return _chatTransport(opts);
+  }
+
   const modelStr = opts.model ?? getChatModel();
   const { model, recipe, modelId } = await resolveChatProvider(modelStr);
 
   const supportsCache = recipe.touchpoints.chat?.supports_prompt_cache === true;
   const useCache = !!opts.cacheSystem && supportsCache;
 
+  // Build messages. Anthropic prompt-cache markers ride on system + last tool
+  // via providerOptions; the AI SDK accepts the system as a string for
+  // generateText, so cache markers go through providerOptions.anthropic.
   const tools = (opts.tools ?? []).reduce((acc, t) => {
     acc[t.name] = {
       description: t.description,
@@ -1049,6 +1193,8 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
     });
 
+    // Normalize blocks. Vercel SDK gives us `result.content` (an array of typed
+    // parts) for v6+; fall back to text + toolCalls for older shapes.
     const blocks: ChatBlock[] = [];
     const rawContent: any[] = (result as any).content ?? [];
     if (Array.isArray(rawContent) && rawContent.length > 0) {
@@ -1064,6 +1210,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
         }
       }
     } else {
+      // Fallback shape for SDK versions exposing flat .text and .toolCalls.
       if (typeof (result as any).text === 'string' && (result as any).text.length > 0) {
         blocks.push({ type: 'text', text: (result as any).text });
       }

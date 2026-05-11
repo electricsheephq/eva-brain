@@ -168,11 +168,11 @@ describe('dims.dimsProviderOptions', () => {
     expect(opts).toBeUndefined();
   });
 
-  test('Voyage openai-compatible returns output_dimension', () => {
+  test('Voyage openai-compatible returns dimensions for the SDK shim', () => {
     const opts = dimsProviderOptions('openai-compatible', 'voyage-3-large', 1024);
-    expect(opts).toEqual({ openaiCompatible: { output_dimension: 1024 } });
+    expect(opts).toEqual({ openaiCompatible: { dimensions: 1024 } });
     const v4Opts = dimsProviderOptions('openai-compatible', 'voyage-4-large', 2048);
-    expect(v4Opts).toEqual({ openaiCompatible: { output_dimension: 2048 } });
+    expect(v4Opts).toEqual({ openaiCompatible: { dimensions: 2048 } });
   });
 
   test('Voyage model without flexible dimensions returns undefined', () => {
@@ -217,7 +217,7 @@ describe('Voyage openai-compatible request shim', () => {
 
       expect(vectors[0].length).toBe(2048);
       expect(requestBody?.output_dimension).toBe(2048);
-      expect(requestBody?.encoding_format).toBeUndefined();
+      expect(requestBody?.encoding_format).toBe('base64');
     } finally {
       globalThis.fetch = originalFetch;
     }

@@ -130,10 +130,6 @@ export function isCodeFilePath(path: string): boolean {
   return false;
 }
 
-function isMarkdownFilePath(path: string): boolean {
-  return path.endsWith('.md') || path.endsWith('.mdx');
-}
-
 /**
  * v0.27.1: image extensions are admitted only when the multimodal config
  * gate is on. The runtime gate flips through `process.env.GBRAIN_EMBEDDING_MULTIMODAL`
@@ -141,7 +137,7 @@ function isMarkdownFilePath(path: string): boolean {
  * (or env directly when the operator overrides). When the gate is off,
  * existing brains keep their current "markdown + code only" sync behavior.
  */
-function isImageFilePath(path: string): boolean {
+export function isImageFilePath(path: string): boolean {
   const lower = path.toLowerCase();
   return (
     lower.endsWith('.png') ||
@@ -158,6 +154,10 @@ function isImageFilePath(path: string): boolean {
 /** Slug shape for native image asset pages. Preserves extension and path. */
 export function slugifyImagePath(filePath: string): string {
   return filePath.replace(/\\/g, '/').replace(/^\.?\//, '').toLowerCase();
+}
+
+export function isMarkdownFilePath(path: string): boolean {
+  return path.endsWith('.md') || path.endsWith('.mdx');
 }
 
 function isMultimodalEnabled(): boolean {
@@ -220,9 +220,8 @@ export function isSyncable(path: string, opts: SyncableOptions = {}): boolean {
 
   if (!isAllowedByStrategy(path, strategy)) return false;
 
+  // Skip hidden directories
   const segments = path.split('/');
-
-  // Skip hidden directories and dependency/vendor caches.
   if (segments.some(p => p.startsWith('.') || p === 'node_modules')) return false;
 
   // Skip .raw/ sidecar directories
@@ -241,6 +240,19 @@ export function isSyncable(path: string, opts: SyncableOptions = {}): boolean {
 
   return true;
 }
+
+/**
+ * Character class for the lowercase-canonical form of a slug segment after
+ * slugifySegment() has run. Lowercase letters, digits, dots, underscores,
+ * hyphens. Exposed so adjacent code (e.g. takes-fence holder validation,
+ * v0.32 EXP-4) can reuse the actual repo slug grammar instead of inventing
+ * a stricter parallel one and emitting false-positive warnings on legitimate
+ * `companies/acme.io` / `people/foo_bar` slugs (codex review #3).
+ *
+ * Pattern is the inner character class only (no anchors); callers wrap it
+ * in `^...$` or compose it with prefixes like `(?:people|companies)/...`.
+ */
+export const SLUG_SEGMENT_PATTERN = /[a-z0-9._-]+/;
 
 /**
  * Slugify a single path segment: lowercase, strip special chars, spaces → hyphens.
@@ -318,10 +330,6 @@ export function pathToSlug(
  * flow through without touching the sync code path.
  */
 export function resolveSlugForPath(filePath: string, repoPrefix?: string): string {
-  if (isImageFilePath(filePath)) {
-    const imageSlug = slugifyImagePath(filePath);
-    return repoPrefix ? `${repoPrefix}/${imageSlug}` : imageSlug;
-  }
   const pageKind = isCodeFilePath(filePath) ? 'code' : 'markdown';
   return pathToSlug(filePath, repoPrefix, { pageKind });
 }
@@ -406,6 +414,18 @@ export function classifyErrorCode(errorMsg: string): string {
   // (lines 199, 347, 352, 401) that previously bucketed to UNKNOWN.
   if (/file too large|content too large|FILE_TOO_LARGE/i.test(errorMsg)) return 'FILE_TOO_LARGE';
   if (/skipping symlink|symlink|SYMLINK_NOT_ALLOWED/i.test(errorMsg)) return 'SYMLINK_NOT_ALLOWED';
+
+  // v0.32 takes-v2 additions: malformed fence rows + holder-grammar failures.
+  // TAKES_TABLE_MALFORMED and TAKES_ROW_NUM_COLLISION are produced by
+  // parseTakesFence (src/core/takes-fence.ts); TAKES_HOLDER_INVALID lands
+  // in v0.32 (EXP-4) when a holder doesn't match the world|brain|people/...|
+  // companies/... grammar. Wired into sync-failures.jsonl by the v0_28_0
+  // migration's phaseBBackfill (one-time backfill emission).
+  if (/TAKES_TABLE_MALFORMED|TAKES_ROW_NUM_COLLISION|TAKES_FENCE_UNBALANCED/i.test(errorMsg)) {
+    return 'TAKES_TABLE_MALFORMED';
+  }
+  if (/TAKES_HOLDER_INVALID/i.test(errorMsg)) return 'TAKES_HOLDER_INVALID';
+
   return 'UNKNOWN';
 }
 
