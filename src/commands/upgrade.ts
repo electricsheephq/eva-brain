@@ -1,7 +1,6 @@
 import { execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
 import { join, dirname, resolve } from 'path';
-import { sanitizeErrorForLog } from '../core/log-safety.ts';
 import { VERSION } from '../version.ts';
 
 const GBRAIN_GITHUB_REPO = 'electricsheephq/eva-brain';
@@ -268,7 +267,7 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
     // Non-fatal: connection or DDL failure here falls back to the existing
     // user-facing WARN. apply-migrations.ts:296-302 already surfaces the
     // hint to run `gbrain init --migrate-only`.
-    console.warn(`\nSchema auto-apply skipped: ${sanitizeErrorForLog(e)}`);
+    console.warn('\nSchema auto-apply skipped.');
     console.warn('Run `gbrain init --migrate-only` manually if your brain is wedged.');
   }
 

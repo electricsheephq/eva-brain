@@ -15,7 +15,6 @@
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operationsByName } from '../src/core/operations.ts';
-import { sanitizeErrorForLog } from '../src/core/log-safety.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 
 const N_WRITES = 200;
@@ -122,7 +121,7 @@ function round(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-main().catch((e) => {
-  console.error(sanitizeErrorForLog(e));
+main().catch(() => {
+  console.error('Benchmark error.');
   process.exit(1);
 });

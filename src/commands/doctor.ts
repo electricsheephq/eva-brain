@@ -2034,6 +2034,7 @@ function outputResults(checks: Check[], json: boolean): boolean {
   console.log('===================');
   for (const c of checks) {
     const icon = c.status === 'ok' ? 'OK' : c.status === 'warn' ? 'WARN' : 'FAIL';
+    // codeql[js/clear-text-logging] Doctor messages are passed through sanitizeLogText() before display.
     console.log(`  [${icon}] ${c.name}: ${sanitizeLogText(c.message)}`);
     if (c.issues) {
       for (const issue of c.issues) {

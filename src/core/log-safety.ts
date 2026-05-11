@@ -8,7 +8,7 @@ const PG_URL_RE = /\bpostgres(?:ql)?:\/\/[^\s"'<>]+/gi;
 const USERINFO_URL_RE = /\b([a-z][a-z0-9+.-]*:\/\/)([^\/\s"'<>:@]+):([^\/\s"'<>@]+)@/gi;
 const SECRET_ASSIGNMENT_RE = /\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH|DATABASE_URL)[A-Z0-9_]*)\s*[:=]\s*["']?[^"',\s}]+/gi;
 const BEARER_RE = /\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi;
-const COMMON_KEY_RE = /\b(sk-[A-Za-z0-9_-]{12,}|gbrain_[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,})\b/g;
+const COMMON_KEY_RE = /\b(sk-[A-Za-z0-9_-]{12,}|gbrain_[a-f0-9]{64}|gbrain_(?:cl|cs|code|at|rt)_[A-Za-z0-9_-]{24,}|gh[pousr]_[A-Za-z0-9_]{12,})\b/g;
 
 export function sanitizeLogText(value: unknown): string {
   const raw = value instanceof Error

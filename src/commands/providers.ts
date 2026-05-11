@@ -11,7 +11,7 @@ import { configureGateway, embedOne, isAvailable as gwIsAvailable, chat as gwCha
 import { probeOllama, probeLMStudio } from '../core/ai/probes.ts';
 import { loadConfig, loadGbrainEnv } from '../core/config.ts';
 import { AIConfigError, AITransientError } from '../core/ai/errors.ts';
-import { safePublicModelLabel, sanitizeErrorForLog, sanitizeLogText } from '../core/log-safety.ts';
+import { safePublicModelLabel, sanitizeLogText } from '../core/log-safety.ts';
 import type { AIGatewayConfig, AuthSourceClass, Recipe } from '../core/ai/types.ts';
 
 const SCHEMA_VERSION = 1;
@@ -207,15 +207,14 @@ async function runTest(args: string[]): Promise<void> {
   } catch (e) {
     const ms = Date.now() - start;
     if (e instanceof AIConfigError) {
-      console.error(`  ✗ config error (${ms}ms): ${sanitizeErrorForLog(e)}`);
-      if (e.fix) console.error(`    Fix: ${sanitizeLogText(e.fix)}`);
+      console.error(`  ✗ config error (${ms}ms). Run \`gbrain providers explain\` for setup guidance.`);
       process.exit(2);
     } else if (e instanceof AITransientError) {
-      console.error(`  ✗ transient error (${ms}ms): ${sanitizeErrorForLog(e)}`);
+      console.error(`  ✗ transient error (${ms}ms).`);
       console.error(`    Retry after a moment.`);
       process.exit(3);
     } else {
-      console.error(`  ✗ unknown error (${ms}ms): ${sanitizeErrorForLog(e)}`);
+      console.error(`  ✗ unknown error (${ms}ms).`);
       process.exit(4);
     }
   }
