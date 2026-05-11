@@ -28,6 +28,7 @@
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operationsByName } from '../src/core/operations.ts';
+import { sanitizeErrorForLog } from '../src/core/log-safety.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import { ResolverRegistry } from '../src/core/resolvers/registry.ts';
 import type { Resolver, ResolverContext } from '../src/core/resolvers/index.ts';
@@ -387,6 +388,6 @@ async function main() {
 }
 
 main().catch(e => {
-  console.error(e);
+  console.error(sanitizeErrorForLog(e));
   process.exit(1);
 });

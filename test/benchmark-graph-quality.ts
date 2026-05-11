@@ -28,6 +28,7 @@
  */
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { sanitizeErrorForLog } from '../src/core/log-safety.ts';
 import { extractPageLinks, parseTimelineEntries, inferLinkType } from '../src/core/link-extraction.ts';
 import { runExtract } from '../src/commands/extract.ts';
 import type { PageInput, PageType } from '../src/core/types.ts';
@@ -1102,7 +1103,7 @@ async function main() {
 }
 
 main().catch(e => {
-  console.error('Benchmark error:', e);
+  console.error('Benchmark error:', sanitizeErrorForLog(e));
   process.exit(1);
 });
 

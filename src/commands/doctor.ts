@@ -8,6 +8,7 @@ import { loadCompletedMigrations } from '../core/preferences.ts';
 import { compareVersions } from './migrations/index.ts';
 import { createProgress, startHeartbeat, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { sanitizeJsonForLog, sanitizeLogText } from '../core/log-safety.ts';
 import type { DbUrlSource } from '../core/config.ts';
 import { join } from 'path';
 import { existsSync, readFileSync, readdirSync } from 'fs';
@@ -2025,7 +2026,7 @@ function outputResults(checks: Check[], json: boolean): boolean {
 
   if (json) {
     const status = hasFail ? 'unhealthy' : hasWarn ? 'warnings' : 'healthy';
-    console.log(JSON.stringify({ schema_version: 2, status, health_score: score, checks }));
+    console.log(JSON.stringify(sanitizeJsonForLog({ schema_version: 2, status, health_score: score, checks })));
     return hasFail;
   }
 
@@ -2033,11 +2034,11 @@ function outputResults(checks: Check[], json: boolean): boolean {
   console.log('===================');
   for (const c of checks) {
     const icon = c.status === 'ok' ? 'OK' : c.status === 'warn' ? 'WARN' : 'FAIL';
-    console.log(`  [${icon}] ${c.name}: ${c.message}`);
+    console.log(`  [${icon}] ${c.name}: ${sanitizeLogText(c.message)}`);
     if (c.issues) {
       for (const issue of c.issues) {
-        console.log(`    → ${issue.type.toUpperCase()}: ${issue.skill}`);
-        console.log(`      ACTION: ${issue.action}`);
+        console.log(`    → ${sanitizeLogText(issue.type.toUpperCase())}: ${sanitizeLogText(issue.skill)}`);
+        console.log(`      ACTION: ${sanitizeLogText(issue.action)}`);
       }
     }
   }

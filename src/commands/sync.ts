@@ -23,6 +23,7 @@ import type { SyncManifest } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { loadConfig } from '../core/config.ts';
+import { safePublicModelLabel, sanitizeJsonForLog } from '../core/log-safety.ts';
 import {
   autoConcurrency,
   shouldRunParallel,
@@ -1186,13 +1187,14 @@ export async function runSync(engine: BrainEngine, args: string[]) {
     if (!noEmbed) {
       const preview = estimateSyncAllCost(sources);
       const { costUsd, model } = estimateEmbeddingPreviewCost(preview.totalTokens);
+      const safeModel = safePublicModelLabel(model);
       const previewMsg =
         `sync --all preview: ${preview.totalFiles} files across ${preview.activeSources} source(s), ` +
-        `~${preview.totalTokens.toLocaleString()} tokens, ${formatEmbeddingCost(costUsd)} on ${model}.`;
+        `~${preview.totalTokens.toLocaleString()} tokens, ${formatEmbeddingCost(costUsd)} on ${safeModel}.`;
 
       if (dryRun) {
         if (jsonOut) {
-          console.log(JSON.stringify({ status: 'dry_run', preview, costUsd, model }));
+          console.log(JSON.stringify(sanitizeJsonForLog({ status: 'dry_run', preview, costUsd, model: safeModel })));
         } else {
           console.log(previewMsg);
           console.log('--dry-run: exit without syncing.');
@@ -1210,7 +1212,7 @@ export async function runSync(engine: BrainEngine, args: string[]) {
             message: previewMsg,
             hint: 'Pass --yes to proceed, or --dry-run to see the preview and exit 0.',
           }));
-          console.log(JSON.stringify({ error: envelope, preview, costUsd, model }));
+          console.log(JSON.stringify(sanitizeJsonForLog({ error: envelope, preview, costUsd, model: safeModel })));
           process.exit(2);
         }
         // Interactive TTY path: prompt [y/N].
