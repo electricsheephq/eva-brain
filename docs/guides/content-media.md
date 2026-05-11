@@ -26,7 +26,9 @@ The `--extract openclaw` adapter prefers `GBRAIN_OPENCLAW_GATEWAY_URL` or
 `OPENCLAW_GATEWAY_URL`, which calls OpenClaw's OAuth-backed Codex runtime through
 `/plugins/gbrain/extract` and supports text plus the current image MVP. The
 `GBRAIN_OPENCLAW_COMPLETION_COMMAND` fallback remains text-only and is meant for
-local host adapters that cannot accept file media.
+local host adapters that cannot accept file media. `GBRAIN_OPENCLAW_COMPLETION_PATH`
+is now legacy opt-in only for older hosts that still expose `/plugins/gbrain/complete`;
+the default repo and live install path is `/plugins/gbrain/extract`.
 
 Do not treat `import-media` / `ingest-media` as a permanent competing GBrain
 media subsystem. They are bridge commands until the OpenClaw plugin can write

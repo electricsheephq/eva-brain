@@ -86,6 +86,42 @@ describe('CodexExtractionClient', () => {
     }
   });
 
+  test('refuses generic gateway completion unless a legacy completion path is explicitly configured', async () => {
+    const client = new OpenClawGatewayCodexExtractionClient({ gatewayUrl: 'http://127.0.0.1:18789' });
+
+    await expect(client.completeJson({ prompt: 'extract JSON' })).rejects.toThrow(
+      'OpenClaw gateway generic completion is not enabled on the default /plugins/gbrain/extract route.',
+    );
+  });
+
+  test('supports the legacy gateway completion bridge only when explicitly configured', async () => {
+    const requests: Array<{ url: string; init: RequestInit }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ ok: true, json: { summary: 'ok' } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    try {
+      const client = new OpenClawGatewayCodexExtractionClient({
+        gatewayUrl: 'http://127.0.0.1:18789',
+        completionPath: '/plugins/gbrain/complete',
+      });
+      const json = await client.completeJson<{ summary: string }>({ prompt: 'extract JSON' });
+
+      expect(json.summary).toBe('ok');
+      expect(requests).toHaveLength(1);
+      expect(requests[0].url).toBe('http://127.0.0.1:18789/plugins/gbrain/complete');
+      const body = JSON.parse(String(requests[0].init.body));
+      expect(body.protocol).toBe('gbrain.codex-extraction.v1');
+      expect(body.prompt).toBe('extract JSON');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test('sends image bytes to the OpenClaw extraction route without model API keys', async () => {
     const requests: Array<{ url: string; init: RequestInit }> = [];
     const originalFetch = globalThis.fetch;
@@ -116,5 +152,9 @@ describe('CodexExtractionClient', () => {
     expect(createConfiguredCodexExtractionClient({})).toBeUndefined();
     expect(createConfiguredCodexExtractionClient({ GBRAIN_OPENCLAW_COMPLETION_COMMAND: 'cat' })).toBeTruthy();
     expect(createConfiguredCodexExtractionClient({ GBRAIN_OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789' })).toBeTruthy();
+    expect(createConfiguredCodexExtractionClient({
+      GBRAIN_OPENCLAW_GATEWAY_URL: 'http://127.0.0.1:18789',
+      GBRAIN_OPENCLAW_COMPLETION_PATH: '/plugins/gbrain/complete',
+    })).toBeTruthy();
   });
 });
