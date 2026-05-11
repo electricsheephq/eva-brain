@@ -32,6 +32,7 @@ import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { getEmbeddingModel } from '../core/ai/gateway.ts';
 import { assertTouchpoint, resolveRecipe } from '../core/ai/model-resolver.ts';
+import { safePublicModelLabel, sanitizeJsonForLog, sanitizeLogText } from '../core/log-safety.ts';
 
 const DEFAULT_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
 
@@ -287,13 +288,14 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
 
   if (dryRun) {
     const result = await runReindexCode(engine, { sourceId, dryRun: true, yes, json, force, noEmbed });
+    const safeResult = sanitizeJsonForLog({ ...result, model: safePublicModelLabel(result.model) });
     if (json) {
-      console.log(JSON.stringify(result));
+      console.log(JSON.stringify(safeResult));
     } else {
       console.log(
         `reindex-code preview: ${result.codePages} code page(s), ` +
           `~${result.totalTokens.toLocaleString()} tokens, ` +
-          `${formatCostPreview(result.costUsd)} on ${result.model}.`,
+          `${formatCostPreview(result.costUsd)} on ${safePublicModelLabel(result.model)}.`,
       );
       console.log('--dry-run: exit without reindexing.');
     }
@@ -304,14 +306,15 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
   if (!noEmbed) {
     const preview = await estimateReindexCost(engine, sourceId, 100);
     const { costUsd, model } = estimateEmbeddingPreviewCost(preview.totalTokens);
+    const safeModel = safePublicModelLabel(model);
     const previewMsg =
       `reindex-code: ${preview.totalPages} code page(s), ` +
       `~${preview.totalTokens.toLocaleString()} tokens, ` +
-      `${formatCostPreview(costUsd)} on ${model}.`;
+      `${formatCostPreview(costUsd)} on ${safeModel}.`;
 
     if (preview.totalPages === 0) {
       if (json) {
-        console.log(JSON.stringify({ status: 'ok', codePages: 0, reindexed: 0, skipped: 0, failed: 0, totalTokens: 0, costUsd: 0, model }));
+        console.log(JSON.stringify({ status: 'ok', codePages: 0, reindexed: 0, skipped: 0, failed: 0, totalTokens: 0, costUsd: 0, model: safeModel }));
       } else {
         console.log('No code pages to reindex.');
       }
@@ -327,7 +330,7 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
           message: previewMsg,
           hint: 'Pass --yes to proceed, or --dry-run to see the preview and exit 0.',
         }));
-        console.log(JSON.stringify({ error: envelope, preview, costUsd, model }));
+        console.log(JSON.stringify(sanitizeJsonForLog({ error: envelope, preview, costUsd, model: safeModel })));
         process.exit(2);
       }
       console.log(previewMsg);
@@ -340,18 +343,19 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
   }
 
   const result = await runReindexCode(engine, { sourceId, yes, json, force, noEmbed });
+  const safeResult = sanitizeJsonForLog({ ...result, model: safePublicModelLabel(result.model) });
   if (json) {
-    console.log(JSON.stringify(result));
+    console.log(JSON.stringify(safeResult));
   } else {
     console.log(
       `reindex-code: ${result.reindexed} reindexed, ${result.skipped} skipped, ${result.failed} failed ` +
         `(${result.codePages} total code pages, ~${result.totalTokens.toLocaleString()} tokens, ` +
-        `${formatCostPreview(result.costUsd)} on ${result.model}).`,
+        `${formatCostPreview(result.costUsd)} on ${safePublicModelLabel(result.model)}).`,
     );
     if (result.failures && result.failures.length > 0) {
       console.log(`\n${result.failures.length} failure(s):`);
       for (const f of result.failures.slice(0, 10)) {
-        console.log(`  ${f.slug}: ${f.error}`);
+        console.log(`  ${sanitizeLogText(f.slug)}: ${sanitizeLogText(f.error)}`);
       }
       if (result.failures.length > 10) {
         console.log(`  ... and ${result.failures.length - 10} more`);

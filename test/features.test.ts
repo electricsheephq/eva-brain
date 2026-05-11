@@ -78,9 +78,9 @@ describe('brain_score calculation', () => {
   });
 
   it('health command treats orphan score as informational before a graph exists', async () => {
-    const cliSource = await Bun.file('src/cli.ts').text();
+    const cliSource = await Bun.file('src/commands/doctor.ts').text();
     expect(cliSource).toContain('graphScoreNotApplicable');
-    expect(cliSource).toContain('!graphScoreNotApplicable && h.orphan_pages > 0');
+    expect(cliSource).toContain('health.brain_score >= 70 || graphScoreNotApplicable');
   });
 });
 

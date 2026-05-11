@@ -1,8 +1,9 @@
-import { existsSync, readFileSync, writeFileSync, statSync, readdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, statSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join, relative } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { importSyncableFile } from '../core/import-file.ts';
+import { collectSyncableFiles } from './import.ts';
 import { createInterface } from 'readline';
 import {
   buildSyncManifest,
@@ -14,12 +15,15 @@ import {
   formatCodeBreakdown,
 } from '../core/sync.ts';
 import { estimateTokens, CHUNKER_VERSION } from '../core/chunkers/code.ts';
+import { getEmbeddingModelName } from '../core/embedding.ts';
+import { getEmbeddingModel } from '../core/ai/gateway.ts';
+import { resolveRecipe, assertTouchpoint } from '../core/ai/model-resolver.ts';
 import { errorFor, serializeError } from '../core/errors.ts';
-import { assertTouchpoint, resolveRecipe } from '../core/ai/model-resolver.ts';
 import type { SyncManifest } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { loadConfig } from '../core/config.ts';
+import { safePublicModelLabel, sanitizeJsonForLog } from '../core/log-safety.ts';
 import {
   autoConcurrency,
   shouldRunParallel,
@@ -28,6 +32,8 @@ import {
 import { tryAcquireDbLock, SYNC_LOCK_ID } from '../core/db-lock.ts';
 import { loadStorageConfig } from '../core/storage-config.ts';
 import { getDefaultSourcePath } from '../core/source-resolver.ts';
+
+const DEFAULT_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
 
 export interface SyncResult {
   status: 'up_to_date' | 'synced' | 'first_sync' | 'dry_run' | 'blocked_by_failures';
@@ -74,10 +80,24 @@ function estimateSyncAllCost(sources: Array<{ local_path: string | null; config:
     let sourceTokens = 0;
     let sourceFiles = 0;
     try {
-      walkSyncableFiles(src.local_path, (filePath: string, content: string) => {
-        sourceTokens += estimateTokens(content);
-        sourceFiles++;
-      }, cfg.strategy ?? 'markdown');
+      // v0.31.2: cost preview routed through collectSyncableFiles
+      // (single hardened walker; see import.ts). Previously
+      // walkSyncableFiles used statSync (followed symlinks). New walker
+      // uses lstat + inode-cycle + max-depth so the preview matches
+      // what the real sync will actually walk.
+      const files = collectSyncableFiles(src.local_path, { strategy: cfg.strategy ?? 'markdown' });
+      for (const fullPath of files) {
+        try {
+          const stat = statSync(fullPath);
+          if (stat.size > 5_000_000) continue; // skip large binaries
+          const content = readFileSync(fullPath, 'utf-8');
+          sourceTokens += estimateTokens(content);
+          sourceFiles++;
+        } catch {
+          // Best-effort per file. Skip unreadable files silently;
+          // sync itself tolerates the same.
+        }
+      }
     } catch {
       // Best-effort: a source whose local_path is gone or unreadable just
       // contributes 0. The sync itself would have failed anyway; no point
@@ -91,8 +111,16 @@ function estimateSyncAllCost(sources: Array<{ local_path: string | null; config:
   return { totalTokens, totalFiles, activeSources, perSource };
 }
 
+function currentEmbeddingModelForPreview(): string {
+  try {
+    return getEmbeddingModel();
+  } catch {
+    return DEFAULT_EMBEDDING_MODEL;
+  }
+}
+
 function estimateEmbeddingPreviewCost(tokens: number): { costUsd: number | null; model: string } {
-  const configuredModel = loadConfig()?.embedding_model ?? 'openai:text-embedding-3-large';
+  const configuredModel = currentEmbeddingModelForPreview();
   try {
     const { parsed, recipe } = resolveRecipe(configuredModel);
     assertTouchpoint(recipe, 'embedding', parsed.modelId);
@@ -102,54 +130,12 @@ function estimateEmbeddingPreviewCost(tokens: number): { costUsd: number | null;
       costUsd: costPerMillion === undefined ? null : (tokens / 1_000_000) * costPerMillion,
     };
   } catch {
-    return { model: configuredModel, costUsd: null };
+    return { model: configuredModel || getEmbeddingModelName(), costUsd: null };
   }
 }
 
-function formatCostPreview(costUsd: number | null): string {
-  return costUsd === null ? 'cost unknown' : `est. $${costUsd.toFixed(2)}`;
-}
-
-/**
- * Walk a repo's working tree and invoke `cb(path, content)` for each
- * syncable file. Honors the same strategy as `isSyncable` so the preview
- * and the real sync agree on what's in scope.
- */
-function walkSyncableFiles(
-  repoRoot: string,
-  cb: (path: string, content: string) => void,
-  strategy: 'markdown' | 'code' | 'auto',
-): void {
-  const stack: string[] = [repoRoot];
-  while (stack.length > 0) {
-    const dir = stack.pop()!;
-    let entries: import('fs').Dirent[];
-    try {
-      entries = readdirSync(dir, { withFileTypes: true }) as unknown as import('fs').Dirent[];
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const name = typeof entry.name === 'string' ? entry.name : String(entry.name);
-      // Skip hidden dirs, .git, node_modules (same rules isSyncable applies).
-      if (name.startsWith('.') || name === 'node_modules' || name === 'ops') continue;
-      const fullPath = `${dir}/${name}`;
-      if (entry.isDirectory()) {
-        stack.push(fullPath);
-      } else if (entry.isFile()) {
-        const relativePath = fullPath.slice(repoRoot.length + 1);
-        if (!isSyncable(relativePath, { strategy })) continue;
-        try {
-          const stat = statSync(fullPath);
-          if (stat.size > 5_000_000) continue; // skip large binaries
-          const content = readFileSync(fullPath, 'utf-8');
-          cb(fullPath, content);
-        } catch {
-          // Ignore files we can't read; consistent with sync's own tolerance.
-        }
-      }
-    }
-  }
+function formatEmbeddingCost(costUsd: number | null): string {
+  return costUsd === null ? 'unknown cost' : `est. $${costUsd.toFixed(2)}`;
 }
 
 /** Interactive [y/N] prompt. Resolves false on non-y answers or EOF. */
@@ -213,6 +199,33 @@ function git(repoPath: string, ...args: string[]): string {
     encoding: 'utf-8',
     timeout: 30000,
   }).trim();
+}
+
+function isDetachedHead(repoPath: string): boolean {
+  try {
+    git(repoPath, 'symbolic-ref', '--quiet', 'HEAD');
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function unique<T>(items: T[]): T[] {
+  return [...new Set(items)];
+}
+
+function buildDetachedWorkingTreeManifest(repoPath: string): SyncManifest {
+  const manifest = buildSyncManifest(git(repoPath, 'diff', '--name-status', '-M', 'HEAD'));
+  const untracked = git(repoPath, 'ls-files', '--others', '--exclude-standard')
+    .split('\n')
+    .filter(line => line.length > 0);
+
+  return {
+    added: unique([...manifest.added, ...untracked]),
+    modified: unique(manifest.modified),
+    deleted: unique(manifest.deleted),
+    renamed: manifest.renamed,
+  };
 }
 
 // v0.18.0 Step 5: source-scoped sync state helpers. When opts.sourceId
@@ -394,18 +407,30 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     throw new Error(`Not a git repository: ${repoPath}. GBrain sync requires a git-initialized repo.`);
   }
 
+  // Detect detached HEAD up front so the working-tree fallback fires for both
+  // the default sync and `--no-pull` callers. Only the actual git pull is
+  // gated on opts.noPull.
+  const detachedHead = isDetachedHead(repoPath);
+  if (detachedHead && !opts.noPull) {
+    console.error(`Detached HEAD on ${repoPath}; skipping git pull. Syncing from local working tree.`);
+  }
+
   // Git pull (unless --no-pull). v0.28.1 codex finding (HIGH): the legacy
   // git() helper at sync.ts:192 spawns git without GIT_SSRF_FLAGS, so
   // every steady-state pull was bypassing the redirect/submodule/protocol
   // hardening that cloneRepo applies. Route through pullRepo from
   // git-remote.ts so the flag set is consistent across initial clone and
   // ongoing pulls — single source of truth for the defensive flags.
-  if (!opts.noPull) {
+  if (!opts.noPull && !detachedHead) {
+    const _t0 = Date.now();
+    console.error(`[gbrain phase] sync.git_pull start`);
     try {
       const { pullRepo } = await import('../core/git-remote.ts');
       pullRepo(repoPath);
+      console.error(`[gbrain phase] sync.git_pull done ${Date.now() - _t0}ms`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[gbrain phase] sync.git_pull error ${Date.now() - _t0}ms (${msg.slice(0, 80)})`);
       if (msg.includes('non-fast-forward') || msg.includes('diverged')) {
         console.error(`Warning: git pull failed (remote diverged). Syncing from local state.`);
       } else {
@@ -459,8 +484,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   const currentVersion = String(CHUNKER_VERSION);
   const versionMismatch = storedVersion !== null && storedVersion !== currentVersion;
   const versionNeverSet = storedVersion === null && opts.sourceId !== undefined;
+  const detachedWorkingTreeManifest = detachedHead ? buildDetachedWorkingTreeManifest(repoPath) : null;
+  const hasDetachedWorkingTreeChanges = detachedWorkingTreeManifest !== null &&
+    (detachedWorkingTreeManifest.added.length > 0 ||
+      detachedWorkingTreeManifest.modified.length > 0 ||
+      detachedWorkingTreeManifest.deleted.length > 0 ||
+      detachedWorkingTreeManifest.renamed.length > 0);
 
-  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet) {
+  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !hasDetachedWorkingTreeChanges) {
     return {
       status: 'up_to_date',
       fromCommit: lastCommit,
@@ -485,6 +516,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // Diff using git diff (net result, not per-commit)
   const diffOutput = git(repoPath, 'diff', '--name-status', '-M', `${lastCommit}..${headCommit}`);
   const manifest = buildSyncManifest(diffOutput);
+  if (detachedWorkingTreeManifest) {
+    manifest.added = unique([...manifest.added, ...detachedWorkingTreeManifest.added]);
+    manifest.modified = unique([...manifest.modified, ...detachedWorkingTreeManifest.modified]);
+    manifest.deleted = unique([...manifest.deleted, ...detachedWorkingTreeManifest.deleted]);
+    manifest.renamed = [...manifest.renamed, ...detachedWorkingTreeManifest.renamed];
+  }
 
   // Filter to syncable files (strategy-aware)
   const syncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
@@ -502,12 +539,16 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // strategy=markdown) deletes the actual code-slug page, not a ghost
   // markdown-slug that never existed.
   const unsyncableModified = manifest.modified.filter(p => !isSyncable(p, syncOpts));
+  // v0.18.0+ multi-source: scope getPage + deletePage to opts.sourceId so
+  // unsyncable cleanup in source A doesn't accidentally sweep same-slug
+  // pages in sources B/C/D.
+  const pageOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
   for (const path of unsyncableModified) {
     const slug = resolveSlugForPath(path);
     try {
-      const existing = await engine.getPage(slug, opts.sourceId ? { sourceId: opts.sourceId } : undefined);
+      const existing = await engine.getPage(slug, pageOpts);
       if (existing) {
-        await engine.deletePage(slug, opts.sourceId ? { sourceId: opts.sourceId } : undefined);
+        await engine.deletePage(slug, pageOpts);
         console.log(`  Deleted un-syncable page: ${slug}`);
       }
     } catch { /* ignore */ }
@@ -569,11 +610,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
   // Process deletes first (prevents slug conflicts). SP-5: resolveSlugForPath
   // dispatches to the right slug shape so code file deletes hit the real page.
+  // v0.18.0+ multi-source: scope deletePage so we only delete the source-A
+  // row, not every same-slug row across all sources.
+  const deleteOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
   if (filtered.deleted.length > 0) {
     progress.start('sync.deletes', filtered.deleted.length);
     for (const path of filtered.deleted) {
       const slug = resolveSlugForPath(path);
-      await engine.deletePage(slug, opts.sourceId ? { sourceId: opts.sourceId } : undefined);
+      await engine.deletePage(slug, deleteOpts);
       pagesAffected.push(slug);
       progress.tick(1, slug);
     }
@@ -586,11 +630,15 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // all resolve to the right slug shape for each side.
   if (filtered.renamed.length > 0) {
     progress.start('sync.renames', filtered.renamed.length);
+    // v0.18.0+ multi-source: scope updateSlug so the rename only touches the
+    // source-A row, not every same-slug row across sources (which would
+    // either sweep them all OR violate (source_id, slug) UNIQUE).
+    const renameOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
     for (const { from, to } of filtered.renamed) {
       const oldSlug = resolveSlugForPath(from);
       const newSlug = resolveSlugForPath(to);
       try {
-        await engine.updateSlug(oldSlug, newSlug, opts.sourceId ? { sourceId: opts.sourceId } : undefined);
+        await engine.updateSlug(oldSlug, newSlug, renameOpts);
       } catch {
         // Slug doesn't exist or collision, treat as add
       }
@@ -652,6 +700,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         return;
       }
       try {
+        // v0.18.0+ multi-source: thread `opts.sourceId` so per-page tx writes
+        // (putPage / getTags / addTag / removeTag / deleteChunks / upsertChunks
+        // / addLink) target (sourceId, slug). Pre-fix the schema DEFAULT
+        // 'default' was applied even for non-default sources, fabricating
+        // duplicate rows that crashed bare-slug subqueries with Postgres 21000.
         const result = await importSyncableFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId });
         if (result.status === 'imported') {
           chunksCreated += result.chunks;
@@ -822,26 +875,72 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     summary: `Sync: +${filtered.added.length} ~${filtered.modified.length} -${filtered.deleted.length} R${filtered.renamed.length}, ${chunksCreated} chunks, ${elapsed}ms`,
   });
 
-  // Auto-extract links + timeline (always, extraction is cheap CPU)
+  // Auto-extract links + timeline (always, extraction is cheap CPU).
+  // Thread opts.sourceId so the extract phase reconciles edges + timeline
+  // entries against the right source — pre-fix (Data R1 HIGH 1) this phase
+  // bypassed sourceId entirely and the bare-slug subquery in addTimelineEntry
+  // (Data R1 HIGH 2) crashed with 21000 in multi-source brains.
+  const extractOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
   if (!opts.noExtract && pagesAffected.length > 0) {
     try {
       const { extractLinksForSlugs, extractTimelineForSlugs } = await import('./extract.ts');
-      const linksCreated = await extractLinksForSlugs(engine, repoPath, pagesAffected, opts.sourceId);
-      const timelineCreated = await extractTimelineForSlugs(engine, repoPath, pagesAffected, opts.sourceId);
+      const linksCreated = await extractLinksForSlugs(engine, repoPath, pagesAffected, extractOpts);
+      const timelineCreated = await extractTimelineForSlugs(engine, repoPath, pagesAffected, extractOpts);
       if (linksCreated > 0 || timelineCreated > 0) {
         console.log(`  Extracted: ${linksCreated} links, ${timelineCreated} timeline entries`);
       }
     } catch { /* extraction is best-effort */ }
   }
 
-  // Auto-embed (skip for large syncs — embedding calls OpenAI)
+  // v0.31.2: facts extraction now routes through the shared
+  // src/core/facts/backstop.ts helper (PR1 commit 6). Sync uses
+  // queue mode (fire-and-forget) + 'high-only' filter so a 50-page
+  // sync doesn't block on N sequential Sonnet calls. The pre-fix
+  // inline loop is gone — it carried (a) a dead-code type filter
+  // ('conversation'/'transcript'/'therapy'/'call' aren't real
+  // PageTypes), (b) a divergent eligibility shape from put_page,
+  // and (c) raw extract→insert without dedup/supersede.
+  if (!opts.noExtract && pagesAffected.length > 0 && pagesAffected.length <= 50) {
+    const { runFactsBackstop } = await import('../core/facts/backstop.ts');
+    const factsSourceId = opts.sourceId ?? 'default';
+    for (const slug of pagesAffected) {
+      try {
+        const page = await engine.getPage(slug);
+        if (!page) continue;
+        await runFactsBackstop(
+          {
+            slug,
+            type: page.type,
+            compiled_truth: page.compiled_truth ?? '',
+            frontmatter: page.frontmatter ?? {},
+          },
+          {
+            engine,
+            sourceId: factsSourceId,
+            sessionId: `sync:${slug}`,
+            source: 'sync:import',
+            mode: 'queue',
+            notabilityFilter: 'high-only',
+          },
+        );
+      } catch { /* per-page enqueue is best-effort */ }
+    }
+  }
+
+  // Auto-embed (skip for large syncs — embedding calls OpenAI).
+  // TODO(multi-source): runEmbed → src/commands/embed.ts:175 + :418 call
+  // upsertChunks defaulting to source='default'. For non-default-source syncs
+  // the page row lives at (sourceId, slug) so this fails with "Page not found"
+  // OR (when a same-slug 'default' row coexists) updates the wrong source's
+  // chunks. Data R1 MED 2 — deferred to a follow-up PR; threading sourceId
+  // through embed.ts is a larger refactor than this fix's scope. The current
+  // try/catch swallows the failure as best-effort, so the sync result still
+  // reports `embedded: 0` for the right reason.
   let embedded = 0;
   if (!noEmbed && pagesAffected.length > 0 && pagesAffected.length <= 100) {
     try {
       const { runEmbed } = await import('./embed.ts');
-      const embedArgs = ['--slugs', ...pagesAffected];
-      if (opts.sourceId) embedArgs.push('--source', opts.sourceId);
-      await runEmbed(engine, embedArgs);
+      await runEmbed(engine, ['--slugs', ...pagesAffected]);
       // Before commit 2 lands: runEmbed is void. Best estimate is pagesAffected,
       // since runEmbed re-embeds every requested slug. Commit 2 sharpens this
       // with EmbedResult.embedded.
@@ -874,21 +973,24 @@ async function performFullSync(
   // Dry-run: walk the repo, count syncable files, return without writing.
   // Fixes the silent-write-on-dry-run bug where performFullSync called
   // runImport unconditionally regardless of opts.dryRun.
+  //
+  // v0.31.2 (codex C6): use the strategy-aware walker. Pre-fix this
+  // hardcoded `collectMarkdownFiles(repoPath)` and filtered with
+  // default-markdown `isSyncable(rel)`, so `gbrain sync --strategy
+  // code --dry-run` always reported zero files even when ~1500 code
+  // files were waiting.
   if (opts.dryRun) {
-    const { collectMarkdownFiles } = await import('./import.ts');
-    const allFiles = collectMarkdownFiles(repoPath);
-    const syncableRelPaths = allFiles
-      .map(abs => relative(repoPath, abs))
-      .filter(rel => isSyncable(rel));
+    const allFiles = collectSyncableFiles(repoPath, { strategy: opts.strategy ?? 'markdown' });
     console.log(
-      `Full-sync dry run: ${syncableRelPaths.length} file(s) would be imported ` +
+      `Full-sync dry run (strategy=${opts.strategy ?? 'markdown'}): ` +
+      `${allFiles.length} file(s) would be imported ` +
       `from ${repoPath} @ ${headCommit.slice(0, 8)}.`,
     );
     return {
       status: 'dry_run',
       fromCommit: null,
       toCommit: headCommit,
-      added: syncableRelPaths.length,
+      added: allFiles.length,
       modified: 0,
       deleted: 0,
       renamed: 0,
@@ -910,7 +1012,21 @@ async function performFullSync(
   const importArgs = [repoPath];
   if (opts.noEmbed) importArgs.push('--no-embed');
   if (fullConcurrency > 1) importArgs.push('--workers', String(fullConcurrency));
-  const result = await runImport(engine, importArgs, { commit: headCommit, sourceId: opts.sourceId });
+  // v0.31.2: thread strategy through so code-strategy first sync
+  // actually enumerates code files (closes bug 1).
+  // v0.30.x: thread sourceId so performFullSync routes pages to the named
+  // source (incremental path already does this).
+  const _fullImportT0 = Date.now();
+  console.error(`[gbrain phase] sync.fullsync.import start strategy=${opts.strategy ?? 'markdown'}`);
+  const result = await runImport(engine, importArgs, {
+    commit: headCommit,
+    strategy: opts.strategy,
+    sourceId: opts.sourceId,
+  });
+  console.error(
+    `[gbrain phase] sync.fullsync.import done ${Date.now() - _fullImportT0}ms ` +
+    `imported=${result.imported} skipped=${result.skipped} errors=${result.errors}`,
+  );
 
   // Bug 9 — gate the full-sync bookmark on success. runImport already
   // writes its own sync.last_commit conditionally (import.ts), but
@@ -963,9 +1079,7 @@ async function performFullSync(
   if (!opts.noEmbed) {
     try {
       const { runEmbed } = await import('./embed.ts');
-      const embedArgs = ['--stale'];
-      if (opts.sourceId) embedArgs.push('--source', opts.sourceId);
-      await runEmbed(engine, embedArgs);
+      await runEmbed(engine, ['--stale']);
       embedded = result.imported;
     } catch { /* embedding is best-effort */ }
   }
@@ -982,6 +1096,24 @@ async function performFullSync(
     embedded,
     pagesAffected: [],
   };
+}
+
+function acknowledgeExistingSyncFailuresForSkip(skipFailed: boolean): void {
+  // --skip-failed: acknowledge pre-existing unacked failures BEFORE the sync
+  // runs, not only ones the current run produces. Without this, the common
+  // recovery flow — fix the YAML, re-run sync, then run --skip-failed to
+  // clear the log — fails to clear anything: when there are no NEW failures
+  // (because the files are now fixed), the inner ack path in performSync is
+  // never reached, and "Already up to date." leaves the log untouched. Both
+  // doctor and printSyncResult instruct users to run --skip-failed in
+  // exactly this case, so the flag has to handle stale entries up-front.
+  if (skipFailed) {
+    const stale = unacknowledgedSyncFailures();
+    if (stale.length > 0) {
+      const acked = acknowledgeSyncFailures();
+      console.log(`Acknowledged ${acked.count} pre-existing failure(s).`);
+    }
+  }
 }
 
 export async function runSync(engine: BrainEngine, args: string[]) {
@@ -1011,6 +1143,8 @@ export async function runSync(engine: BrainEngine, args: string[]) {
     process.exit(1);
   }
 
+  acknowledgeExistingSyncFailuresForSkip(skipFailed);
+
   // v0.18.0 Step 5: --source resolves to a sources(id) row. Falls back
   // to pre-v0.17 global config (sync.repo_path + sync.last_commit) when
   // no flag, no env, no dotfile is present.
@@ -1019,10 +1153,6 @@ export async function runSync(engine: BrainEngine, args: string[]) {
   if (explicitSource || process.env.GBRAIN_SOURCE) {
     const { resolveSourceId } = await import('../core/source-resolver.ts');
     sourceId = await resolveSourceId(engine, explicitSource);
-  }
-
-  if (skipFailed && !retryFailed && !dryRun) {
-    acknowledgeExistingSyncFailuresForSkip();
   }
 
   // v0.19.0 — `sync --all` iterates all registered sources with a
@@ -1057,13 +1187,14 @@ export async function runSync(engine: BrainEngine, args: string[]) {
     if (!noEmbed) {
       const preview = estimateSyncAllCost(sources);
       const { costUsd, model } = estimateEmbeddingPreviewCost(preview.totalTokens);
+      const safeModel = safePublicModelLabel(model);
       const previewMsg =
         `sync --all preview: ${preview.totalFiles} files across ${preview.activeSources} source(s), ` +
-        `~${preview.totalTokens.toLocaleString()} tokens, ${formatCostPreview(costUsd)} on ${model}.`;
+        `~${preview.totalTokens.toLocaleString()} tokens, ${formatEmbeddingCost(costUsd)} on ${safeModel}.`;
 
       if (dryRun) {
         if (jsonOut) {
-          console.log(JSON.stringify({ status: 'dry_run', preview, costUsd, model }));
+          console.log(JSON.stringify(sanitizeJsonForLog({ status: 'dry_run', preview, costUsd, model: safeModel })));
         } else {
           console.log(previewMsg);
           console.log('--dry-run: exit without syncing.');
@@ -1081,7 +1212,7 @@ export async function runSync(engine: BrainEngine, args: string[]) {
             message: previewMsg,
             hint: 'Pass --yes to proceed, or --dry-run to see the preview and exit 0.',
           }));
-          console.log(JSON.stringify({ error: envelope, preview, costUsd, model }));
+          console.log(JSON.stringify(sanitizeJsonForLog({ error: envelope, preview, costUsd, model: safeModel })));
           process.exit(2);
         }
         // Interactive TTY path: prompt [y/N].
@@ -1331,15 +1462,5 @@ function printSyncResult(result: SyncResult) {
       console.log(`  See ~/.gbrain/sync-failures.jsonl for details, or run 'gbrain doctor'.`);
       console.log(`  Fix the files then re-run 'gbrain sync', or 'gbrain sync --skip-failed' to move on.`);
       break;
-  }
-}
-
-function acknowledgeExistingSyncFailuresForSkip() {
-  const acked = acknowledgeSyncFailures();
-  if (acked.count > 0) {
-    console.error(
-      `  Acknowledged ${acked.count} previously-recorded failure(s):\n` +
-        `${formatCodeBreakdown(acked.summary)}`,
-    );
   }
 }

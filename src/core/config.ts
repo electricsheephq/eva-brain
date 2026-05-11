@@ -122,8 +122,8 @@ export function isThinClient(config: GBrainConfig | null): boolean {
 }
 
 /**
- * Load config with credential precedence: env vars > config file.
- * Plugin config is handled by the plugin runtime injecting env vars.
+ * Load config with credential precedence: env vars > ~/.gbrain/gbrain.env >
+ * config file. Plugin config is handled by the plugin runtime injecting env vars.
  */
 export function loadConfig(env: Record<string, string | undefined> = loadGbrainEnv()): GBrainConfig | null {
   let fileConfig: GBrainConfig | null = null;
@@ -137,15 +137,22 @@ export function loadConfig(env: Record<string, string | undefined> = loadGbrainE
 
   if (!fileConfig && !dbUrl) return null;
 
-  // Infer engine type if not explicitly set
-  const inferredEngine: 'postgres' | 'pglite' = fileConfig?.engine
-    || (fileConfig?.database_path ? 'pglite' : 'postgres');
+  // Infer engine type. A DATABASE_URL-style env var is always a Postgres
+  // connection target and must override a file-backed PGLite engine
+  // selection; otherwise direct-script / operator paths can silently hit
+  // the local PGLite brain while claiming to use the env URL. The PGLite
+  // database_path is also cleared when dbUrl is set so toEngineConfig
+  // doesn't pass a stale path through alongside the URL.
+  const inferredEngine: 'postgres' | 'pglite' = dbUrl
+    ? 'postgres'
+    : fileConfig?.engine || (fileConfig?.database_path ? 'pglite' : 'postgres');
 
   // Merge: env vars override config file. READ only — never mutate process.env.
-  const merged = {
+  const merged: GBrainConfig = {
     ...fileConfig,
     engine: inferredEngine,
     ...(dbUrl ? { database_url: dbUrl } : {}),
+    ...(dbUrl ? { database_path: undefined } : {}),
     ...(env.OPENAI_API_KEY ? { openai_api_key: env.OPENAI_API_KEY } : {}),
     ...(env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: env.GBRAIN_EMBEDDING_MODEL } : {}),
     ...(() => {
@@ -185,7 +192,7 @@ export function loadConfig(env: Record<string, string | undefined> = loadGbrainE
       },
     };
   }
-  return merged as GBrainConfig;
+  return merged;
 }
 
 /**
@@ -299,6 +306,15 @@ export function gbrainEnvPath(env: Record<string, string | undefined> = process.
   return env.GBRAIN_ENV_FILE || env.GBRAIN_ENV_PATH || join(configDir(), 'gbrain.env');
 }
 
+function stripInlineComment(raw: string): string {
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw[i] !== '#') continue;
+    const prev = raw[i - 1];
+    if (prev === ' ' || prev === '\t') return raw.slice(0, i).trimEnd();
+  }
+  return raw.trimEnd();
+}
+
 function parseEnvValue(value: string): string {
   const raw = value.trim();
   if (!raw) return '';
@@ -321,15 +337,6 @@ function parseEnvValue(value: string): string {
     out += char;
   }
   return out;
-}
-
-function stripInlineComment(raw: string): string {
-  for (let i = 0; i < raw.length; i += 1) {
-    if (raw[i] !== '#') continue;
-    const prev = raw[i - 1];
-    if (prev === ' ' || prev === '\t') return raw.slice(0, i).trimEnd();
-  }
-  return raw.trimEnd();
 }
 
 export function parseGbrainEnv(content: string): Record<string, string> {
@@ -377,8 +384,9 @@ export function gbrainPath(...segments: string[]): string {
  * Never throws, never connects. Env vars take precedence (matches loadConfig).
  */
 export function getDbUrlSource(): DbUrlSource {
-  if (process.env.GBRAIN_DATABASE_URL) return 'env:GBRAIN_DATABASE_URL';
-  if (process.env.DATABASE_URL) return 'env:DATABASE_URL';
+  const env = loadGbrainEnv();
+  if (env.GBRAIN_DATABASE_URL) return 'env:GBRAIN_DATABASE_URL';
+  if (env.DATABASE_URL) return 'env:DATABASE_URL';
   if (!existsSync(configPath())) return null;
   try {
     const raw = readFileSync(configPath(), 'utf-8');

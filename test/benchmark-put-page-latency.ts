@@ -121,7 +121,7 @@ function round(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-main().catch((e) => {
-  console.error(e);
+main().catch(() => {
+  console.error('Benchmark error.');
   process.exit(1);
 });

@@ -9,10 +9,11 @@ import { chunkCodeText, chunkCodeTextFull, detectCodeLanguage, CHUNKER_VERSION }
 import { findChunkForOffset } from './chunkers/edge-extractor.ts';
 import { extractCodeRefs, imageOfCandidates } from './link-extraction.ts';
 import { embedBatch, embedMultimodal } from './embedding.ts';
-import { slugifyPath, slugifyCodePath, slugifyImagePath, isCodeFilePath } from './sync.ts';
+import { slugifyPath, slugifyCodePath, isCodeFilePath } from './sync.ts';
 import type { ChunkInput, PageInput, PageType } from './types.ts';
-import { buildMediaEvidenceRawData, type MediaEvidence } from './media-extraction.ts';
 import { computeEffectiveDate } from './effective-date.ts';
+import { buildMediaEvidenceRawData } from './media-extraction.ts';
+import { contentHash } from './utils.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -169,24 +170,6 @@ export interface ImportResult {
   parsedPage?: ParsedPage;
 }
 
-export interface ImportMediaEvidenceOptions {
-  source?: string;
-  rawDataSource?: string;
-}
-
-interface ImportOptions {
-  noEmbed?: boolean;
-  inferFrontmatter?: boolean;
-  force?: boolean;
-  sourceId?: string;
-  /**
-   * v0.29.1: basename without extension for filename-date precedence on
-   * `daily/`, `meetings/` slugs. importFromFile threads this from the disk
-   * path; the put_page MCP op derives it from the slug tail.
-   */
-  filename?: string;
-}
-
 const MAX_FILE_SIZE = 5_000_000; // 5MB
 
 /**
@@ -205,8 +188,23 @@ export async function importFromContent(
   engine: BrainEngine,
   slug: string,
   content: string,
-  opts: ImportOptions = {},
+  opts: {
+    noEmbed?: boolean;
+    sourceId?: string;
+    /**
+     * v0.29.1: basename without extension for filename-date precedence on
+     * `daily/`, `meetings/` slugs. importFromFile threads this from the
+     * disk path; the put_page MCP op derives it from the slug tail.
+     */
+    filename?: string;
+  } = {},
 ): Promise<ImportResult> {
+  // v0.18.0+ multi-source: when caller is syncing under a non-default source,
+  // every per-page tx call must carry `sourceId` so writes target the right
+  // (source_id, slug) row. Pre-fix, putPage relied on the schema DEFAULT and
+  // silently fabricated a duplicate at (default, slug) — causing later
+  // bare-slug subqueries (getTags, deleteChunks, etc.) to crash with 21000.
+  const sourceId = opts.sourceId;
   // Reject oversized payloads before any parsing, chunking, or embedding happens.
   // Uses Buffer.byteLength to count UTF-8 bytes the same way disk size would,
   // so the network path behaves identically to the file path.
@@ -243,8 +241,7 @@ export async function importFromContent(
     tags: parsed.tags,
   };
 
-  const sourceOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
-  const existing = await engine.getPage(slug, sourceOpts);
+  const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
   if (existing?.content_hash === hash) {
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
@@ -263,20 +260,15 @@ export async function importFromContent(
   }
 
   // v0.20.0 Cathedral II Layer 8 D2 — extract fenced code blocks from
-  // compiled_truth as first-class code chunks. A markdown page like
-  // `docs/hybrid-search.md` with embedded TypeScript examples now ranks
-  // the TS fence directly in code-aware queries instead of burying it
-  // inside prose. Fences that carry an unrecognized lang tag (or no tag)
-  // fall through — the prose chunker above already chunked them as text.
+  // compiled_truth as first-class code chunks.
   if (parsed.compiled_truth.trim()) {
     const fenceChunks = await extractFencedChunks(parsed.compiled_truth, chunks.length);
     chunks.push(...fenceChunks);
   }
 
   // Embed BEFORE the transaction (external API call).
-  // v0.14+ provider-stack replay keeps hard failure semantics: silent drop is
-  // worse than surfacing the embedding problem to the caller.
-  // Caller can pass opts.noEmbed=true to explicitly skip (used by migrations).
+  // v0.14+ (Codex C2): embedding failure PROPAGATES. Silent drop accumulates
+  // unembedded pages invisibly. Caller can pass opts.noEmbed=true to skip.
   if (!opts.noEmbed && chunks.length > 0) {
     const embeddings = await embedBatch(chunks.map(c => c.chunk_text));
     for (let i = 0; i < chunks.length; i++) {
@@ -285,9 +277,13 @@ export async function importFromContent(
     }
   }
 
-  // Transaction wraps all DB writes
+  // Transaction wraps all DB writes. Every per-page tx call carries the
+  // caller's sourceId so writes target (sourceId, slug) rather than the
+  // schema DEFAULT — required for multi-source brains; harmless ('default')
+  // for single-source callers.
+  const txOpts = sourceId ? { sourceId } : undefined;
   await engine.transaction(async (tx) => {
-    if (existing) await tx.createVersion(slug, sourceOpts);
+    if (existing) await tx.createVersion(slug, txOpts);
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
     // Filename comes from importFromFile path (basename) or the slug tail
@@ -313,27 +309,26 @@ export async function importFromContent(
       timeline: parsed.timeline || '',
       frontmatter: parsed.frontmatter,
       content_hash: hash,
-      source_id: opts.sourceId,
       effective_date: effectiveDate,
       effective_date_source: effectiveDateSource,
       import_filename: filenameForChain,
-    }, sourceOpts);
+    }, txOpts);
 
     // Tag reconciliation: remove stale, add current
-    const existingTags = await tx.getTags(slug, sourceOpts);
+    const existingTags = await tx.getTags(slug, txOpts);
     const newTags = new Set(parsed.tags);
     for (const old of existingTags) {
-      if (!newTags.has(old)) await tx.removeTag(slug, old, sourceOpts);
+      if (!newTags.has(old)) await tx.removeTag(slug, old, txOpts);
     }
     for (const tag of parsed.tags) {
-      await tx.addTag(slug, tag, sourceOpts);
+      await tx.addTag(slug, tag, txOpts);
     }
 
     if (chunks.length > 0) {
-      await tx.upsertChunks(slug, chunks, sourceOpts);
+      await tx.upsertChunks(slug, chunks, txOpts);
     } else {
       // Content is empty — delete stale chunks so they don't ghost in search results
-      await tx.deleteChunks(slug, sourceOpts);
+      await tx.deleteChunks(slug, txOpts);
     }
 
     // v0.19.0 E1 — doc↔impl linking: if this markdown page cites code paths
@@ -343,8 +338,14 @@ export async function importFromContent(
     // before their code repo syncs are common, and the missing edges land
     // later via `gbrain reconcile-links` (Layer 8 D3, v0.21.0).
     const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
-    const linkSourceOpts = opts.sourceId
-      ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
+    // For doc↔impl edges, both endpoints are within the same source as the
+    // markdown page being imported. Cross-source edges (markdown in one
+    // source, code in another) currently fail with "page not found" — a
+    // faster failure mode than the pre-fix cross-product fan-out, which
+    // silently wired edges to whichever same-slug page Postgres returned
+    // first across sources.
+    const linkOpts = sourceId
+      ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
       : undefined;
     for (const ref of codeRefs) {
       const codeSlug = slugifyCodePath(ref.path);
@@ -353,14 +354,16 @@ export async function importFromContent(
         await tx.addLink(
           slug, codeSlug,
           ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
-          'documents', 'markdown', slug, 'compiled_truth', linkSourceOpts,
+          'documents', 'markdown', slug, 'compiled_truth',
+          linkOpts,
         );
       } catch { /* code page not yet imported — reconcile-links will catch it */ }
       // Reverse: code page → markdown guide (this code is documented by the guide)
       try {
         await tx.addLink(
           codeSlug, slug,
-          ref.path, 'documented_by', 'markdown', slug, 'compiled_truth', linkSourceOpts,
+          ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
+          linkOpts,
         );
       } catch { /* same reason — silent skip */ }
     }
@@ -383,7 +386,7 @@ export async function importFromFile(
   engine: BrainEngine,
   filePath: string,
   relativePath: string,
-  opts: ImportOptions = {},
+  opts: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string } = {},
 ): Promise<ImportResult> {
   // Defense-in-depth: reject symlinks before reading content.
   const lstat = lstatSync(filePath);
@@ -400,7 +403,10 @@ export async function importFromFile(
 
   // Route code files through the code import path
   if (isCodeFilePath(relativePath)) {
-    return importCodeFile(engine, relativePath, content, opts);
+    return importCodeFile(engine, relativePath, content, {
+      noEmbed: opts.noEmbed,
+      sourceId: opts.sourceId,
+    });
   }
 
   // v0.22.8 — Frontmatter inference: if the file has no frontmatter and
@@ -448,29 +454,34 @@ export async function importFromFile(
  * Uses tree-sitter code chunker for semantic splitting.
  * Page type is 'code', slug includes file extension.
  */
-export async function importMediaEvidence(
-  engine: BrainEngine,
-  slug: string,
-  content: string,
-  extraction: unknown,
-  opts: { noEmbed?: boolean } & ImportMediaEvidenceOptions = {},
-): Promise<ImportResult> {
-  const evidence: MediaEvidence = buildMediaEvidenceRawData(extraction);
-  const result = await importFromContent(engine, slug, content, { noEmbed: opts.noEmbed });
-  if (result.status !== 'imported' && result.status !== 'skipped') return result;
-  await engine.putRawData(slug, opts.rawDataSource ?? opts.source ?? 'media-extraction', evidence as unknown as object);
-  return result;
-}
-
+/**
+ * v0.31.2 (PR1 commit 10): facts backstop wiring decision.
+ *
+ * Code pages have `type: 'code'` which the `isFactsBackstopEligible`
+ * predicate (src/core/facts/eligibility.ts) rejects with `kind:code`.
+ * Wiring `runFactsBackstop` here would always produce a no-op envelope.
+ * The wiring is intentionally omitted — when README extraction or
+ * doc-comment extraction is added in a future release, the eligibility
+ * predicate is the single place to update.
+ *
+ * Sibling decisions: `file_upload` doesn't write a page (uploads to
+ * storage; the page itself is written via separate put_page); `gbrain
+ * import` (bulk markdown import) intentionally skips the backstop to
+ * avoid a cost spike on first-time imports of large brain repos. The
+ * user runs `gbrain dream` or the consolidate phase to backfill facts
+ * from bulk-imported pages.
+ */
 export async function importCodeFile(
   engine: BrainEngine,
   relativePath: string,
   content: string,
-  opts: ImportOptions = {},
+  opts: { noEmbed?: boolean; force?: boolean; sourceId?: string } = {},
 ): Promise<ImportResult> {
   const slug = slugifyCodePath(relativePath);
   const lang = detectCodeLanguage(relativePath) || 'unknown';
   const title = `${relativePath} (${lang})`;
+  const sourceId = opts.sourceId;
+  const txOpts = sourceId ? { sourceId } : undefined;
 
   const byteLength = Buffer.byteLength(content, 'utf-8');
   if (byteLength > MAX_FILE_SIZE) {
@@ -483,8 +494,7 @@ export async function importCodeFile(
     .update(JSON.stringify({ title, type: 'code', content, lang, chunker_version: CHUNKER_VERSION }))
     .digest('hex');
 
-  const sourceOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
-  const existing = await engine.getPage(slug, sourceOpts);
+  const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
   if (!opts.force && existing?.content_hash === hash) {
     return { slug, status: 'skipped', chunks: 0 };
   }
@@ -522,7 +532,7 @@ export async function importCodeFile(
   // OpenAI API. Order matters: our chunk_index is semantic (tree-sitter
   // order), so a matching (chunk_index, text_hash) means a verbatim
   // preserved symbol.
-  const existingChunks = existing ? await engine.getChunks(slug, sourceOpts) : [];
+  const existingChunks = existing ? await engine.getChunks(slug, sourceId ? { sourceId } : undefined) : [];
   const existingByKey = new Map<string, typeof existingChunks[number]>();
   for (const ec of existingChunks) {
     existingByKey.set(`${ec.chunk_index}:${ec.chunk_text}`, ec);
@@ -551,9 +561,11 @@ export async function importCodeFile(
     }
   }
 
-  // Store
+  // Store. Every per-page tx call carries `txOpts.sourceId` so multi-source
+  // brains write to the correct (source_id, slug) row instead of duplicating
+  // under the schema DEFAULT.
   await engine.transaction(async (tx) => {
-    if (existing) await tx.createVersion(slug, sourceOpts);
+    if (existing) await tx.createVersion(slug, txOpts);
 
     await tx.putPage(slug, {
       type: 'code' as PageType,
@@ -563,16 +575,15 @@ export async function importCodeFile(
       timeline: '',
       frontmatter: { language: lang, file: relativePath },
       content_hash: hash,
-      source_id: opts.sourceId,
-    }, sourceOpts);
+    }, txOpts);
 
-    await tx.addTag(slug, 'code', sourceOpts);
-    await tx.addTag(slug, lang, sourceOpts);
+    await tx.addTag(slug, 'code', txOpts);
+    await tx.addTag(slug, lang, txOpts);
 
     if (chunks.length > 0) {
-      await tx.upsertChunks(slug, chunks, sourceOpts);
+      await tx.upsertChunks(slug, chunks, txOpts);
     } else {
-      await tx.deleteChunks(slug, sourceOpts);
+      await tx.deleteChunks(slug, txOpts);
     }
   });
 
@@ -583,7 +594,7 @@ export async function importCodeFile(
   // chunk IDs are stable.
   if (extractedEdges.length > 0 && chunks.length > 0) {
     try {
-      const persistedChunks = await engine.getChunks(slug, sourceOpts);
+      const persistedChunks = await engine.getChunks(slug, sourceId ? { sourceId } : undefined);
       const byIndex = new Map<number, { id?: number; symbol_name_qualified?: string | null; start_line?: number | null; end_line?: number | null }>();
       for (const pc of persistedChunks) {
         byIndex.set(pc.chunk_index, pc);
@@ -642,15 +653,17 @@ export async function importCodeFile(
 export const importFile = importFromFile;
 export type ImportFileResult = ImportResult;
 
-/** Shared file dispatcher for import + sync paths. */
 export async function importSyncableFile(
   engine: BrainEngine,
   filePath: string,
   relativePath: string,
-  opts: ImportOptions = {},
+  opts: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string } = {},
 ): Promise<ImportResult> {
   if (isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true') {
-    return importImageFile(engine, filePath, relativePath, opts);
+    return importImageFile(engine, filePath, relativePath, {
+      noEmbed: opts.noEmbed,
+      sourceId: opts.sourceId,
+    });
   }
   return importFromFile(engine, filePath, relativePath, opts);
 }
@@ -688,6 +701,7 @@ const NEEDS_DECODE = new Set(['.heic', '.heif', '.avif']);
 export interface ImportTransactionSpec {
   slug: string;
   hadExisting: boolean;
+  /** Optional source scope for all page/chunk/file writes in the transaction. */
   sourceId?: string;
   page: PageInput;
   /** When undefined, no chunk write happens. When [], deletes any prior chunks. */
@@ -702,13 +716,13 @@ export async function withImportTransaction(
   engine: BrainEngine,
   spec: ImportTransactionSpec,
 ): Promise<void> {
+  const txOpts = spec.sourceId ? { sourceId: spec.sourceId } : undefined;
   await engine.transaction(async (tx) => {
-    const sourceOpts = spec.sourceId ? { sourceId: spec.sourceId } : undefined;
-    if (spec.hadExisting) await tx.createVersion(spec.slug, sourceOpts);
-    await tx.putPage(spec.slug, spec.page, sourceOpts);
+    if (spec.hadExisting) await tx.createVersion(spec.slug, txOpts);
+    await tx.putPage(spec.slug, spec.page, txOpts);
     if (spec.file) {
       // page_id resolution after putPage so the new row's id is available.
-      const stored = await tx.getPage(spec.slug, sourceOpts);
+      const stored = await tx.getPage(spec.slug, txOpts);
       await tx.upsertFile({
         ...spec.file,
         source_id: spec.sourceId,
@@ -718,13 +732,57 @@ export async function withImportTransaction(
     }
     if (spec.chunks !== undefined) {
       if (spec.chunks.length > 0) {
-        await tx.upsertChunks(spec.slug, spec.chunks, sourceOpts);
+        await tx.upsertChunks(spec.slug, spec.chunks, txOpts);
       } else {
-        await tx.deleteChunks(spec.slug, sourceOpts);
+        await tx.deleteChunks(spec.slug, txOpts);
       }
     }
     if (spec.after) await spec.after(tx);
   });
+}
+
+export async function importMediaEvidence(
+  engine: BrainEngine,
+  slug: string,
+  content: string,
+  extraction: unknown,
+  opts: { noEmbed?: boolean; sourceId?: string; rawDataSource?: string } = {},
+): Promise<{ slug: string; status: 'imported'; chunks: number }> {
+  const evidence = buildMediaEvidenceRawData(extraction);
+  const parsed = parseMarkdown(content, `${slug}.md`);
+  const page: PageInput = {
+    title: parsed.title || evidence.sourceRef || slug,
+    type: 'media',
+    compiled_truth: parsed.compiled_truth || evidence.text,
+    timeline: parsed.timeline || '',
+    frontmatter: {
+      ...parsed.frontmatter,
+      media_type: evidence.kind,
+      source_ref: evidence.sourceRef,
+      evidence_schema: evidence.schemaVersion,
+      ingestion: 'media-evidence-mvp',
+    },
+  };
+  page.content_hash = contentHash(page);
+  const chunks = chunkText([page.compiled_truth, evidence.text].filter(Boolean).join('\n\n')).map((chunk, idx) => ({
+    chunk_index: idx,
+    chunk_text: chunk.text,
+    chunk_source: 'compiled_truth' as const,
+  }));
+  const sourceId = opts.sourceId;
+  const txOpts = sourceId ? { sourceId } : undefined;
+  const rawDataSource = opts.rawDataSource ?? 'media-extraction';
+  const existing = await engine.getPage(slug, txOpts);
+
+  await engine.transaction(async (tx) => {
+    if (existing) await tx.createVersion(slug, txOpts);
+    await tx.putPage(slug, page, txOpts);
+    await tx.putRawData(slug, rawDataSource, evidence as unknown as object, txOpts);
+    if (chunks.length > 0) await tx.upsertChunks(slug, chunks, txOpts);
+    else await tx.deleteChunks(slug, txOpts);
+  });
+
+  return { slug, status: 'imported', chunks: chunks.length };
 }
 
 /**
@@ -906,7 +964,11 @@ export interface ImportImageOptions {
   ocrConcurrency?: number;
   /** Skip the embed call (for tests that want fast metadata-only inserts). */
   noEmbed?: boolean;
-  /** Source identity for multi-source brains. */
+  /**
+   * v0.30.x follow-up to PR #707: route image-page writes to a named source.
+   * Mirrors importFromContent's threading; without this, runImport callers
+   * with sourceId would TS-error on the importImageFile branch.
+   */
   sourceId?: string;
 }
 
@@ -941,15 +1003,16 @@ export async function importImageFile(
   }
 
   const ext = extname(relativePath).toLowerCase();
+  const slug = slugifyPath(relativePath); // strips .md/.mdx; for images ext stays in path
   // Image slug includes the extension (otherwise foo.png and foo.jpg collide
   // and slugifyPath would already preserve it). Recompute with the file
   // extension preserved so the page slug is stable + collision-free.
-  const imageSlug = slugifyImagePath(relativePath);
+  const imageSlug = relativePath.replace(/[\\\/]/g, '/').toLowerCase();
+  const sourceId = opts.sourceId;
   const buf = readFileSync(filePath);
   const hash = createHash('sha256').update(buf).digest('hex');
 
-  const sourceOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
-  const existing = await engine.getPage(imageSlug, sourceOpts);
+  const existing = await engine.getPage(imageSlug, sourceId ? { sourceId } : undefined);
   if (existing?.content_hash === hash) {
     return { slug: imageSlug, status: 'skipped', chunks: 0 };
   }
@@ -1015,7 +1078,6 @@ export async function importImageFile(
   };
 
   const fileSpec: FileSpec = {
-    source_id: opts.sourceId,
     filename,
     storage_path: relativePath.replace(/[\\\/]/g, '/'),
     mime_type: decoded.mime,
@@ -1026,7 +1088,7 @@ export async function importImageFile(
   await withImportTransaction(engine, {
     slug: imageSlug,
     hadExisting: !!existing,
-    sourceId: opts.sourceId,
+    sourceId,
     page: {
       type: 'image',
       page_kind: 'image',
@@ -1035,7 +1097,6 @@ export async function importImageFile(
       timeline: '',
       frontmatter,
       content_hash: hash,
-      source_id: opts.sourceId,
     },
     chunks: [chunk],
     file: fileSpec,
@@ -1044,17 +1105,15 @@ export async function importImageFile(
       // matching candidate gets an image_of edge. Best-effort — addLink
       // throws when the target doesn't exist; we silently skip for now and
       // let `gbrain reconcile-links` pick up later additions.
-      const linkSourceOpts = opts.sourceId
-        ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
-        : undefined;
       for (const candidate of imageOfCandidates(imageSlug)) {
-        const sibling = await tx.getPage(candidate, sourceOpts);
+        const sibling = await tx.getPage(candidate, sourceId ? { sourceId } : undefined);
         if (sibling) {
           try {
             await tx.addLink(
               imageSlug, candidate,
               filename,
-              'image_of', 'manual', imageSlug, 'frontmatter', linkSourceOpts,
+              'image_of', 'manual', imageSlug, 'frontmatter',
+              sourceId ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId } : undefined,
             );
           } catch { /* sibling vanished mid-tx; skip */ }
           break; // one canonical link per image

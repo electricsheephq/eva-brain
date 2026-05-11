@@ -574,6 +574,12 @@ export interface TimelineOpts {
   limit?: number;
   after?: string;
   before?: string;
+  /**
+   * v0.31.8: when set, scope the page-id lookup to this source. When omitted,
+   * the read returns timeline entries for every same-slug page across sources
+   * (pre-v0.31.8 behavior; preserved by the two-branch query in both engines).
+   */
+  sourceId?: string;
 }
 
 // Raw data
@@ -649,11 +655,42 @@ export interface BrainHealth {
   timeline_coverage_score: number;   // 0-15
   no_orphans_score: number;          // 0-15
   no_dead_links_score: number;       // 0-10
+  /**
+   * v0.30.1 (Cherry D7 + Codex C3): explicit migrations diagnostic surface
+   * exposed to MCP get_health callers so remote agents can detect a wedged
+   * brain WITHOUT shelling SSH + gbrain doctor. Two ledgers (schema +
+   * orchestrator) per Codex T5 namespacing.
+   *
+   * `schema_version` ("1") on the parent BrainHealth pins the additive
+   * contract — clients should default-handle missing fields and never
+   * assume removed ones.
+   */
+  schema_version?: '1';
+  migrations?: {
+    schema: {
+      /** Current numeric config.version. */
+      version: number;
+      /** Latest available migration. */
+      latest_version: number;
+      /**
+       * Optional drift evidence — names of columns/tables a verify hook
+       * surfaced as missing on opt-in migrations. Empty array means no
+       * drift detected (or no verify hook ran).
+       */
+      verify_drift?: string[];
+    };
+    orchestrator: {
+      pending: Array<{ version: string; name: string; status: 'pending' | 'partial' }>;
+      wedged: Array<{ version: string; name: string; consecutive_partials: number }>;
+    };
+  };
 }
 
 // Ingest log
 export interface IngestLogEntry {
   id: number;
+  /** v0.31.2: brain source identifier; default 'default'. Added by migration v47. */
+  source_id: string;
   source_type: string;
   source_ref: string;
   pages_updated: string[];
@@ -662,6 +699,8 @@ export interface IngestLogEntry {
 }
 
 export interface IngestLogInput {
+  /** v0.31.2: brain source identifier; defaults to 'default' on the engine. */
+  source_id?: string;
   source_type: string;
   source_ref: string;
   pages_updated: string[];
