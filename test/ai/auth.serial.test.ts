@@ -146,6 +146,22 @@ describe('provider auth resolver', () => {
     expect(resolved.apiKey).toBeUndefined();
   });
 
+  test('multi-required providers are unavailable until every required field is present', () => {
+    const partial = config({
+      embedding_model: 'azure-openai:text-embedding-3-large',
+      env: {
+        AZURE_OPENAI_ENDPOINT: 'https://example.openai.azure.com',
+      },
+    });
+
+    const resolution = resolveProviderAuth(azure, partial);
+    expect(resolution.isConfigured).toBe(false);
+    expect(resolution.source).toBe('missing');
+
+    configureGateway(partial);
+    expect(isAvailable('embedding')).toBe(false);
+  });
+
 });
 
 function config(overrides: Partial<AIGatewayConfig>): AIGatewayConfig {

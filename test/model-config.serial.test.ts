@@ -45,6 +45,8 @@ describe('resolveAlias', () => {
     expect(await resolveAlias(null, 'opus')).toBe(DEFAULT_ALIASES.opus);
     expect(await resolveAlias(null, 'sonnet')).toBe(DEFAULT_ALIASES.sonnet);
     expect(await resolveAlias(null, 'haiku')).toBe(DEFAULT_ALIASES.haiku);
+    expect(await resolveAlias(null, 'gemini')).toBe('google:gemini-3-pro');
+    expect(await resolveAlias(null, 'gpt')).toBe('openai:gpt-5');
   });
 
   test('unknown alias passes through (treats as full id)', async () => {
@@ -213,6 +215,22 @@ describe('resolveModel — v0.31.12 tier system', () => {
     expect(isAnthropicProvider('openai:gpt-5.5')).toBe(false);
     expect(isAnthropicProvider('gemini-3-pro')).toBe(false);
     expect(isAnthropicProvider('')).toBe(false);
+  });
+
+  test('built-in non-Anthropic aliases are provider-qualified', async () => {
+    stub.set('models.default', 'gpt');
+    const gpt = await resolveModel(stub as never, {
+      tier: 'reasoning',
+      fallback: 'sonnet',
+    });
+    expect(gpt).toBe('openai:gpt-5');
+
+    stub.set('models.default', 'gemini');
+    const gemini = await resolveModel(stub as never, {
+      tier: 'reasoning',
+      fallback: 'sonnet',
+    });
+    expect(gemini).toBe('google:gemini-3-pro');
   });
 
   test('alias-chain conflict: forward + reverse for same id (Codex F6)', async () => {

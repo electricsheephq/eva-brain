@@ -122,6 +122,31 @@ describe('providers command auth hardening', () => {
     });
   });
 
+  test('providers command honors config-file API keys and config base URLs', async () => {
+    loadGbrainEnvMock.mockReturnValueOnce({
+      OLLAMA_BASE_URL: 'http://env-ollama.test/v1',
+    });
+    loadConfigMock.mockReturnValueOnce({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      expansion_model: 'anthropic:claude-haiku-4-5-20251001',
+      openai_api_key: 'from-config-openai',
+      anthropic_api_key: 'from-config-anthropic',
+      provider_base_urls: { ollama: 'http://config-ollama.test/v1' },
+    } as any);
+
+    const { runProviders } = await import('../../src/commands/providers.ts');
+    await runProviders('list', []);
+
+    const initialArgs = configureGatewayMock.mock.calls[0] as unknown[] | undefined;
+    const initialCall = initialArgs?.[0] as Record<string, any> | undefined;
+    expect(initialCall?.env.OPENAI_API_KEY).toBe('from-config-openai');
+    expect(initialCall?.env.ANTHROPIC_API_KEY).toBe('from-config-anthropic');
+    expect(initialCall?.base_urls).toMatchObject({
+      ollama: 'http://config-ollama.test/v1',
+    });
+  });
+
   test('providers explain recommends openai when auth comes from openclaw profile', async () => {
     const { runProviders } = await import('../../src/commands/providers.ts');
     await runProviders('explain', []);

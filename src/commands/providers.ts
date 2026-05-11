@@ -39,15 +39,25 @@ let gatewayConfig: AIGatewayConfig;
 function configureFromEnv(): void {
   const env = loadGbrainEnv();
   const config = loadConfig(env);
+  const envFromConfig: Record<string, string> = {};
+  if (config?.openai_api_key) envFromConfig.OPENAI_API_KEY = config.openai_api_key;
+  if (config?.anthropic_api_key) envFromConfig.ANTHROPIC_API_KEY = config.anthropic_api_key;
+
+  const envBaseUrls: Record<string, string> = {};
+  if (env.LLAMA_SERVER_BASE_URL) envBaseUrls['llama-server'] = env.LLAMA_SERVER_BASE_URL;
+  if (env.OLLAMA_BASE_URL) envBaseUrls['ollama'] = env.OLLAMA_BASE_URL;
+  if (env.LMSTUDIO_BASE_URL) envBaseUrls['lmstudio'] = env.LMSTUDIO_BASE_URL;
+  if (env.LITELLM_BASE_URL) envBaseUrls['litellm'] = env.LITELLM_BASE_URL;
+
   gatewayConfig = {
     embedding_model: config?.embedding_model,
     embedding_dimensions: config?.embedding_dimensions,
     expansion_model: config?.expansion_model,
     chat_model: config?.chat_model,
     chat_fallback_chain: config?.chat_fallback_chain,
-    base_urls: config?.provider_base_urls,
+    base_urls: { ...envBaseUrls, ...(config?.provider_base_urls ?? {}) },
     provider_auth: config?.provider_auth,
-    env,
+    env: { ...envFromConfig, ...env },
   };
   configureGateway(gatewayConfig);
 }

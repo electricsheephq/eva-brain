@@ -217,7 +217,12 @@ function shouldSkipProvider(modelStr: string, skip: string[]): boolean {
 
 export async function runModels(engine: BrainEngine, args: string[]): Promise<void> {
   const json = args.includes('--json');
-  const sub = args[1] === 'doctor' ? 'doctor' : args[1] === 'help' || args.includes('--help') || args.includes('-h') ? 'help' : 'read';
+  const subcommand = args[0];
+  const sub = subcommand === 'doctor'
+    ? 'doctor'
+    : subcommand === 'help' || args.includes('--help') || args.includes('-h')
+      ? 'help'
+      : 'read';
 
   if (sub === 'help') {
     process.stdout.write(

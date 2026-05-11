@@ -52,8 +52,8 @@ export const DEFAULT_ALIASES: Record<string, string> = {
   opus:   'claude-opus-4-7',
   sonnet: 'claude-sonnet-4-6',
   haiku:  'claude-haiku-4-5-20251001',
-  gemini: 'gemini-3-pro',
-  gpt:    'gpt-5',
+  gemini: 'google:gemini-3-pro',
+  gpt:    'openai:gpt-5',
 };
 
 /**

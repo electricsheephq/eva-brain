@@ -50,10 +50,10 @@ describe('IRON RULE: existing 9 recipes survive the v0.32 resolveAuth refactor',
     for (const r of listRecipes()) {
       const required = r.auth_env?.required ?? [];
       if (required.length === 0) continue;
-      const env = { [required[0]]: `fake-${r.id}-key` };
+      const env = Object.fromEntries(required.map(key => [key, `fake-${r.id}-${key}`]));
       const auth = defaultResolveAuth(r, env, 'embedding');
       expect(auth.headerName).toBe('Authorization');
-      expect(auth.token).toBe(`Bearer fake-${r.id}-key`);
+      expect(auth.token).toBe(`Bearer fake-${r.id}-${required[0]}`);
     }
   });
 
@@ -126,7 +126,7 @@ describe('IRON RULE: existing 9 recipes survive the v0.32 resolveAuth refactor',
       if (r.implementation !== 'openai-compatible') continue;
       const required = r.auth_env?.required ?? [];
       const env: Record<string, string> = {};
-      if (required.length > 0) env[required[0]] = `fake-${r.id}-key`;
+      for (const key of required) env[key] = `fake-${r.id}-${key}`;
 
       const embeddingAuth = applyResolveAuth(r, { env } as any, 'embedding');
       const expansionAuth = applyResolveAuth(r, { env } as any, 'expansion');

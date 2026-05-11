@@ -526,9 +526,16 @@ export function isAvailable(touchpoint: TouchpointKind): boolean {
     // mean "operator must supply a model", not "provider unavailable".
     // resolveRecipe(modelStr) already proved a concrete provider:model was configured.
 
-    // For openai-compatible without auth requirements (Ollama/LiteLLM local),
-    // the auth resolver returns the unauthenticated source as configured.
-    return resolveProviderAuth(recipe, _config!).isConfigured;
+    const auth = resolveProviderAuth(recipe, _config!);
+    if (!auth.isConfigured) return false;
+
+    // OpenAI-compatible recipes can also require URL/deployment config
+    // (Azure, local servers). Validate that side before advertising readiness.
+    if (recipe.implementation === 'openai-compatible') {
+      applyOpenAICompatConfig(recipe, _config!);
+    }
+
+    return true;
   } catch {
     return false;
   }
