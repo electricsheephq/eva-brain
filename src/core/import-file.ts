@@ -552,16 +552,12 @@ export async function importCodeFile(
 
   // Embed only the new/changed chunks.
   if (!opts.noEmbed && needsEmbedIndexes.length > 0) {
-    try {
-      const textsToEmbed = needsEmbedIndexes.map((i) => chunks[i]!.chunk_text);
-      const embeddings = await embedBatch(textsToEmbed);
-      for (let j = 0; j < needsEmbedIndexes.length; j++) {
-        const i = needsEmbedIndexes[j]!;
-        chunks[i]!.embedding = embeddings[j]!;
-        chunks[i]!.token_count = Math.ceil(chunks[i]!.chunk_text.length / 4);
-      }
-    } catch (e: unknown) {
-      console.warn(`[gbrain] embedding failed for code file ${slug}: ${e instanceof Error ? e.message : String(e)}`);
+    const textsToEmbed = needsEmbedIndexes.map((i) => chunks[i]!.chunk_text);
+    const embeddings = await embedBatch(textsToEmbed);
+    for (let j = 0; j < needsEmbedIndexes.length; j++) {
+      const i = needsEmbedIndexes[j]!;
+      chunks[i]!.embedding = embeddings[j]!;
+      chunks[i]!.token_count = Math.ceil(chunks[i]!.chunk_text.length / 4);
     }
   }
 
