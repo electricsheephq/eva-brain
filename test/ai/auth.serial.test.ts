@@ -29,8 +29,11 @@ describe('provider auth resolver', () => {
   });
 
   afterEach(() => {
-    process.env.GBRAIN_OPENCLAW_AUTH_PATH = originalEnv.GBRAIN_OPENCLAW_AUTH_PATH;
-    process.env.OPENCLAW_AUTH_PATH = originalEnv.OPENCLAW_AUTH_PATH;
+    resetGateway();
+    if (originalEnv.GBRAIN_OPENCLAW_AUTH_PATH === undefined) delete process.env.GBRAIN_OPENCLAW_AUTH_PATH;
+    else process.env.GBRAIN_OPENCLAW_AUTH_PATH = originalEnv.GBRAIN_OPENCLAW_AUTH_PATH;
+    if (originalEnv.OPENCLAW_AUTH_PATH === undefined) delete process.env.OPENCLAW_AUTH_PATH;
+    else process.env.OPENCLAW_AUTH_PATH = originalEnv.OPENCLAW_AUTH_PATH;
     rmSync(tempDir, { recursive: true, force: true });
   });
 
