@@ -53,17 +53,20 @@ function resolveEnvAuth(recipe: Recipe, env: Record<string, string | undefined>)
     };
   }
 
-  for (const key of required) {
-    const value = env[key];
-    if (value) {
-      return {
-        source: 'env',
-        credentialKey: key,
-        value,
-        isConfigured: true,
-        meta: { mode: 'env' },
-      };
-    }
+  const missing = required.filter(key => !env[key]);
+  if (missing.length > 0) {
+    return null;
+  }
+
+  const credentialKey = required[0];
+  if (credentialKey) {
+    return {
+      source: 'env',
+      credentialKey,
+      value: env[credentialKey],
+      isConfigured: true,
+      meta: { mode: 'env' },
+    };
   }
 
   return null;

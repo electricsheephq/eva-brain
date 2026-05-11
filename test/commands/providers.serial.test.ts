@@ -12,6 +12,7 @@ const chatMock = mock(async () => ({
 }));
 const probeOllamaMock = mock(async () => ({ reachable: false, models_endpoint_valid: false }));
 const probeLMStudioMock = mock(async () => ({ reachable: false, models_endpoint_valid: false }));
+const probeLlamaServerMock = mock(async () => ({ reachable: false, models_endpoint_valid: false }));
 const loadGbrainEnvMock = mock(() => ({ ...process.env }));
 const loadConfigMock = mock(() => ({
   embedding_model: 'openai:text-embedding-3-large',
@@ -55,6 +56,7 @@ mock.module('../../src/core/ai/gateway.ts', () => ({
 mock.module('../../src/core/ai/probes.ts', () => ({
   probeOllama: probeOllamaMock,
   probeLMStudio: probeLMStudioMock,
+  probeLlamaServer: probeLlamaServerMock,
 }));
 
 mock.module('../../src/core/config.ts', () => ({
@@ -78,6 +80,7 @@ describe('providers command auth hardening', () => {
     chatMock.mockClear();
     probeOllamaMock.mockClear();
     probeLMStudioMock.mockClear();
+    probeLlamaServerMock.mockClear();
     loadGbrainEnvMock.mockClear();
     loadConfigMock.mockClear();
     resolveProviderAuthMock.mockClear();
@@ -119,6 +122,31 @@ describe('providers command auth hardening', () => {
     expect(overrideCall).toMatchObject({
       embedding_model: 'voyage:voyage-4-large',
       embedding_dimensions: 2048,
+    });
+  });
+
+  test('providers command honors config-file API keys and config base URLs', async () => {
+    loadGbrainEnvMock.mockReturnValueOnce({
+      OLLAMA_BASE_URL: 'http://env-ollama.test/v1',
+    });
+    loadConfigMock.mockReturnValueOnce({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      expansion_model: 'anthropic:claude-haiku-4-5-20251001',
+      openai_api_key: 'from-config-openai',
+      anthropic_api_key: 'from-config-anthropic',
+      provider_base_urls: { ollama: 'http://config-ollama.test/v1' },
+    } as any);
+
+    const { runProviders } = await import('../../src/commands/providers.ts');
+    await runProviders('list', []);
+
+    const initialArgs = configureGatewayMock.mock.calls[0] as unknown[] | undefined;
+    const initialCall = initialArgs?.[0] as Record<string, any> | undefined;
+    expect(initialCall?.env.OPENAI_API_KEY).toBe('from-config-openai');
+    expect(initialCall?.env.ANTHROPIC_API_KEY).toBe('from-config-anthropic');
+    expect(initialCall?.base_urls).toMatchObject({
+      ollama: 'http://config-ollama.test/v1',
     });
   });
 

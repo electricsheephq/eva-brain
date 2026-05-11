@@ -2,6 +2,313 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.32.0] - 2026-05-10
+
+**5 new embedding providers + the discoverability fix that closes the 17-PR dupe cluster.**
+**`gbrain providers list` now shows 14 recipes; `gbrain doctor` tells you which alternatives are already wired.**
+
+A triage of 197 open issues + 289 open PRs surfaced a 17-PR cluster of community embedding-provider PRs filed within ~3 weeks (Ollama, Gemini, Voyage, Azure, MiniMax, Copilot, llama-server, Vertex, DashScope, Zhipu, etc.). Most were dupes of work already in master — gbrain has shipped a comprehensive AI SDK gateway + recipe pattern since v0.14, with 9 providers built in. Users just didn't know.
+
+v0.32.0 ships the missing recipes that aren't covered by the existing pattern, plus a documentation pass + doctor advisory + improved error hints that close the discoverability gap. Codex outside-voice review during plan-eng-review caught the discoverability framing — without it, the wave would have shipped 8 recipes plus an OAuth subsystem instead of the focused 5-recipe + docs delivery.
+
+### The numbers that matter
+
+```
+gbrain providers list   →   v0.31.1: 9 providers   →   v0.32.0: 14 providers
+gbrain doctor           →   v0.31.1: 1 advisory     →   v0.32.0: 2 advisories (+ alternative_providers)
+```
+
+5 new recipes:
+
+| Recipe | Auth | Default dims | Notes |
+|---|---|---|---|
+| `azure-openai` | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_DEPLOYMENT` | 1536 | First recipe with `api-key:` custom header (not Bearer); first with templated URL + `?api-version=` query injection |
+| `minimax` | `MINIMAX_API_KEY` | 1536 | China-region; embo-01 model; type='db' asymmetric retrieval field plumbed via dims.ts |
+| `dashscope` | `DASHSCOPE_API_KEY` | 1024 | Alibaba; international endpoint default; CJK-aware batching (chars_per_token=2) |
+| `zhipu` | `ZHIPUAI_API_KEY` | 1024 | BigModel; embedding-3 with Matryoshka up to 2048 (HNSW falls back to exact-scan past 2000 dims) |
+| `llama-server` | (none) | user-set | llama.cpp's `llama-server --embeddings`; user_provided_models recipe |
+
+### What this means for new users
+
+`gbrain init` keeps OpenAI as the zero-config default. Users with API keys for any of the other 13 providers see them surfaced via `gbrain doctor` ("Detected 2 alternative embedding providers ready to use: voyage, dashscope. Run `gbrain providers list` to switch."). Users on Azure tenancies, China-region, or local-only setups have first-class recipes instead of "find a workaround." Users with provider needs gbrain doesn't ship can route through LiteLLM proxy (the universal escape hatch) without writing custom code.
+
+For agents: every recipe is registered in the same `listRecipes()` registry, so `gbrain providers list/test/env/explain` automatically picks up new recipes without code changes. The recipe contract test (`test/ai/recipes-contract.test.ts`) keeps the registry honest.
+
+### To take advantage of v0.32.0
+
+`gbrain upgrade` should do this automatically. If it didn't:
+
+1. **Confirm the new recipes show:**
+   ```bash
+   gbrain providers list
+   ```
+   Should show 14 entries including `azure-openai`, `minimax`, `dashscope`, `zhipu`, `llama-server`.
+
+2. **Try the doctor advisory:**
+   ```bash
+   gbrain doctor
+   ```
+   Look for the `alternative_providers` row. If env vars for unconfigured providers are present, it'll name them.
+
+3. **Read the new docs** at [`docs/integrations/embedding-providers.md`](docs/integrations/embedding-providers.md) — capability matrix, decision tree, per-recipe setup, "my provider isn't listed" path.
+
+4. **No breaking changes**: the existing 9 recipes (openai, anthropic, google, deepseek, groq, ollama, litellm-proxy, together, voyage) keep working unchanged. The internal auth refactor (D12=A unified resolveAuth seam) is pinned by `test/ai/recipes-existing-regression.test.ts` so the next refactor can't silently break them.
+
+5. **If anything breaks**, file an issue at https://github.com/garrytan/gbrain/issues with `gbrain doctor` output. The only behavior change for existing recipes: Ollama expansion + chat now read `OLLAMA_API_KEY` when set (embedding already did; the unification aligns all three touchpoints).
+
+### Itemized changes
+
+#### Architectural foundations
+
+- **Recipe.resolveAuth(env) seam (D12=A)**: unified the openai-compatible auth path, which was duplicated 3 times across `instantiateEmbedding`, `instantiateExpansion`, `instantiateChat` with subtle drift. Default impl (used by all existing recipes unchanged) returns `{headerName: 'Authorization', token: 'Bearer <key>'}`. Recipes deviating override; Azure is the first.
+- **Recipe.resolveOpenAICompatConfig(env) seam**: env-templated baseURL + optional fetch wrapper for recipes whose URL shape doesn't fit a static `base_url_default`. Azure uses both seams.
+- **Recipe.probe() seam (D13=A)**: recipe-owned readiness check for local-server providers. Replaces the hardcoded `recipe.id === 'ollama'` special case in `runExplain()`. llama-server declares its own probe; future local providers self-register.
+- **EmbeddingTouchpoint.user_provided_models?: true (D8=A)**: explicit signal for recipes that ship without a fixed model list (litellm, llama-server). Replaces the legacy `recipe.id === 'litellm'` hardcode in gateway.ts:223; refusal in `init.ts:resolveAIOptions` for shorthand `--model` with a setup hint pointing at the explicit form.
+- **EmbeddingTouchpoint.no_batch_cap?: true**: silences the missing-max_batch_tokens startup warning for recipes with genuinely dynamic batch capacity (Ollama, LiteLLM proxy, llama-server). Pre-fix: 3 stderr warnings on every `configureGateway()` call. Post-fix: only `google` warns.
+
+#### Discoverability
+
+- New `docs/integrations/embedding-providers.md` (one-pager: capability table, decision tree, per-recipe setup, "my provider isn't listed" path to LiteLLM).
+- README embedding-providers callout near the top of the install section.
+- `gbrain doctor` adds an `alternative_providers` check that surfaces recipes whose env vars are already set but aren't the configured provider.
+- `gbrain init --model litellm` (or any user_provided_models recipe) now refuses with a structured setup hint instead of throwing "no embedding models listed."
+
+#### Codex review fixes (pre-merge)
+
+- **dimsProviderOptions on openai-compatible**: text-embedding-3-* (Azure), text-embedding-v3 (DashScope), and embedding-3 (Zhipu) now thread `dimensions` to the wire. Without this, Azure-default 3072d would mismatch a 1536d brain on the first embed; DashScope/Zhipu Matryoshka requests would be silently ignored.
+- **`gbrain init --embedding-model llama-server:foo` (verbose path)**: now refuses without `--embedding-dimensions`. Pre-fix, the verbose path fell through to the gateway's 1536d default and silently created the wrong-width schema (only the shorthand `--model` was guarded).
+- **MiniMax host correction**: `api.minimax.chat` → `api.minimaxi.com` (matches MiniMax's current OpenAI-compatible docs).
+- **`LLAMA_SERVER_BASE_URL` reaches the gateway**: `buildGatewayConfig` now threads `LLAMA_SERVER_BASE_URL`, `OLLAMA_BASE_URL`, `LMSTUDIO_BASE_URL`, `LITELLM_BASE_URL` env into `cfg.base_urls` so embed traffic actually hits the configured port. Pre-fix, the env-only setup let probe pass on a custom port while traffic still hit `localhost:8080`.
+- **`Recipe.probe(baseURL?)` accepts the resolved URL**: probe and gateway can no longer disagree when only `provider_base_urls` is set in config (no env). Callers with cfg pass the URL; legacy callers fall back to env.
+
+#### Adjacent fixes
+
+- **#779 (alexandreroumieu-codeapprentice) reworked**: `EmbeddingTouchpoint.no_batch_cap?: true` opt-out for dynamic-cap recipes.
+- **#121 (vinsew) reworked**: `~/.gbrain/config.json` API keys now propagate to the gateway env. Pre-fix, `openai_api_key` / `anthropic_api_key` config-file values were ignored (the gateway only saw `process.env`). Common bite: launchd-spawned daemons or agent subprocess tools without `~/.zshrc` propagation. Process env still wins on conflict.
+- `loadConfig()` now merges `ANTHROPIC_API_KEY` env var into the file-config result (was silently dropped).
+- IRON RULE regression test (`test/ai/recipes-existing-regression.test.ts`): pins that the v0.32 resolveAuth refactor preserves auth behavior for the existing 9 recipes.
+
+### Closed as superseded
+
+The following community PRs are closed because their work is now covered by the recipe system + LiteLLM proxy escape hatch + the recipes shipped in this wave:
+
+- #49, #58, #73, #100, #112, #134, #137, #150, #172, #178, #255, #327, #420, #482, #516, #780, #89 — pluggable embedding adapter / Ollama / Gemini / E5 / Azure-via-LiteLLM / etc.
+
+Each contributor identified a real gap; the patterns they prototyped converged on the recipe system that was shipped in v0.14. Thank you for the early signal.
+
+### Deferred to v0.32.x (with TODOS.md entries)
+
+- **#729 Vertex AI ADC** (lucha0404): proper ADC chain (metadata server, gcloud creds, service-account JSON) is a real product surface, not the single-source-JSON path the original PR proposed.
+- **#691 GitHub Copilot** (tonyxu-io): outbound OAuth is a new product surface (login flow, browser/device flow, refresh, UX), not a sidecar recipe. Needs its own design pass.
+- **#698 OpenAI Codex OAuth** (perlantir): same OAuth-product-surface argument; chat-only.
+- **#765 Hunyuan PGLite + CJK keyword fallback** (313094319-sudo): the CJK PGLite branch is ~150 lines of new SQL + scoring logic that deserves its own focused PR rather than being folded into a 9-commit wave.
+- **Interactive provider chooser in `gbrain init`**: the wizard piece of the discoverability lane. v0.32.0 ships the doctor advisory + cleaner refusal that close the 80% case; the full wizard is a v0.32.x follow-up.
+- **Real-credentials per-recipe smoke fixtures**: opt-in CI matrix gated on API-key budget approval.
+
+### Contributors
+
+Reworked from / inspired by:
+- @cacity (#148 MiniMax)
+- @JamesJZhang (#459 Azure OpenAI)
+- @Magicray1217 (#59 DashScope + Zhipu)
+- @SiyaoZheng (#702 llama-server)
+- @alexandreroumieu-codeapprentice (#779)
+- @vinsew (#121)
+- @100yenadmin / Eva (Voyage 4 Large 2048d HNSW policy, shipped earlier via 3004a87)
+
+Codex outside-voice review during plan-eng-review drove the scope reduction (D11=C) from 8 recipes + OAuth subsystem to 5 recipes + docs.
+
+## [0.31.12] - 2026-05-10
+
+**The chat default no longer 404s, and every Claude call gbrain makes is now one config key away from your preferred model.**
+
+gbrain v0.31.6 shipped `claude-sonnet-4-6-20250929` as the chat default. That model ID does not exist on the Anthropic API. It 404'd on every call. Worse, the failure mode wasn't loud: `isAvailable("chat")` returned false in every code path that loaded the recipe's model list, and `extractFactsFromTurn` silently returned `[]`. The headline v0.31.6 feature, real-time fact extraction during sync, was a no-op on the happy path for most users.
+
+This release fixes the model ID, adds a tier-based routing surface so power users can swap defaults in one config key, and ships `gbrain models doctor` as the structural probe against this exact bug class. Credit to `garrytan-agents` for the initial fix submitted as PR #830; the recipe diff and the structural test file are pulled verbatim. This release adds a reverse alias for stale user configs, the four-tier routing surface, the `gbrain models` CLI, three layers of subagent enforcement, and a real regression test for the silent-no-op bug class.
+
+### What you can now do
+
+**Use any model for everything with one config key.** `gbrain config set models.default opus` routes every internal call (chat, expansion, synthesis, classification) through Opus 4.7. Switch to `models.default openai:gpt-5.5` and gbrain will route every call to GPT-5.5, except for the subagent loop, which falls back to `claude-sonnet-4-6` automatically because the loop is Anthropic-only by construction.
+
+**Tier-level control when you want finer than "use opus for everything."** Four tiers: `utility` (haiku-class, fast classification + expansion + verdict), `reasoning` (sonnet-class, default chat + synthesis), `deep` (opus-class, expensive reasoning), `subagent` (Anthropic-only multi-turn tool loop). Override each independently via `gbrain config set models.tier.<tier> <model>`. Per-task keys like `models.dream.synthesize` still beat tier overrides because they are more specific.
+
+**`gbrain models` shows the live routing.** Read mode prints the four tier defaults, the resolved value for each, every per-task override, the alias map, and a source-of-truth column showing exactly where each model came from (`default`, `config: models.tier.reasoning`, `env: GBRAIN_MODEL`). `--json` for machine-readable output.
+
+**`gbrain models doctor` probes each configured model with a 1-token call** and reports reachability with the provider's error message. This is the structural fix for the bug class that produced this release: an invalid model ID surfaces at config time, not at the next agent-run that silently degrades.
+
+**Subagent jobs reject non-Anthropic models at submit time.** The minion queue's `add()` method now refuses `subagent` jobs with `data.model` pointing at a non-Anthropic provider. Three layers of enforcement: submit-time guard, tier-resolution fallback in `resolveModel`, and a `subagent_provider` check in `gbrain doctor`. You cannot accidentally route the Anthropic Messages API tool-loop to OpenAI and watch it fail at runtime.
+
+**Opus 4.7 pricing is correct** (`$5/$25 per MTok`, was `$15/$75` left over from Opus 4). The budget meter and cross-modal-eval estimator both read from `src/core/anthropic-pricing.ts` as the single source of truth now, not two duplicated maps.
+
+### Numbers that matter
+
+| Surface | Before (v0.31.6) | After (v0.31.12) |
+|---|---|---|
+| Chat default model ID | `claude-sonnet-4-6-20250929` (404s) | `claude-sonnet-4-6` (valid) |
+| `isAvailable("chat")` on default install | false (silently) | true |
+| `extractFactsFromTurn` on default install | returns `[]` silently | actually extracts facts |
+| Config keys to swap models everywhere | n/a (hardcoded per call) | 1 (`models.default`) |
+| Provider-mismatch enforcement layers for subagent | 0 | 3 (submit/runtime/doctor) |
+| Reachability check at config time | n/a | `gbrain models doctor` |
+| Sources of truth for Anthropic pricing | 2 (duplicated, diverged) | 1 (`ANTHROPIC_PRICING`) |
+
+### What this means for you
+
+If you upgraded to v0.31.6 hoping for real-time facts extraction during sync and noticed nothing got extracted, this is the fix. Run `gbrain upgrade && gbrain doctor` and the chat-default check returns to green. The new `subagent_provider` check surfaces any non-Anthropic config drift.
+
+If you are a power user, the boring path stays boring: `gbrain config set models.default opus` and you're done. The advanced path is `gbrain models` to see what's live, `gbrain models doctor` to probe reachability before a long agent run, and `models.tier.*` keys for tier-specific overrides. The skill at `skills/conventions/model-routing.md` documents the full precedence chain and override recipes.
+
+If you had a `claude-sonnet-4-6-20250929` string sitting in `facts.extraction_model` or `models.dream.synthesize` from v0.31.6, you do not need to update it. A reverse alias rewrites that broken ID back to the canonical `claude-sonnet-4-6` automatically. If you want to clean it up: `gbrain config set facts.extraction_model anthropic:claude-sonnet-4-6`.
+
+## To take advantage of v0.31.12
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about the chat default:
+
+1. **Verify the routing is healthy:**
+   ```bash
+   gbrain doctor
+   gbrain models
+   ```
+   The `subagent_provider` check should be `ok`. `gbrain models` should show `tier.reasoning` resolving to `claude-sonnet-4-6` (or your override).
+
+2. **Optional: probe reachability of every configured model.** ~1 token per model, runs in under 5 seconds. Catches the next 404 before it ships.
+   ```bash
+   gbrain models doctor
+   ```
+
+3. **Power-user override (any one of these):**
+   ```bash
+   # Use opus for everything
+   gbrain config set models.default opus
+
+   # Use sonnet for the default workhorse but opus for deep reasoning
+   gbrain config set models.tier.deep opus
+
+   # Use a custom alias as the global default
+   gbrain config set models.aliases.frontier anthropic:claude-opus-4-7
+   gbrain config set models.default frontier
+   ```
+
+4. **If `gbrain doctor` still flags anything,** please file an issue: https://github.com/garrytan/gbrain/issues — include the output of `gbrain doctor` and `gbrain models --json`.
+
+### Itemized changes
+
+#### Bug fix sweep + reverse alias
+
+- `src/core/ai/gateway.ts`: `DEFAULT_CHAT_MODEL` corrected to `anthropic:claude-sonnet-4-6` (was the v0.31.6 phantom `-20250929`).
+- `src/core/ai/recipes/anthropic.ts`: chat and expansion `models:` lists drop the phantom date suffix. The wrong-direction alias (`claude-sonnet-4-6 → claude-sonnet-4-6-20250929`) is removed; a reverse alias (`claude-sonnet-4-6-20250929 → claude-sonnet-4-6`) keeps stale user configs working.
+- `src/core/facts/extract.ts`: routes through `resolveModel({tier: 'reasoning'})` instead of hardcoding the broken default.
+- `test/anthropic-model-ids.test.ts`: 6 structural test cases pinning the recipe shape (verbatim cherry-pick of PR #830, plus the reverse-alias rescue case).
+
+#### Tier system + recipe-models merge
+
+- `src/core/model-config.ts`: new `ModelTier` type, new `TIER_DEFAULTS` constant, new `tier?` field on `ResolveModelOpts`. Tier resolution is step 5 in the resolution chain (after `models.default`, before env var). Tier defaults win over caller fallback when no override is set.
+- `src/core/ai/model-resolver.ts`: `assertTouchpoint()` gains an optional 4th arg `extendedModels` so per-gateway-instance recipe extension can permit user-supplied model strings without breaking the source-code-typo failure path. Replaces the earlier plan to soften the validator wholesale, which Codex flagged as too broad.
+- `src/core/ai/gateway.ts`: new `reconfigureGatewayWithEngine(engine)` async function called from `cli.ts` after `engine.connect()` to re-resolve expansion + chat defaults through `resolveModel()`. Configured models register into a per-instance extended-models set so the gateway routes them without recipe modification.
+- Every existing `resolveModel()` call site gains a `tier:` argument: think → deep, cycle/synthesize → reasoning (+ utility for verdict), cycle/patterns → reasoning, cycle/drift → reasoning, cycle/auto-think → deep, facts/extract → reasoning.
+
+#### Subagent runtime enforcement (3 layers)
+
+- Layer 1 (`src/core/minions/queue.ts`): `MinionQueue.add()` rejects `subagent` jobs with a non-Anthropic `data.model` before the job enters the queue.
+- Layer 2 (`src/core/minions/handlers/subagent.ts`): handler routes through `resolveModel({tier: 'subagent'})`. If config resolves to a non-Anthropic provider, the resolver warns and falls back to `TIER_DEFAULTS.subagent` (`claude-sonnet-4-6`).
+- Layer 3 (`src/commands/doctor.ts`): new `subagent_provider` check warns when `models.tier.subagent` or `models.default` resolves to a non-Anthropic provider, with a paste-ready fix command.
+
+#### `gbrain models` CLI + probe
+
+- `src/commands/models.ts`: read mode prints routing table + source attribution. `doctor` subcommand fires a 1-token `gateway.chat()` probe to each configured chat/expansion model and classifies failures into `{model_not_found, auth, rate_limit, network, unknown}`. `--skip=<provider>` narrows the probe matrix.
+- Wired into the cli.ts dispatch table and `CLI_ONLY` set.
+
+#### Pricing dedupe
+
+- `src/core/anthropic-pricing.ts`: Opus 4.7 corrected from `$15/$75` to `$5/$25` per Anthropic's published pricing (the old number was from Opus 4 generation). Opus 4.6 also corrected.
+- `src/core/cross-modal-eval/runner.ts`: pricing map now reads from `ANTHROPIC_PRICING` for Anthropic models instead of duplicating the values. Single source of truth.
+
+#### Tests
+
+- `test/facts-extract-silent-no-op.test.ts` (NEW, 5 cases): the regression test for the bug class. Wires gateway with the v0.31.6 broken model ID and asserts the reverse alias rescues `isAvailable("chat")`. Also asserts the smoking-gun: when chat is available, `extractFactsFromTurn` actually calls the chat transport (does not silently return `[]`).
+- `test/model-config.serial.test.ts`: 9 new cases covering tier precedence, `models.default` beats tier, `tier.subagent` falls back to Anthropic when default is non-Anthropic, alias-chain conflict (Codex F6 regression guard).
+- `test/agent-cli.test.ts`: 3 new cases for the queue submit-time subagent guard (Layer 1).
+- `test/ai/gateway-chat.test.ts`: existing alias-resolution tests rewritten to reflect the new direction (4.6+ dateless is canonical, reverse alias rescues stale strings).
+- `test/anthropic-model-ids.test.ts` (NEW, 6 cases): recipe-shape guardrails, verbatim cherry-pick of PR #830 plus reverse-alias case.
+
+#### Skills + docs
+
+- `skills/conventions/model-routing.md`: rewritten to cover both the new tier system AND the existing subagent spawn routing in one canonical doc. Power-user recipes, three-layer subagent enforcement explanation, override priority chain.
+
+### For contributors
+
+- **Iron rule when adding a new LLM call:** route through `resolveModel()` with a `tier:` argument. Do not hardcode a model string as a fallback. The v0.31.6 chat-default failure mode was exactly this — a hardcoded const fallback bypassed the resolver and shipped a phantom ID. The tier system + `gbrain models doctor` is the structural fix; future drift will be caught by the recipe-shape test in `test/anthropic-model-ids.test.ts`.
+- **The `gbrain models doctor` probe is opt-in.** Do not auto-fire it on every CLI invocation; that would burn tokens for users who just want `gbrain put-page`. Operators run it explicitly when they suspect a config issue or after upgrading.
+
+## [0.31.11] - 2026-05-10
+
+**Thin-client gbrain notices when the remote brain has upgraded and offers to bring you along.**
+
+If you're running `gbrain` against a remote `gbrain serve --http` host (the thin-client install from v0.31.1), each command now compares your local CLI version against the remote brain. When the remote has a newer minor or major release, you get a one-line prompt: `Upgrade local CLI now? [Y/n]`. Press Enter, the upgrade runs, the binary advances, your command re-prompts you to retype. Patch drift stays silent. Sticky decline per remote+version so you don't get re-asked every command after saying no. `gbrain remote doctor` surfaces the same drift as a warn-level check for quiet operators and CI.
+
+### What you can now do
+
+**Stop running stale binaries against a fresh brain.** Before this release, a thin-client install at v0.31.4 talking to a v0.32.0 brain would silently use the older protocol surface until the user noticed something was broken. The drift was invisible. Now the banner that already prints `[thin-client → host · brain: ... · v0.32.0]` follows up with an interactive upgrade prompt when local lags remote.
+
+**Decline once, stay declined.** If you press `n`, the prompt remembers your answer for that exact remote+version combination in `~/.gbrain/upgrade-prompt-state.json`. Subsequent commands are silent. When the remote bumps again, you get fresh prompts because the version key changed. Independent answers per remote brain (`work` vs `home`) via mcp_url-scoped state.
+
+**See drift in `gbrain remote doctor` even in non-TTY contexts.** The new `thin_client_upgrade_drift` check fires `warn` when minor/major drift is detected, with a fix hint pointing at `gbrain upgrade`. If a prior in-process upgrade attempt failed (state file shows `last_response: failed` for the same remote version), the hint pivots to the manual install URL so you don't loop on a broken binary.
+
+**Concurrent OpenClaw subagents don't fight over the TTY.** One advisory lockfile (`~/.gbrain/upgrade-prompt.lock`) gates the prompt. If two subagents both detect drift at the same instant, one prompts and the rest silently no-op. Stale-lock reclaim after 60s handles the case where a prompting process died mid-question.
+
+**Ctrl-C escapes the prompt cleanly.** A prompt-scoped SIGINT handler installs around the read and removes after, so pressing Ctrl-C exits 130 (the standard `network/aborted` code) instead of being swallowed by the outer dispatcher's AbortController-only handler.
+
+### Numbers that matter
+
+| Failure mode | Before v0.31.11 | After v0.31.11 |
+|---|---|---|
+| Local v0.31.4, remote v0.32.0 (minor drift) | No signal; user runs stale CLI until something breaks | Banner + interactive prompt; one Enter to upgrade |
+| User declines, runs `gbrain query` again | Re-prompted on every command | Sticky decline per (mcp_url, remote_version) |
+| `gbrain upgrade` runs but doesn't advance the binary (catch-and-print path) | Silent loop on broken binary | State=failed, exit 1, doctor hint pivots to manual install URL |
+| Two OpenClaw subagents both detect drift | Interleaved prompts on same TTY, both read each other's keystrokes | One prompts, others no-op via advisory lockfile |
+| Quiet/non-TTY/CI run with drift | No signal | `gbrain remote doctor` warns with fix hint |
+| Ctrl-C during the prompt | Swallowed (outer SIGINT handler installed already) | Exits 130 cleanly |
+| Stdin EOF mid-prompt (terminal closes, /dev/null piped past TTY check) | Hangs forever on `stdin.once('data')` | Resolves to null after 5min timeout; orchestrator treats as silent decline, no state write |
+
+### What this means for your workflow
+
+If you've been running `gbrain init --mcp-only` thin-client installs across a few machines, this closes the last "why is my brain confused?" failure mode: the answer was always "your local CLI is six releases behind the brain." Now the CLI tells you. The prompt fires at most once per command per (remote, version) and stays out of the way for quiet/non-TTY runs. CI sees the drift in `gbrain remote doctor`.
+
+## To take advantage of v0.31.11
+
+`gbrain upgrade` should land this automatically. If you're already on v0.31.11 the first time a remote brain you talk to bumps past you, you'll see the prompt. Nothing to configure.
+
+1. **Verify the doctor check is wired:**
+   ```bash
+   gbrain remote doctor --json | jq '.checks[] | select(.name == "thin_client_upgrade_drift")'
+   ```
+   You should see either `status: "ok"` (local equals remote) or `status: "warn"` (drift detected, fix hint included).
+
+2. **State file lives at `~/.gbrain/upgrade-prompt-state.json`.** It's keyed by mcp_url so multiple remote brains have isolated decline history. Delete the file to reset all answers.
+
+3. **Lockfile lives at `~/.gbrain/upgrade-prompt.lock`.** If a prompt died without cleaning up, the next invocation reclaims after 60s of stale mtime.
+
+4. **If any step fails or the prompt fires when it shouldn't,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with the output of `gbrain remote doctor --json` and the contents of `~/.gbrain/upgrade-prompt-state.json` if it exists.
+
+### Itemized changes
+
+#### Added
+- `src/core/thin-client-upgrade-prompt.ts` — `maybePromptForUpgrade` orchestrator with full DI seams for tests. Lockfile gating (`acquirePromptLock` with stale-reclaim >60s mtime), atomic state-file IO via tmp+rename, per-entry shape validator that drops malformed entries while preserving valid siblings. Pure `decideAction` returns `prompt` or `noop` based on TTY gates, banner-suppressed, sticky decline, sticky yes, prior-failed re-prompt, and the D8 patch-drift-silent rule. `verifyUpgradeAdvanced` (D5) re-reads `gbrain --version` from a fresh subprocess to detect catch-and-print upgrade paths that return 0 without advancing the binary. Prompt-scoped SIGINT handler exits 130 cleanly.
+- `src/core/cli-util.ts` — `promptLineStderr(prompt, {timeoutMs})` sibling to `promptLine`. Resolves to `string` on stdin data, `null` on stdin EOF or after the 5-minute default timeout. Never rejects. Listener cleanup is idempotent via a `settled` guard.
+- `src/core/doctor-remote.ts` — `runUpgradeDriftCheck(config)` new check `thin_client_upgrade_drift`. Returns ok+inconclusive on network error (informational; the earlier `mcp_smoke` check covers the genuinely-unreachable case). Returns ok on local≥remote OR patch drift. Returns warn on minor/major drift with a fix hint that pivots to the manual install URL if a prior `gbrain upgrade` is recorded as `failed` for the same remote version.
+- `src/cli.ts` — exported `bannerSuppressed` + `BrainIdentity`; wired `maybePromptForUpgrade` into both banner code paths (cache hit and cache miss). Banner-suppressed early return guarantees `bannerIsSuppressed=false` at the call site.
+
+#### Changed
+- `PromptReader` type now returns `Promise<string | null>` to accommodate EOF/timeout. Orchestrator handles null as silent decline with no state write (a transient stdin closure must not poison the per-version sticky-decline gate).
+
+#### Tests
+- 63 new tests across `test/thin-client-upgrade-prompt.test.ts` (50 cases: safeCompare, driftLevel, state-file IO including atomic-write and corrupt-JSON fallthrough, every decision-matrix row, lockfile acquire/EEXIST/stale-reclaim, orchestrator yes/no/advanced/not-advanced/threw/null-from-EOF, SIGINT install/remove lifecycle including cleanup-on-throw, malformed-entry filtering preserves valid siblings, empty-key dropped) and `test/doctor-remote.test.ts` (5 new cases for `runUpgradeDriftCheck`: unreachable host returns ok+inconclusive, major drift no prior state shows auto-upgrade hint, major drift with prior_failed shows manual install hint, prior_failed for older version does NOT pivot stale, local equals remote returns ok). 100% pass.
+- Test fixture in `test/doctor-remote.test.ts` extended to dispatch JSON-RPC `tools/call` by tool name via per-test `mcpToolResults` map.
+
+#### For contributors
+- The `_setVerifierForTest`, `_setPromptReaderForTest`, `_setUpgradeRunnerForTest` injection seams in `thin-client-upgrade-prompt.ts` follow the same pattern as `_clearIdentityCacheForTest` in `src/cli.ts` so tests can drive the orchestrator end-to-end without spawning subprocesses or touching the user's PATH.
+
 ## [0.31.10] - 2026-05-10
 
 **Setup hands you a real bootstrap, not an empty brain. New `cold-start` skill sequences day-1 imports across markdown, contacts, calendar, email, conversations, X, archives, and meeting transcripts. New `ask-user` choice-gate pattern. Phase J in `setup` auto-launches cold-start when verification passes.**
@@ -192,6 +499,7 @@ After upgrade, anything that was `[WARN] graph_coverage` or `[WARN] resolver_hea
 - Contributors: [@mayazbay](https://github.com/mayazbay), [@psperera](https://github.com/psperera), [@FUSED-ID](https://github.com/FUSED-ID), [@TheAndersMadsen](https://github.com/TheAndersMadsen). Outside-voice plan review (codex) caught the read-path/write-path split risk on the original plan; a second codex pass during /ship caught the `--fix` write-path leak before merge.
 
 [#798](https://github.com/garrytan/gbrain/pull/798) [#788](https://github.com/garrytan/gbrain/pull/788) [#536](https://github.com/garrytan/gbrain/pull/536) [#376](https://github.com/garrytan/gbrain/pull/376) [#128](https://github.com/garrytan/gbrain/pull/128)
+
 ## [0.31.4.1] - 2026-05-10
 
 **Takes v2: lessons from a 100K-take production extraction folded back into the runtime, and `gbrain auth` works on Postgres again.**

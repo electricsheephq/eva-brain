@@ -37,7 +37,9 @@ import type {
   TouchpointKind,
 } from './types.ts';
 import { resolveProviderAuth } from './auth.ts';
-import { resolveRecipe, assertTouchpoint } from './model-resolver.ts';
+import { resolveRecipe, assertTouchpoint, parseModelId } from './model-resolver.ts';
+import { resolveModel, TIER_DEFAULTS } from '../model-config.ts';
+import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
 
@@ -45,10 +47,53 @@ const MAX_CHARS = 8000;
 const DEFAULT_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
 const DEFAULT_EMBEDDING_DIMENSIONS = 1536;
 const DEFAULT_EXPANSION_MODEL = 'anthropic:claude-haiku-4-5-20251001';
-const DEFAULT_CHAT_MODEL = 'anthropic:claude-sonnet-4-6-20250929';
+const DEFAULT_CHAT_MODEL = 'anthropic:claude-sonnet-4-6';
 
 let _config: AIGatewayConfig | null = null;
 const _modelCache = new Map<string, any>();
+
+/**
+ * v0.31.12 recipe-models merge: per-gateway-instance set of model ids the
+ * user opted into via config. Keyed by provider id (`anthropic`, `openai`,
+ * etc.). Passed into `assertTouchpoint` so native-recipe allowlist checks
+ * skip these models — provider 404s surface at HTTP call time instead of
+ * config-build time.
+ *
+ * Replaces the earlier plan to soften `assertTouchpoint` from throw to
+ * warn (Codex F4/F5 — too broad, removed fail-fast for chat/expand/embed
+ * across all callers). This narrower approach preserves fail-fast for
+ * source-code typos while allowing config-time model selection of any id.
+ */
+const _extendedModels: Map<string, Set<string>> = new Map();
+
+/**
+ * v0.31.12 — register a model id under its provider so `assertTouchpoint`
+ * (called via the gateway's chat/embed/expand entry points) permits it
+ * even when it isn't in the recipe's declared `models:` array.
+ *
+ * Idempotent + safe to call before/after configureGateway. Exported only
+ * for the `gbrain models doctor` probe path (where the operator may want
+ * to probe any user-supplied id without re-running configure).
+ */
+function registerExtendedModel(modelStr: string): void {
+  if (!modelStr) return;
+  try {
+    const { providerId, modelId } = parseModelId(modelStr);
+    let set = _extendedModels.get(providerId);
+    if (!set) {
+      set = new Set();
+      _extendedModels.set(providerId, set);
+    }
+    set.add(modelId);
+  } catch {
+    // Malformed model strings will fail at parseModelId — ignore here;
+    // the actual chat/embed call will surface the error.
+  }
+}
+
+function getExtendedModelsForProvider(providerId: string): ReadonlySet<string> | undefined {
+  return _extendedModels.get(providerId);
+}
 
 /**
  * The function the gateway calls to actually run a batch through the AI SDK.
@@ -98,6 +143,139 @@ const MAX_VOYAGE_RESPONSE_BYTES = 256 * 1024 * 1024;
 
 class VoyageResponseSizeError extends Error {}
 
+// ---- Unified auth resolution (D12=A) ----
+//
+// Pre-v0.32, openai-compatible auth was duplicated across instantiateEmbedding,
+// instantiateExpansion, and instantiateChat with subtle drift (embedding had a
+// `${recipe.id.toUpperCase()}_API_KEY` fallback the other two lacked). D12=A
+// unifies all three through `Recipe.resolveAuth?(env)` with a sensible default
+// so existing recipes need zero code changes; only deviating recipes (Azure
+// with `api-key:` instead of `Authorization: Bearer`) override.
+
+/**
+ * Default auth resolver: returns `{headerName: 'Authorization', token: 'Bearer
+ * <key>'}` where `<key>` is the first present env var from `auth_env.required`,
+ * falling back to the first `auth_env.optional` entry, or 'unauthenticated'
+ * for fully no-auth recipes (Ollama). Throws AIConfigError when required env
+ * is missing.
+ *
+ * `touchpoint` is included in the error message so users know which call path
+ * triggered the missing-env error.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function defaultResolveAuth(
+  recipe: Recipe,
+  env: Record<string, string | undefined>,
+  touchpoint: 'embedding' | 'expansion' | 'chat',
+): { headerName: string; token: string } {
+  const required = recipe.auth_env?.required ?? [];
+  const optional = recipe.auth_env?.optional ?? [];
+
+  if (required.length === 0) {
+    // No-auth or optional-auth recipe (e.g. Ollama, llama-server). Read first
+    // present optional API-key env (ignoring URL-shaped names like
+    // OLLAMA_BASE_URL, which belong in cfg.base_urls, not auth). If none
+    // present, use 'unauthenticated' so createOpenAICompatible has something
+    // to put in Authorization (servers like Ollama / llama-server ignore it).
+    const optKey = optional.find(
+      k => !!env[k] && !/_(BASE_)?URL$/.test(k),
+    );
+    const token = optKey ? env[optKey]! : 'unauthenticated';
+    return { headerName: 'Authorization', token: `Bearer ${token}` };
+  }
+
+  const key = env[required[0]];
+  if (!key) {
+    throw new AIConfigError(
+      `${recipe.name} ${touchpoint} requires ${required[0]}.`,
+      recipe.setup_hint,
+    );
+  }
+  return { headerName: 'Authorization', token: `Bearer ${key}` };
+}
+
+/**
+ * Apply the recipe's auth resolver (or default) and translate the result into
+ * `createOpenAICompatible` options. Authorization-Bearer style returns
+ * `{apiKey}` (the SDK's native path); custom-header style returns `{headers}`
+ * with NO apiKey to avoid double-auth.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function applyResolveAuth(
+  recipe: Recipe,
+  cfg: AIGatewayConfig,
+  touchpoint: 'embedding' | 'expansion' | 'chat',
+): { apiKey?: string; headers?: Record<string, string> } {
+  const resolved = resolveRecipeAuthHeader(recipe, cfg, touchpoint);
+
+  // Bearer-via-Authorization: use the SDK's native apiKey path (which sets
+  // Authorization: Bearer <key> internally). Strip the 'Bearer ' prefix the
+  // resolver returned.
+  if (
+    resolved.headerName === 'Authorization' &&
+    resolved.token.startsWith('Bearer ')
+  ) {
+    return { apiKey: resolved.token.slice('Bearer '.length) };
+  }
+
+  // Custom header (Azure: api-key). Use headers; do NOT pass apiKey, or the
+  // SDK will also set Authorization and the server may reject double-auth.
+  return { headers: { [resolved.headerName]: resolved.token } };
+}
+
+function resolveRecipeAuthHeader(
+  recipe: Recipe,
+  cfg: AIGatewayConfig,
+  touchpoint: 'embedding' | 'expansion' | 'chat',
+): { headerName: string; token: string } {
+  const authConfig = cfg.provider_auth?.[recipe.id];
+  if (authConfig?.prefer === 'openclaw-codex' || authConfig?.prefer === 'openclaw-openai') {
+    const resolved = resolveProviderAuth(recipe, cfg);
+    const value = requireAuth(resolved, recipe, touchpoint);
+    const authEnv = { ...cfg.env };
+    const authKey =
+      recipe.auth_env?.required?.[0] ??
+      recipe.auth_env?.optional?.find(k => !/_(BASE_)?URL$/.test(k)) ??
+      'OPENAI_API_KEY';
+    authEnv[authKey] = value;
+    return recipe.resolveAuth
+      ? recipe.resolveAuth(authEnv)
+      : defaultResolveAuth(recipe, authEnv, touchpoint);
+  }
+
+  return recipe.resolveAuth
+    ? recipe.resolveAuth(cfg.env)
+    : defaultResolveAuth(recipe, cfg.env, touchpoint);
+}
+
+/**
+ * Resolve the openai-compatible URL + optional fetch wrapper. Defaults to
+ * `cfg.base_urls?.[recipe.id] ?? recipe.base_url_default` (the pre-v0.32
+ * behavior). Recipes whose URL is env-templated (Azure: needs endpoint +
+ * deployment + api-version) override `recipe.resolveOpenAICompatConfig` to
+ * build the URL and inject custom fetch behavior.
+ *
+ * @internal exported for tests.
+ */
+export function applyOpenAICompatConfig(
+  recipe: Recipe,
+  cfg: AIGatewayConfig,
+): { baseURL: string; fetch?: typeof fetch } {
+  if (recipe.resolveOpenAICompatConfig) {
+    return recipe.resolveOpenAICompatConfig(cfg.env);
+  }
+  const baseURL = cfg.base_urls?.[recipe.id] ?? recipe.base_url_default;
+  if (!baseURL) {
+    throw new AIConfigError(
+      `${recipe.name} requires a base URL.`,
+      recipe.setup_hint,
+    );
+  }
+  return { baseURL };
+}
+
 /** Configure the gateway. Called by cli.ts#connectEngine. Clears cached models. */
 export function configureGateway(config: AIGatewayConfig): void {
   _config = {
@@ -113,7 +291,84 @@ export function configureGateway(config: AIGatewayConfig): void {
   };
   _modelCache.clear();
   _shrinkState.clear();
+  _extendedModels.clear();
+  // Register configured models so assertTouchpoint allows them even when
+  // they aren't in the recipe's declared models: array (v0.31.12).
+  for (const m of [
+    _config.embedding_model,
+    _config.embedding_multimodal_model,
+    _config.expansion_model,
+    _config.chat_model,
+    ...(_config.chat_fallback_chain ?? []),
+  ]) {
+    if (m) registerExtendedModel(m);
+  }
   warnRecipesMissingBatchTokens();
+}
+
+/**
+ * v0.31.12 — async re-stamp seam.
+ *
+ * After `engine.connect()` succeeds, callers (today: `src/cli.ts`)
+ * invoke this to re-resolve the gateway's expansion / chat / embedding
+ * defaults through `resolveModel()` (which can read `models.tier.*` /
+ * `models.default` / per-task config keys from the engine). The pre-connect
+ * `configureGateway` path used hardcoded TIER_DEFAULTS as fallbacks;
+ * this re-stamp picks up any user overrides that live in the DB-backed
+ * config plane.
+ *
+ * Sync `configureGateway` stays for pre-connect callers (rare bootstrap
+ * paths like `gbrain --version` that never touch a brain). Per Codex F3
+ * in the v0.31.12 plan review: spelling out the sync→async boundary instead
+ * of hand-waving "config-build time."
+ *
+ * Idempotent. Safe to call multiple times. Returns the resolved gateway
+ * config for callers who want to inspect what landed.
+ */
+export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise<AIGatewayConfig> {
+  const cfg = requireConfig();
+  // Resolve expansion (utility tier) and chat (reasoning tier). Embedding is
+  // intentionally NOT re-resolved here — switching embedding models invalidates
+  // the vector index. Out of scope per v0.31.12 plan ("Embedding tier knob").
+  const newExpansion = await resolveModel(engine, {
+    configKey: 'models.expansion',
+    tier: 'utility',
+    fallback: cfg.expansion_model ?? DEFAULT_EXPANSION_MODEL,
+  });
+  const newChat = await resolveModel(engine, {
+    configKey: 'models.chat',
+    tier: 'reasoning',
+    fallback: cfg.chat_model ?? DEFAULT_CHAT_MODEL,
+  });
+
+  // Resolved values are bare model ids (e.g. `claude-sonnet-4-6`) — prepend
+  // the existing provider prefix from cfg so the gateway keeps routing to
+  // the right recipe. If the resolved string already contains a `:`, it
+  // came from a `provider:model` override and we use it as-is.
+  const expansionFull = newExpansion.includes(':') ? newExpansion : prefixWithProviderFrom(cfg.expansion_model ?? DEFAULT_EXPANSION_MODEL, newExpansion);
+  const chatFull = newChat.includes(':') ? newChat : prefixWithProviderFrom(cfg.chat_model ?? DEFAULT_CHAT_MODEL, newChat);
+
+  _config = { ...cfg, expansion_model: expansionFull, chat_model: chatFull };
+  _modelCache.clear();
+  _shrinkState.clear();
+  _extendedModels.clear();
+  for (const m of [
+    _config.embedding_model,
+    _config.embedding_multimodal_model,
+    _config.expansion_model,
+    _config.chat_model,
+    ...(_config.chat_fallback_chain ?? []),
+  ]) {
+    if (m) registerExtendedModel(m);
+  }
+  return _config;
+}
+
+/** Carry over the provider prefix from `original` when `bare` lacks one. */
+function prefixWithProviderFrom(original: string, bare: string): string {
+  const colon = original.indexOf(':');
+  if (colon === -1) return bare;
+  return `${original.slice(0, colon)}:${bare}`;
 }
 
 /**
@@ -142,6 +397,10 @@ function warnRecipesMissingBatchTokens(): void {
     // recipe; suppress the warning for it. Every other recipe missing the
     // field is suspicious.
     if (recipe.id === 'openai') continue;
+    // v0.32 (#779): explicit opt-out for dynamic-cap recipes (Ollama,
+    // LiteLLM proxy, llama-server) — they ship without a static cap because
+    // the cap depends on a user-launched server. Warning is noise for them.
+    if (embedding.no_batch_cap === true) continue;
     if (_warnedRecipes.has(recipe.id)) continue;
     _warnedRecipes.add(recipe.id);
     // eslint-disable-next-line no-console
@@ -160,6 +419,7 @@ export function resetGateway(): void {
   _embedTransport = embedMany;
   _chatTransport = null;
   _warnedRecipes.clear();
+  _extendedModels.clear();
 }
 
 /**
@@ -266,9 +526,16 @@ export function isAvailable(touchpoint: TouchpointKind): boolean {
     // mean "operator must supply a model", not "provider unavailable".
     // resolveRecipe(modelStr) already proved a concrete provider:model was configured.
 
-    // For openai-compatible without auth requirements (Ollama/LiteLLM local),
-    // the auth resolver returns the unauthenticated source as configured.
-    return resolveProviderAuth(recipe, _config!).isConfigured;
+    const auth = resolveProviderAuth(recipe, _config!);
+    if (!auth.isConfigured) return false;
+
+    // OpenAI-compatible recipes can also require URL/deployment config
+    // (Azure, local servers). Validate that side before advertising readiness.
+    if (recipe.implementation === 'openai-compatible') {
+      applyOpenAICompatConfig(recipe, _config!);
+    }
+
+    return true;
   } catch {
     return false;
   }
@@ -412,7 +679,7 @@ const voyageCompatFetch = (async (input: RequestInfo | URL, init?: RequestInit) 
 
 async function resolveEmbeddingProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
   const { parsed, recipe } = resolveRecipe(modelStr);
-  assertTouchpoint(recipe, 'embedding', parsed.modelId);
+  assertTouchpoint(recipe, 'embedding', parsed.modelId, getExtendedModelsForProvider(parsed.providerId));
   const cfg = requireConfig();
 
   const cacheKey = `emb:${recipe.id}:${parsed.modelId}:${cfg.base_urls?.[recipe.id] ?? ''}`;
@@ -457,26 +724,20 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
         `Anthropic has no embedding model. Use openai or google for embeddings.`,
       );
     case 'openai-compatible': {
-      const baseUrl = cfg.base_urls?.[recipe.id] ?? recipe.base_url_default;
-      if (!baseUrl) throw new AIConfigError(
-        `${recipe.name} requires a base URL.`,
-        recipe.setup_hint,
-      );
-      // For openai-compatible, auth is optional (ollama local) but pass a dummy key if unauthenticated.
-      const apiKey = auth.source === 'unauthenticated'
-        ? 'unauthenticated'
-        : requireAuth(auth, recipe, 'embedding');
+      // D12=A: unified auth via Recipe.resolveAuth (or default).
+      const auth = applyResolveAuth(recipe, cfg, 'embedding');
+      // v0.32: env-templated base URL + optional fetch wrapper for Azure.
+      const compat = applyOpenAICompatConfig(recipe, cfg);
+      // Voyage's openai-compat path needs voyageCompatFetch (translates
+      // request/response shape) when the recipe doesn't ship its own fetch
+      // wrapper via resolveOpenAICompatConfig. Azure recipes ship their own
+      // fetch (api-version splice); voyage doesn't — use voyageCompatFetch.
+      const fetchWrapper = compat.fetch ?? (recipe.id === 'voyage' ? voyageCompatFetch : undefined);
       const client = createOpenAICompatible({
         name: recipe.id,
-        baseURL: baseUrl,
-        apiKey: apiKey ?? 'unauthenticated',
-        // Voyage AI's `/v1/embeddings` endpoint is "OpenAI-compatible" only in URL
-        // shape; it rejects `encoding_format=float` (only `base64` is accepted) and
-        // ignores OpenAI's `dimensions` parameter (Voyage uses `output_dimension`).
-        // The default openai-compatible client sends `encoding_format=float`, which
-        // makes Voyage respond with HTTP 400 "Bad Request". Strip those fields
-        // before forwarding when targeting Voyage.
-        fetch: recipe.id === 'voyage' ? voyageCompatFetch : undefined,
+        baseURL: compat.baseURL,
+        ...(fetchWrapper ? { fetch: fetchWrapper } : {}),
+        ...auth,
       });
       return client.textEmbeddingModel(modelId);
     }
@@ -879,7 +1140,7 @@ void MULTIMODAL_MAX_IMAGE_BYTES;
 
 async function resolveExpansionProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
   const { parsed, recipe } = resolveRecipe(modelStr);
-  assertTouchpoint(recipe, 'expansion', parsed.modelId);
+  assertTouchpoint(recipe, 'expansion', parsed.modelId, getExtendedModelsForProvider(parsed.providerId));
   const cfg = requireConfig();
 
   const cacheKey = `exp:${recipe.id}:${parsed.modelId}:${cfg.base_urls?.[recipe.id] ?? ''}`;
@@ -907,15 +1168,15 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
       return createAnthropic({ apiKey }).languageModel(modelId);
     }
     case 'openai-compatible': {
-      const baseUrl = cfg.base_urls?.[recipe.id] ?? recipe.base_url_default;
-      if (!baseUrl) throw new AIConfigError(`${recipe.name} requires a base URL.`, recipe.setup_hint);
-      const apiKey = auth.source === 'unauthenticated'
-        ? 'unauthenticated'
-        : requireAuth(auth, recipe, 'expansion');
+      // D12=A: unified auth via Recipe.resolveAuth (or default).
+      const auth = applyResolveAuth(recipe, cfg, 'expansion');
+      // v0.32: env-templated base URL + optional fetch wrapper.
+      const compat = applyOpenAICompatConfig(recipe, cfg);
       return createOpenAICompatible({
         name: recipe.id,
-        baseURL: baseUrl,
-        apiKey,
+        baseURL: compat.baseURL,
+        ...(compat.fetch ? { fetch: compat.fetch } : {}),
+        ...auth,
       }).languageModel(modelId);
     }
   }
@@ -1080,7 +1341,7 @@ export interface ChatOpts {
 
 async function resolveChatProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
   const { parsed, recipe } = resolveRecipe(modelStr);
-  assertTouchpoint(recipe, 'chat', parsed.modelId);
+  assertTouchpoint(recipe, 'chat', parsed.modelId, getExtendedModelsForProvider(parsed.providerId));
   const cfg = requireConfig();
 
   const cacheKey = `chat:${recipe.id}:${parsed.modelId}:${cfg.base_urls?.[recipe.id] ?? ''}`;
@@ -1108,15 +1369,15 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
       return createAnthropic({ apiKey }).languageModel(modelId);
     }
     case 'openai-compatible': {
-      const baseUrl = cfg.base_urls?.[recipe.id] ?? recipe.base_url_default;
-      if (!baseUrl) throw new AIConfigError(`${recipe.name} requires a base URL.`, recipe.setup_hint);
-      const apiKey = auth.source === 'unauthenticated'
-        ? 'unauthenticated'
-        : requireAuth(auth, recipe, 'chat');
+      // D12=A: unified auth via Recipe.resolveAuth (or default).
+      const auth = applyResolveAuth(recipe, cfg, 'chat');
+      // v0.32: env-templated base URL + optional fetch wrapper.
+      const compat = applyOpenAICompatConfig(recipe, cfg);
       return createOpenAICompatible({
         name: recipe.id,
-        baseURL: baseUrl,
-        apiKey,
+        baseURL: compat.baseURL,
+        ...(compat.fetch ? { fetch: compat.fetch } : {}),
+        ...auth,
       }).languageModel(modelId);
     }
     default:
