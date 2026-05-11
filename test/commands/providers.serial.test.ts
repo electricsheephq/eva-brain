@@ -12,6 +12,7 @@ const chatMock = mock(async () => ({
 }));
 const probeOllamaMock = mock(async () => ({ reachable: false, models_endpoint_valid: false }));
 const probeLMStudioMock = mock(async () => ({ reachable: false, models_endpoint_valid: false }));
+const probeLlamaServerMock = mock(async () => ({ reachable: false, models_endpoint_valid: false }));
 const loadGbrainEnvMock = mock(() => ({ ...process.env }));
 const loadConfigMock = mock(() => ({
   embedding_model: 'openai:text-embedding-3-large',
@@ -55,6 +56,7 @@ mock.module('../../src/core/ai/gateway.ts', () => ({
 mock.module('../../src/core/ai/probes.ts', () => ({
   probeOllama: probeOllamaMock,
   probeLMStudio: probeLMStudioMock,
+  probeLlamaServer: probeLlamaServerMock,
 }));
 
 mock.module('../../src/core/config.ts', () => ({
@@ -78,6 +80,7 @@ describe('providers command auth hardening', () => {
     chatMock.mockClear();
     probeOllamaMock.mockClear();
     probeLMStudioMock.mockClear();
+    probeLlamaServerMock.mockClear();
     loadGbrainEnvMock.mockClear();
     loadConfigMock.mockClear();
     resolveProviderAuthMock.mockClear();
