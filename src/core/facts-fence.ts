@@ -229,8 +229,8 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
 
     const { text: claimText, struck } = stripStrikethrough(claimRaw);
     const context = parseStringCell(contextRaw);
-    const supersededBy = parseSupersededByFromContext(context);
-    const forgotten    = parseForgottenFromContext(context);
+    const supersededBy = struck ? parseSupersededByFromContext(context) : undefined;
+    const forgotten    = struck ? parseForgottenFromContext(context) : false;
 
     facts.push({
       rowNum,
@@ -245,7 +245,7 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
       context,
       active: !struck,
       supersededBy,
-      forgotten: struck ? forgotten : false,
+      forgotten,
     });
   }
 

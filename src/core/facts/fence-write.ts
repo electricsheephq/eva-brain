@@ -217,16 +217,20 @@ export async function writeFactsToFence(
       const newRowSet = new Set(assignedRowNums);
       const toInsert = allExtracted.filter(r => newRowSet.has(r.row_num));
 
-      // Carry per-input embedding + sessionId across — the fence
-      // parser doesn't reconstruct embeddings (they're not in the
-      // fence text) and source_session is runtime provenance that
-      // isn't a fence column either. Stitch them back by row_num
-      // index.
-      const enriched = toInsert.map((row, i) => ({
-        ...row,
-        embedding:      facts[i].embedding,
-        source_session: facts[i].sessionId,
-      }));
+      // Carry per-input embedding + sessionId across — the fence parser
+      // doesn't reconstruct embeddings and source_session is runtime
+      // provenance. Key by row_num instead of array position so filters
+      // or future ordering changes cannot attach provenance to the wrong
+      // fact row.
+      const inputByRowNum = new Map(assignedRowNums.map((rowNum, i) => [rowNum, facts[i]]));
+      const enriched = toInsert.map(row => {
+        const input = inputByRowNum.get(row.row_num);
+        return {
+          ...row,
+          embedding:      input?.embedding,
+          source_session: input?.sessionId,
+        };
+      });
 
       const result = await engine.insertFacts(enriched, { source_id: target.sourceId }); // gbrain-allow-direct-insert: writeFactsToFence is the markdown-first reconcile path; runs only after the atomic fence write commits
       return { inserted: result.inserted, ids: result.ids };

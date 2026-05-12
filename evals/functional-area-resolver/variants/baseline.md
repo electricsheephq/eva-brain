@@ -106,7 +106,7 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 - Personalized book analysis, "book mirror", "apply this book", … → `book-mirror`
 - Deep-retrieval book mirror, "extreme mirror", "go deep", … → `book-mirror/SKILL.md (deep retrieval is now the default)`
 - Freshness check, data source SLA monitoring, smoke test → `freshness-monitor`
-- Write as the owner: blog posts → `garry-voice`
+- Write as the owner: blog posts → `owner-voice`
 - Essay review, writing feedback, draft review → `essay-review`
 - Brain search/query, hybrid search, entity lookup; Brain maintenance, lint, backlinks, health checks → `gbrain`
 - "My ChatGPT conversations" → `conversation-history`
@@ -125,7 +125,7 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 - Upgrade gbrain, update gbrain, gbrain version → `gbrain-upgrade`
 - "Review my Dropbox archive", Dropbox folder audit, old Dropbox files → `dropbox-archive-review`
 - Screenshot style, apply style to screenshot → `screenshot-style`
-- Signorelli letter, draft formal letter → `signorelli-letter`
+- Signorelli letter, draft formal letter → `formal-letter`
 - Data loss prevention, confirm bulk delete → `data-loss-gate`
 - Public repo PII guard, check for secrets → `public-repo-guard`
 
@@ -150,7 +150,7 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 
 ### Executive assistant
 - Inbox triage, email reply, scheduling, calendar → `executive-assistant`
-- Gmail search, send email, draft reply via ClawVisor → `gmail`
+- Gmail search, send email, draft reply via credential-helper → `gmail`
 - Google Contacts lookup, search contacts, contact info → `google-contacts`
 - Personal logistics, schedule timeline, countdown deltas, time-aware foundation → `personal-logistics`
 - Intro health check, dropped handoffs, re-ping opportunities, intro tracker → `intro-reping`
@@ -162,8 +162,8 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 - Task add/remove/complete/defer/review → `daily-task-manager`
 - Morning task list prep (cron) → `daily-task-prep`
 - Business development, outreach tracking → `business-development`
-- Phone call handling (510-MY-GARRY) → `voice-agent`
-- Venus call ended, "Process this Venus call", voice session analysis → `voice-session-ingest`
+- Phone call handling (example-number) → `voice-agent`
+- voice-platform call ended, "Process this voice-platform call", voice session analysis → `voice-session-ingest`
 - Post-call analysis, "analyze the last call", "what happened on that call" → `venus-post-call`
 - "give me a link" → `voice-link`
 - OpenPhone/SMS (415-777-0000) → `quo`
@@ -216,7 +216,7 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 - Tweet deep ingest, deep tweet enrichment, article extraction from tweets → `tweet-deep-ingest`
 
 ### X/Twitter API - ENTERPRISE TIER
-**ALL X API work:** Read `skills/_x-api-rules.md` FIRST. We pay $50K/mo. Rate limit: 40K req/15min. Import `lib/x-api.mjs`. NEVER throttle to free-tier limits.
+**ALL social API work:** Read `skills/_x-api-rules.md` FIRST. We pay $50K/mo. Rate limit: 40K req/15min. Import `lib/x-api.mjs`. NEVER throttle to free-tier limits.
 
 ### Message intelligence
 - "Scan my DMs", "triage my messages", X DM triage, unified message extraction → `message-intel`
@@ -282,8 +282,8 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 - Container restart → `container-restart`
 - Zombie processes → `zombie-reaper`
 - Write to /tmp → `scratch-space`
-- ClawVisor service routing, Gmail/Calendar/Drive/Contacts/iMessage via ClawVisor → `clawvisor`
-- ClawVisor Shield proxy, credential vaulting, API audit → `clawvisor-shield`
+- credential-helper service routing, Gmail/Calendar/Drive/Contacts/iMessage via credential-helper → `credential-helper`
+- credential-helper Shield proxy, credential vaulting, API audit → `credential-helper-shield`
 - "What crons are running", recurring jobs, cron audit, scheduled tasks → `recurring-jobs`
 - Work on a PR → `acp-coding`
 - PR workflow, git worktree, dev checkout, "build this feature" → `repo-dev`
@@ -333,23 +333,23 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 - File archive ingestion, Dropbox, Google Drive import → `file-archive-ingestion`
 - "skillpackify", PR to gbrain, open source this skill, add to skillpack → `skillpackify`
 - Restart sweep, dropped messages, missed messages after restart → `restart-sweep`
-- Neuromancer coordination, agent handoffs, inter-agent tasks, "hand off to Neuromancer" → `neuromancer-coordination`
-- Inter-agent coordination, "Owner's Agents" group chat, the agent+Neuromancer collaboration, agent task claiming, brain write protocol; Bot-to-bot communication, /curtain protocol, agent volley limits, bot-to-bot setup, how agents talk to each other → `inter-agent-coordination`
+- delegate-agent coordination, agent handoffs, inter-agent tasks, "hand off to delegate-agent" → `delegate-agent-coordination`
+- Inter-agent coordination, "agent group" group chat, the agent+delegate-agent collaboration, agent task claiming, brain write protocol; Bot-to-bot communication, /curtain protocol, agent volley limits, bot-to-bot setup, how agents talk to each other → `inter-agent-coordination`
 
-**Internal data-source skills** (called by other skills, not directly): captain-api, crustdata, exa, happenstance, gmail, google-calendar, google-contacts, slack, clawvisor
+**Internal data-source skills** (called by other skills, not directly): captain-api, crustdata, exa, happenstance, gmail, google-calendar, google-contacts, slack, credential-helper
 
 
-## Neuromancer Delegation (Cross-Topic)
+## delegate-agent Delegation (Cross-Topic)
 
-**In ANY topic**, if a task would benefit from Neuromancer's capabilities, delegate it by posting a `[TASK]` message to the "Owner's Agents" group (thread 1, group -<GROUP_ID>).
+**In ANY topic**, if a task would benefit from delegate-agent's capabilities, delegate it by posting a `[TASK]` message to the "agent group" group (thread 1, group -<GROUP_ID>).
 
-**Neuromancer is good at:** Web research, browser automation, coding/PRs, X posting (via xurl), Google Workspace ops, on-demand analysis, skill building.
+**delegate-agent is good at:** Web research, browser automation, coding/PRs, social posting (via xurl), Google Workspace ops, on-demand analysis, skill building.
 
-**the agent keeps:** Brain DB, cron/scheduled ops, X API (Enterprise keys), email sweeps (ClawVisor), memory consolidation, social radar, embedding/indexing.
+**the agent keeps:** brain database, cron/scheduled ops, social API (Enterprise keys), email sweeps (credential-helper), memory consolidation, social radar, embedding/indexing.
 
-**Protocol:** Prefix structured messages with `[TASK]`, `[RESULT]`, or `[QUERY]`. Neuromancer monitors the topic in real-time. Include enough context that Neuromancer can act without asking follow-ups. Reference brain pages by path.
+**Protocol:** Prefix structured messages with `[TASK]`, `[RESULT]`, or `[QUERY]`. delegate-agent monitors the topic in real-time. Include enough context that delegate-agent can act without asking follow-ups. Reference brain pages by path.
 
-**Don't delegate silently.** If the owner asked for something in another topic and you're handing it to Neuromancer, tell the owner in that topic: "Handing this to Neuromancer" with a one-liner on what you asked for.
+**Don't delegate silently.** If the owner asked for something in another topic and you're handing it to delegate-agent, tell the owner in that topic: "Handing this to delegate-agent" with a one-liner on what you asked for.
 
 ## Memory (Operational)
 

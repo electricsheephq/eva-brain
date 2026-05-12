@@ -87,7 +87,7 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 - Inline buttons / user decision gate → `ask-user`
 
 ### Functional Areas
-- **Brain & knowledge**: create/enrich/search/export brain pages, filing, citations, publishing, book analysis, strategic reading, concept synthesis, archive mining, conversation history → `brain-ops` (dispatcher for: enrich, query, brain-pdf, brain-publish, brain-export, brain-plan, brain-librarian, brain-commit, brain-storage, brain-storage-links, citation-fixer, repo-architecture, book-mirror, book-mirror-extreme, book-mirror-synthesis, strategic-reading, concept-synthesis, archive-crawler, conversation-history, conversation-enrichment, garry-voice, essay-review, fact-check, takes-extraction, gbrain, gbrain-upgrade, benchmark-gbrain, freshness-monitor, dropbox-archive-review, bulk-skillify, x-handle-enrich, person-score)
+- **Brain & knowledge**: create/enrich/search/export brain pages, filing, citations, publishing, book analysis, strategic reading, concept synthesis, archive mining, conversation history → `brain-ops` (dispatcher for: enrich, query, brain-pdf, brain-publish, brain-export, brain-plan, brain-librarian, brain-commit, brain-storage, brain-storage-links, citation-fixer, repo-architecture, book-mirror, book-mirror-extreme, book-mirror-synthesis, strategic-reading, concept-synthesis, archive-crawler, conversation-history, conversation-enrichment, owner-voice, essay-review, fact-check, takes-extraction, gbrain, gbrain-upgrade, benchmark-gbrain, freshness-monitor, dropbox-archive-review, bulk-skillify, x-handle-enrich, person-score)
 - **Content ingestion**: ingest links/articles/PDFs/video/audio/tweets/books/meetings/voice notes, transcription, media enrichment → `ingest` (dispatcher for: media-ingest, meeting-ingestion, meeting-digest, meeting-gold-standard, meeting-signal-pass, voice-note-ingest, article-enrichment, post-ingestion-enrichment, media-enrichment, book-acquisition, annas-archive, pdf-ingest, tweet-deep-ingest, substack-ingest, pocket-ingest, investor-update-ingest, yc-ingest, yc-oh-ingest, yc-app-ingest, yc-meeting-ingest, kindle-library, therapy-ingest, transcript-save, file-archive-ingestion, idea-ingest)
 - **Calendar & scheduling**: schedule, events, conflicts, sync, prep, travel booking, time/location → `google-calendar` (dispatcher for: calendar-event-create, calendar-check, calendar-sync, calendar-recall, calendar-travel-setup, meeting-prep, interview-prep, context-now, jet-lag, location-inference)
 - **Email & comms**: inbox triage, email search/send, iMessage, Slack, unsubscribe, Front API → `executive-assistant` (dispatcher for: gmail, email-triage, email-unsubscribe, cold-email-lookup, cold-pitch-scorer, front-api, slack, intro-reping, startup-intro, investigate-no-response)
@@ -95,27 +95,27 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 - **X/Twitter & social**: tweets, social monitoring, adversary tracking, content strategy, DM triage → `x-ingest` (dispatcher for: adversary-tracking, social-radar, x-daily-quality, x-concept-tier, social-json-store, detect-astroturf, real-name-hostiles, investigate-x-anon, anti-dunk, clapback, tweet-draft, tweet-composition, tweet-shield, journo-dunk, hater-tracker, message-intel, yc-media-monitor, yc-competitor-oppo, yc-booster-tracker, steph-instagram, content-ideas)
 - **Places & travel**: checkins, restaurants, showtimes, trip logistics → `checkin` (dispatcher for: trip-logistics, trip-ingest, showtimes, personal-logistics)
 - **Product & building**: CEO review, code, debugging, skill creation, testing, refactoring, PR management → `acp-coding` (dispatcher for: gstack-openclaw-ceo-review, gstack-openclaw-investigate, gstack-openclaw-office-hours, gstack-openclaw-retro, skill-creator, skillify, testing, durable-service, refactor, narrative, budget-roi, fail-improve-loop, weekly-essay, printing-press, cross-modal-review, cross-modal-eval)
-- **Infrastructure**: tunnels, containers, services, crons, GitHub, browser automation, security → `healthcheck` (dispatcher for: ngrok-verify, system-load, container-restart, zombie-reaper, scratch-space, clawvisor, clawvisor-shield, recurring-jobs, github-repo, github-agents, gbrain-pr, captcha-solver, qr-code, browser, browser-use, gstack-browse, binary-deps, pixel-match, nordvpn-proxy, channel-discovery, durable-service, data-loss-gate, public-repo-guard, web-archive, security-audit)
+- **Infrastructure**: tunnels, containers, services, crons, GitHub, browser automation, security → `healthcheck` (dispatcher for: ngrok-verify, system-load, container-restart, zombie-reaper, scratch-space, credential-helper, credential-helper-shield, recurring-jobs, github-repo, github-agents, gbrain-pr, captcha-solver, qr-code, browser, browser-use, gstack-browse, binary-deps, pixel-match, nordvpn-proxy, channel-discovery, durable-service, data-loss-gate, public-repo-guard, web-archive, security-audit)
 - **People & contacts**: Google contacts, face detection/identification, people enrichment → `google-contacts` (dispatcher for: face-detect, identify-faces, enrich)
 - **Tasks & logistics**: daily tasks, reminders, briefings, business dev, flight tracking, voice calls → `daily-task-manager` (dispatcher for: daily-task-prep, business-development, flight-tracker, voice-agent, voice-session-ingest, venus-post-call, voice-link, voice-call-enrich, quo, checkin)
 - **Political**: donation tracking, voter guides, civic intel → `political-donations` (dispatcher for: voter-guide, voter-guide-extract, fiscal-forensics)
-- **Inter-agent**: Neuromancer delegation, agent coordination → `inter-agent-coordination` (dispatcher for: neuromancer-coordination)
+- **Inter-agent**: delegate-agent delegation, agent coordination → `inter-agent-coordination` (dispatcher for: delegate-agent-coordination)
 - **Circleback**: meeting search → `circleback-cli`
 
-**Internal data-source skills** (called by other skills, not directly): captain-api, crustdata, exa, happenstance, gmail, google-calendar, google-contacts, slack, clawvisor
+**Internal data-source skills** (called by other skills, not directly): captain-api, crustdata, exa, happenstance, gmail, google-calendar, google-contacts, slack, credential-helper
 
 
-## Neuromancer Delegation (Cross-Topic)
+## delegate-agent Delegation (Cross-Topic)
 
-**In ANY topic**, if a task would benefit from Neuromancer's capabilities, delegate it by posting a `[TASK]` message to the "Owner's Agents" group (thread 1, group -<GROUP_ID>).
+**In ANY topic**, if a task would benefit from delegate-agent's capabilities, delegate it by posting a `[TASK]` message to the "agent group" group (thread 1, group -<GROUP_ID>).
 
-**Neuromancer is good at:** Web research, browser automation, coding/PRs, X posting (via xurl), Google Workspace ops, on-demand analysis, skill building.
+**delegate-agent is good at:** Web research, browser automation, coding/PRs, social posting (via xurl), Google Workspace ops, on-demand analysis, skill building.
 
-**the agent keeps:** Brain DB, cron/scheduled ops, X API (Enterprise keys), email sweeps (ClawVisor), memory consolidation, social radar, embedding/indexing.
+**the agent keeps:** brain database, cron/scheduled ops, social API (Enterprise keys), email sweeps (credential-helper), memory consolidation, social radar, embedding/indexing.
 
-**Protocol:** Prefix structured messages with `[TASK]`, `[RESULT]`, or `[QUERY]`. Neuromancer monitors the topic in real-time. Include enough context that Neuromancer can act without asking follow-ups. Reference brain pages by path.
+**Protocol:** Prefix structured messages with `[TASK]`, `[RESULT]`, or `[QUERY]`. delegate-agent monitors the topic in real-time. Include enough context that delegate-agent can act without asking follow-ups. Reference brain pages by path.
 
-**Don't delegate silently.** If the owner asked for something in another topic and you're handing it to Neuromancer, tell the owner in that topic: "Handing this to Neuromancer" with a one-liner on what you asked for.
+**Don't delegate silently.** If the owner asked for something in another topic and you're handing it to delegate-agent, tell the owner in that topic: "Handing this to delegate-agent" with a one-liner on what you asked for.
 
 ## Memory (Operational)
 

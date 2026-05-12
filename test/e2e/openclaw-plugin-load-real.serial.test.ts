@@ -7,7 +7,7 @@
  *
  * Why this exists:
  *   The unit/e2e tests in test/context-engine.test.ts and
- *   test/e2e/openclaw-context-engine-plugin.test.ts both run STANDALONE —
+ *   test/e2e/openclaw-context-engine-plugin.serial.test.ts both run STANDALONE —
  *   they mock the OpenClaw SDK or call our engine factory directly. Codex
  *   outside-voice F1 flagged that nothing in the repo proves OpenClaw's
  *   actual plugin loader walks our entry file, calls register(api), and
@@ -18,7 +18,7 @@
  *      ship to ClawHub).
  *   2. `openclaw plugins install --link` against an isolated `--profile`
  *      directory.
- *   3. `openclaw plugins inspect <id> --json` reads our default-export shape
+ *   3. `openclaw plugins inspect <id> --runtime --json` reads our default-export shape
  *      back from the runtime registry (`status: 'loaded'`, `imported: true`,
  *      id/name/description match).
  *   4. `openclaw config set plugins.slots.contextEngine gbrain-context` →
@@ -128,17 +128,18 @@ describe('openclaw-plugin-load-real (Tier 2 e2e)', () => {
       [
         'build',
         join(repoRoot, 'src', 'openclaw-context-engine.ts'),
-        '--target=bun',
+        '--target=node',
+        '--format=cjs',
         '--outfile',
-        join(fixtureDir, 'entry.js'),
+        join(fixtureDir, 'entry.cjs'),
       ],
       { encoding: 'utf8', timeout: 60_000 },
     );
     if (buildResult.status !== 0) {
       throw new Error(`bun build failed (exit ${buildResult.status}): ${buildResult.stderr}`);
     }
-    if (!existsSync(join(fixtureDir, 'entry.js'))) {
-      throw new Error('bun build did not produce entry.js');
+    if (!existsSync(join(fixtureDir, 'entry.cjs'))) {
+      throw new Error('bun build did not produce entry.cjs');
     }
 
     // Install via openclaw plugins install --link into the isolated profile.
@@ -167,7 +168,7 @@ describe('openclaw-plugin-load-real (Tier 2 e2e)', () => {
   it.skipIf(SKIP)(
     'openclaw imports the entry file and reports status=loaded',
     () => {
-      const r = runOpenclaw(['plugins', 'inspect', PLUGIN_ID, '--json'], { timeoutMs: 30_000 });
+      const r = runOpenclaw(['plugins', 'inspect', PLUGIN_ID, '--runtime', '--json'], { timeoutMs: 30_000 });
       expect(r.exitCode).toBe(0);
 
       const inspect = JSON.parse(r.stdout);
@@ -177,13 +178,14 @@ describe('openclaw-plugin-load-real (Tier 2 e2e)', () => {
       expect(inspect.plugin.status).toBe('loaded');
       expect(inspect.plugin.imported).toBe(true);
       expect(inspect.plugin.activated).toBe(true);
+      expect(inspect.plugin.contextEngineIds).toContain(ENGINE_ID);
     },
   );
 
   it.skipIf(SKIP)(
     'default export carries the expected id / name / description metadata',
     () => {
-      const r = runOpenclaw(['plugins', 'inspect', PLUGIN_ID, '--json'], { timeoutMs: 30_000 });
+      const r = runOpenclaw(['plugins', 'inspect', PLUGIN_ID, '--runtime', '--json'], { timeoutMs: 30_000 });
       expect(r.exitCode).toBe(0);
       const inspect = JSON.parse(r.stdout);
 
@@ -198,22 +200,16 @@ describe('openclaw-plugin-load-real (Tier 2 e2e)', () => {
   it.skipIf(SKIP)(
     'register(api) ran without producing error-level diagnostics',
     () => {
-      const r = runOpenclaw(['plugins', 'inspect', PLUGIN_ID, '--json'], { timeoutMs: 30_000 });
+      const r = runOpenclaw(['plugins', 'inspect', PLUGIN_ID, '--runtime', '--json'], { timeoutMs: 30_000 });
       expect(r.exitCode).toBe(0);
       const inspect = JSON.parse(r.stdout);
 
       const errors = (inspect.diagnostics ?? []).filter((d: { level: string }) => d.level === 'error');
       expect(errors).toEqual([]);
 
-      // The trust warning is expected for --link installs — it's openclaw
-      // telling the operator that --link bypasses install-record provenance.
-      // We assert it's there so a future openclaw change that elevates it to
-      // error-level surfaces here too.
-      const warns = (inspect.diagnostics ?? []).filter((d: { level: string }) => d.level === 'warn');
-      const hasTrustWarning = warns.some((d: { message: string }) =>
-        d.message.includes('install/load-path provenance'),
-      );
-      expect(hasTrustWarning).toBe(true);
+      // Some OpenClaw builds warn for linked test fixtures, newer ones stay
+      // quiet when --dangerously-force-unsafe-install was explicit. Error
+      // diagnostics are the stable contract.
     },
   );
 

@@ -5,6 +5,6 @@
   "description": "Test-time fixture for openclaw-loads-the-plugin e2e",
   "openclaw": {
     "id": "gbrain-context-engine",
-    "extensions": ["./entry.js"]
+    "extensions": ["./entry.cjs"]
   }
 }

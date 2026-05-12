@@ -269,14 +269,18 @@ function getTimeInTz(tz: string): { iso: string; dayOfWeek: string; hour: number
   const parts = fmt.formatToParts(now);
   const get = (t: string) => parts.find(p => p.type === t)?.value ?? '00';
 
-  const utcH = now.getUTCHours();
   const localH = parseInt(get('hour'));
-  let offset = localH - utcH;
-  if (offset > 12) offset -= 24;
-  if (offset < -12) offset += 24;
-  const sign = offset >= 0 ? '+' : '-';
-  const abs = Math.abs(offset);
-  const offsetStr = `${sign}${String(abs).padStart(2, '0')}:00`;
+  const tzParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    timeZoneName: 'shortOffset',
+    hour: '2-digit',
+  }).formatToParts(now);
+  const tzName = tzParts.find(p => p.type === 'timeZoneName')?.value ?? 'GMT';
+  const m = tzName.match(/^GMT(?:(?<sign>[+-])(?<hours>\d{1,2})(?::?(?<minutes>\d{2}))?)?$/);
+  const sign = m?.groups?.sign ?? '+';
+  const hours = m?.groups?.hours ? Number(m.groups.hours) : 0;
+  const minutes = m?.groups?.minutes ? Number(m.groups.minutes) : 0;
+  const offsetStr = `${sign}${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
 
   const iso = `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}${offsetStr}`;
   const dayOfWeek = now.toLocaleDateString('en-US', { timeZone: tz, weekday: 'long' });
@@ -289,11 +293,17 @@ function resolveLocation(
   flights: FlightData | null,
 ): { city: string; tz: string; source: string } {
   if (hb?.currentLocation?.timezone) {
-    return {
-      city: hb.currentLocation.city ?? DEFAULT_HOME,
-      tz: hb.currentLocation.timezone,
-      source: hb.currentLocation.source ?? 'heartbeat',
-    };
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: hb.currentLocation.timezone }).format(new Date());
+      return {
+        city: hb.currentLocation.city ?? DEFAULT_HOME,
+        tz: hb.currentLocation.timezone,
+        source: hb.currentLocation.source ?? 'heartbeat',
+      };
+    } catch {
+      // Fall through to active-flight or default resolution instead of
+      // throwing during context assembly.
+    }
   }
 
   // Heartbeat has no tz. Check flights.
@@ -337,7 +347,8 @@ function resolveActivity(
   }
 
   // Check staleness: if cache is >6 hours old, flag it
-  const lastUpdated = cache.lastUpdated ? new Date(cache.lastUpdated).getTime() : 0;
+  const parsedLastUpdated = cache.lastUpdated ? new Date(cache.lastUpdated).getTime() : 0;
+  const lastUpdated = Number.isNaN(parsedLastUpdated) ? 0 : parsedLastUpdated;
   const calendarStale = (nowMs - lastUpdated) > 6 * 60 * 60 * 1000;
 
   const LOOKAHEAD_MS = 4 * 60 * 60 * 1000; // next 4 hours

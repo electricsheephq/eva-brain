@@ -94,7 +94,7 @@
 **Priority:** P1
 **Filed:** 2026-05-08 from v0.31.2 bug report (separate from the sync hang).
 
-**Evidence:** Two `bun /Users/garrytan/.bun/bin/gbrain query the` processes
+**Evidence:** Two `bun /Users/example-user/.bun/bin/gbrain query the` processes
 (PIDs 39429, 46624) on the user's Mac were pegged at 99% CPU for 7
 straight days before being killed manually. Each used 6+ GB resident
 memory. Originated from the `algiers-v3` worktree. Not walker-related
@@ -662,12 +662,12 @@ After the sweep, both should be fixable and renameable back to plain `*.test.ts`
 ### CI-skip artifact + signature for stages 1+2 follow-up
 **Priority:** P0
 
-**What:** After a successful local CI run via `bun run ci:local`, write `.ci-cache/passed-<commit-sha>.json` containing `{commit, test_set_hash, bun_version, schema_hash, signature}`. Push to a `ci-cache` orphan branch (or GH Releases). CI's first step fetches the artifact for the current SHA and skips the test job if (a) signature matches Garry's GPG/SSH key, and (b) `test_set_hash` matches what CI would have run.
+**What:** After a successful local CI run via `bun run ci:local`, write `.ci-cache/passed-<commit-sha>.json` containing `{commit, test_set_hash, bun_version, schema_hash, signature}`. Push to a `ci-cache` orphan branch (or GH Releases). CI's first step fetches the artifact for the current SHA and skips the test job if (a) signature matches the operator's GPG/SSH key, and (b) `test_set_hash` matches what CI would have run.
 
-**Why:** Stages 1+2 (shipped in this branch) give a strong local CI gate, but PR CI still re-runs every test on every push. Stage 3 closes the loop and trades ~10 min of CI wall-time for sub-second artifact verification on Garry's own pushes. External PRs are unaffected because the signature won't match — they hit the normal CI path.
+**Why:** Stages 1+2 (shipped in this branch) give a strong local CI gate, but PR CI still re-runs every test on every push. Stage 3 closes the loop and trades ~10 min of CI wall-time for sub-second artifact verification on the operator's own pushes. External PRs are unaffected because the signature won't match — they hit the normal CI path.
 
 **Pros:**
-- ~10 min/PR saved on Garry's own pushes; the local gate becomes the source of truth.
+- ~10 min/PR saved on the operator's own pushes; the local gate becomes the source of truth.
 - External contributor PRs untouched (no security regression).
 - Forces a clear test-set-hash contract: any drift in what local-vs-CI run is caught at verification time.
 
@@ -786,7 +786,7 @@ After the sweep, both should be fixable and renameable back to plain `*.test.ts`
 ### Public scoreboard — `gbrain-evals.io/friction`
 **Priority:** P3
 
-**What:** Sibling-repo PR in `garrytan/gbrain-evals` that renders friction JSONL into a public dashboard. Friction count per version per agent, line charts over time. v1's JSONL already includes `gbrain_version` + `agent` tags so the scoreboard is a thin layer on top.
+**What:** Sibling-repo PR in `example/gbrain-evals` that renders friction JSONL into a public dashboard. Friction count per version per agent, line charts over time. v1's JSONL already includes `gbrain_version` + `agent` tags so the scoreboard is a thin layer on top.
 
 **Why:** Marketing surface. Proves install quality is improving release-over-release. The friction loop becomes visible to the world, not just maintainers.
 
@@ -845,7 +845,7 @@ TTL is 30 min; new cycles give up before that. Doctor reports UNHEALTHY.
 
 **The chain in production:** ~5min cron submits cycle → 22K stale pages →
 embed phase takes 10–15 min → 600s timeout fires → job dead-lettered → embed
-keeps running → lock held → all subsequent cycles skip. Garry hits this
+keeps running → lock held → all subsequent cycles skip. the operator hits this
 DAILY on his production brain.
 
 **Pros:** Closes the daily wedge. Makes timeouts actually effective. Lets
@@ -1381,7 +1381,7 @@ iteration's residuals.
 
 **Cons:** Requires adding `sender_id` or `access_tier` to `OperationContext`. Each mutating operation needs a permission check. Medium implementation effort.
 
-**Context:** From CEO review + Codex outside voice (2026-04-13). Prompt-layer access control works in practice (same model as Garry's OpenClaw) but is not sufficient for remote MCP where direct tool calls bypass the agent's prompt.
+**Context:** From CEO review + Codex outside voice (2026-04-13). Prompt-layer access control works in practice (same model as the operator's OpenClaw) but is not sufficient for remote MCP where direct tool calls bypass the agent's prompt.
 
 **Depends on:** v0.10.0 GStackBrain skill layer (shipped).
 
@@ -1424,7 +1424,7 @@ iteration's residuals.
 
 **Effort:** 30 min for option 1, ~2 hours for option 3.
 
-**Context:** Noticed during /ship merge wave on `garrytan/mcp-key-mgmt` (2026-04-16 branch merge of v0.18.0). Failure set stayed exactly 17-18 tests across multiple /ship runs, confirming deterministic flakes rather than real regressions. Blocking workaround: run the specific test file to verify after any suite change.
+**Context:** Noticed during /ship merge wave on `example-org/mcp-key-mgmt` (2026-04-16 branch merge of v0.18.0). Failure set stayed exactly 17-18 tests across multiple /ship runs, confirming deterministic flakes rather than real regressions. Blocking workaround: run the specific test file to verify after any suite change.
 
 ## P1 (new from v0.11.0 — Minions)
 
@@ -1796,8 +1796,8 @@ doesn't gate on scopes. Adding per-tool scope enforcement would let
 
 ---
 
-### `@garrytan/gbrain` scoped-name npm publishing
-**What:** Publish gbrain to npm under the scoped name `@garrytan/gbrain`
+### `@example/gbrain` scoped-name npm publishing
+**What:** Publish gbrain to npm under the scoped name `@example/gbrain`
 instead of the bare `gbrain` name. Provides structural defense against the
 unrelated `gbrain@1.x` squatter package on npm.
 
@@ -1805,7 +1805,7 @@ unrelated `gbrain@1.x` squatter package on npm.
 best-effort fingerprint check on `repository.url` + `src/cli.ts` marker, with
 the comment explicitly accepting that signals are spoofable by a determined
 squatter. Scoped publishing is the structural answer that closes the loop:
-`bun add -g @garrytan/gbrain` cannot collide with any non-`@garrytan` package.
+`bun add -g @example/gbrain` cannot collide with any non-`@example-org` package.
 
 **Pros:** closes the squatter vector; consistent with how high-trust npm
 packages are published; allows removing `classifyBunInstall`'s spoofable
@@ -1910,7 +1910,7 @@ embedded offset string is wrong. Fix: use `Intl.DateTimeFormat` with
 ### DST-boundary test (deferred)
 
 **What:** Lock in `getTimeInTz` behavior across spring-forward / fall-back
-transitions. Edge case but real if Garry travels during a transition window.
+transitions. Edge case but real if the operator travels during a transition window.
 
 ### Multibyte sanitizer test (deferred)
 

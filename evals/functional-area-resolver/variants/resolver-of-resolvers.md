@@ -99,23 +99,23 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 - **People & contacts**: Google contacts, face detection/identification, people enrichment → `google-contacts`
 - **Tasks & logistics**: daily tasks, reminders, briefings, business dev, flight tracking, voice calls → `daily-task-manager`
 - **Political**: donation tracking, voter guides, civic intel → `political-donations`
-- **Inter-agent**: Neuromancer delegation, agent coordination → `inter-agent-coordination`
+- **Inter-agent**: delegate-agent delegation, agent coordination → `inter-agent-coordination`
 - **Circleback**: meeting search → `circleback-cli`
 
-**Internal data-source skills** (called by other skills, not directly): captain-api, crustdata, exa, happenstance, gmail, google-calendar, google-contacts, slack, clawvisor
+**Internal data-source skills** (called by other skills, not directly): captain-api, crustdata, exa, happenstance, gmail, google-calendar, google-contacts, slack, credential-helper
 
 
-## Neuromancer Delegation (Cross-Topic)
+## delegate-agent Delegation (Cross-Topic)
 
-**In ANY topic**, if a task would benefit from Neuromancer's capabilities, delegate it by posting a `[TASK]` message to the "Owner's Agents" group (thread 1, group -<GROUP_ID>).
+**In ANY topic**, if a task would benefit from delegate-agent's capabilities, delegate it by posting a `[TASK]` message to the "agent group" group (thread 1, group -<GROUP_ID>).
 
-**Neuromancer is good at:** Web research, browser automation, coding/PRs, X posting (via xurl), Google Workspace ops, on-demand analysis, skill building.
+**delegate-agent is good at:** Web research, browser automation, coding/PRs, social posting (via xurl), Google Workspace ops, on-demand analysis, skill building.
 
-**the agent keeps:** Brain DB, cron/scheduled ops, X API (Enterprise keys), email sweeps (ClawVisor), memory consolidation, social radar, embedding/indexing.
+**the agent keeps:** brain database, cron/scheduled ops, social API (Enterprise keys), email sweeps (credential-helper), memory consolidation, social radar, embedding/indexing.
 
-**Protocol:** Prefix structured messages with `[TASK]`, `[RESULT]`, or `[QUERY]`. Neuromancer monitors the topic in real-time. Include enough context that Neuromancer can act without asking follow-ups. Reference brain pages by path.
+**Protocol:** Prefix structured messages with `[TASK]`, `[RESULT]`, or `[QUERY]`. delegate-agent monitors the topic in real-time. Include enough context that delegate-agent can act without asking follow-ups. Reference brain pages by path.
 
-**Don't delegate silently.** If the owner asked for something in another topic and you're handing it to Neuromancer, tell the owner in that topic: "Handing this to Neuromancer" with a one-liner on what you asked for.
+**Don't delegate silently.** If the owner asked for something in another topic and you're handing it to delegate-agent, tell the owner in that topic: "Handing this to delegate-agent" with a one-liner on what you asked for.
 
 ## Memory (Operational)
 

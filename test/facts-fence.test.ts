@@ -176,11 +176,11 @@ describe('parseFactsFence — strikethrough semantics (Codex R2-#3 contract)', (
   });
 
   test('NO strikethrough but context contains "superseded by #N" → active stays true, supersededBy NOT populated', () => {
-    // The strikethrough is the trigger. A row whose claim text mentions
+    // The strikethrough is the trigger. A row whose context mentions
     // superseded but isn't struck-through stays active. Prevents a stray
     // mention in `context` from inadvertently marking a row inactive.
     const body = wrapFenceBody(
-      `| 1 | Talked about the superseded by #3 issue | fact | 1.0 | world | medium | 2026-01-01 |  | src |  |`,
+      `| 1 | Talked about the issue | fact | 1.0 | world | medium | 2026-01-01 |  | src | superseded by #3 |`,
     );
     const r = parseFactsFence(body);
     expect(r.facts[0].active).toBe(true);

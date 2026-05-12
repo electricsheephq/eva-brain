@@ -301,6 +301,26 @@ describe('gbrain-context engine', () => {
     expect(result.systemPromptAddition).toContain('Calendar cache >6h old');
   });
 
+  it('treats invalid calendar timestamps as stale', async () => {
+    tmpDir = makeWorkspace({
+      heartbeat: { garryAwake: true },
+      calendar: {
+        lastUpdated: 'not-a-date',
+        events: [
+          { summary: 'Planning sync', start: new Date(Date.now() + 30 * 60 * 1000).toISOString() },
+        ],
+      },
+    });
+    const engine = createGBrainContextEngine({ workspaceDir: tmpDir });
+
+    const result = await engine.assemble({
+      sessionId: 'test-session',
+      messages: [],
+    });
+
+    expect(result.systemPromptAddition).toContain('Calendar cache >6h old');
+  });
+
   it('injects open tasks from ops/tasks.md', async () => {
     tmpDir = makeWorkspace({
       heartbeat: { garryAwake: true },
@@ -365,6 +385,42 @@ describe('gbrain-context engine', () => {
     expect(result.systemPromptAddition).toContain('flight:AC8');
     // Home time should appear because we're not in PT
     expect(result.systemPromptAddition).toContain('Home (SF)');
+  });
+
+  it('heartbeat timezone with partial-hour offset renders the correct ISO offset', async () => {
+    tmpDir = makeWorkspace({
+      heartbeat: {
+        garryAwake: true,
+        currentLocation: { city: 'Kathmandu', timezone: 'Asia/Kathmandu' },
+      },
+    });
+    const engine = createGBrainContextEngine({ workspaceDir: tmpDir });
+
+    const result = await engine.assemble({
+      sessionId: 'test-session',
+      messages: [],
+    });
+
+    expect(result.systemPromptAddition).toContain('Asia/Kathmandu');
+    expect(result.systemPromptAddition).toMatch(/\+05:45/);
+  });
+
+  it('invalid heartbeat timezone falls back instead of crashing context assembly', async () => {
+    tmpDir = makeWorkspace({
+      heartbeat: {
+        garryAwake: true,
+        currentLocation: { city: 'Bad Zone', timezone: 'Not/A_Real_Timezone' },
+      },
+    });
+    const engine = createGBrainContextEngine({ workspaceDir: tmpDir });
+
+    const result = await engine.assemble({
+      sessionId: 'test-session',
+      messages: [],
+    });
+
+    expect(result.systemPromptAddition).toContain('US/Pacific');
+    expect(result.systemPromptAddition).not.toContain('Not/A_Real_Timezone');
   });
 
   it('L0-A: active flight to an UNKNOWN airport emits NO concrete local time', async () => {

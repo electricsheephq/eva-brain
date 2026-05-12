@@ -12,7 +12,7 @@
  * Real PGLite + tempdir filesystem.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,6 +21,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { chunkText } from '../src/core/chunkers/recursive.ts';
 import { forgetFactInFence } from '../src/core/facts/forget.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from '../src/core/facts-fence.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 let engine: PGLiteEngine;
 let brainDir: string;
@@ -37,10 +38,19 @@ afterAll(async () => {
 
 beforeEach(async () => {
   brainDir = mkdtempSync(join(tmpdir(), 'privacy-test-'));
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (engine as any).db.query('DELETE FROM facts');
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (engine as any).db.query(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [brainDir]);
+  await resetPgliteState(engine);
+  await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [brainDir]);
+});
+
+afterEach(() => {
+  if (!brainDir) return;
+  try {
+    rmSync(brainDir, { recursive: true, force: true });
+  } catch {
+    /* best-effort */
+  } finally {
+    brainDir = '';
+  }
 });
 
 const FENCE_BODY = (rows: string): string => `# Page

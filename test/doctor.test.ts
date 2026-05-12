@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'bun:test';
+import { withEnv } from './helpers/with-env.ts';
 
 describe('doctor command', () => {
   test('doctor module exports runDoctor', async () => {
@@ -476,15 +477,15 @@ describe('v0.32.4 — sync_freshness check', () => {
     expect(result.message).toContain('brain search is stale');
   });
 
-  test('exact 72h boundary → warn (>72h strict; 72h source NOT yet fail)', async () => {
+  test('near 72h boundary → warn (>72h strict; just under 72h source NOT yet fail)', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
-    // Exactly 72h. Strict `>` on fail threshold means 72h-stale is still in
-    // the warn window. (Tested boundary semantics.)
+    // Keep the fixture away from the exact boundary so Date.now() drift in the
+    // implementation cannot flip the assertion.
     const result = await checkSyncFreshness(makeStubEngine([
-      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: agoMs(72 * 60 * 60 * 1000) },
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: agoMs((72 * 60 * 60 * 1000) - 60_000) },
     ]));
     expect(result.status).toBe('warn');
-    expect(result.message).toContain('72h ago');
+    expect(result.message).toContain('71h ago');
   });
 
   test('24h < last_sync_at < 72h → warn with hour-rounded "Nh ago"', async () => {
@@ -496,11 +497,12 @@ describe('v0.32.4 — sync_freshness check', () => {
     expect(result.message).toMatch(/30h ago/);
   });
 
-  test('exact 24h boundary → ok (>24h strict)', async () => {
+  test('near 24h boundary → ok (>24h strict)', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
-    // Exactly 24h. Strict `>` on warn threshold means 24h-stale is still ok.
+    // Keep the fixture away from the exact boundary so Date.now() drift in the
+    // implementation cannot flip the assertion.
     const result = await checkSyncFreshness(makeStubEngine([
-      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: agoMs(24 * 60 * 60 * 1000) },
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: agoMs((24 * 60 * 60 * 1000) - 60_000) },
     ]));
     expect(result.status).toBe('ok');
     expect(result.message).toContain('synced recently');
@@ -553,18 +555,13 @@ describe('v0.32.4 — sync_freshness check', () => {
 
   test('env-var override: GBRAIN_SYNC_FRESHNESS_FAIL_HOURS=6 → 7h-stale fails', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
-    const prev = process.env.GBRAIN_SYNC_FRESHNESS_FAIL_HOURS;
-    process.env.GBRAIN_SYNC_FRESHNESS_FAIL_HOURS = '6';
-    try {
+    await withEnv({ GBRAIN_SYNC_FRESHNESS_FAIL_HOURS: '6' }, async () => {
       const result = await checkSyncFreshness(makeStubEngine([
         { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: agoMs(7 * 60 * 60 * 1000) },
       ]));
       expect(result.status).toBe('fail');
       expect(result.message).toContain('brain search is stale');
-    } finally {
-      if (prev === undefined) delete process.env.GBRAIN_SYNC_FRESHNESS_FAIL_HOURS;
-      else process.env.GBRAIN_SYNC_FRESHNESS_FAIL_HOURS = prev;
-    }
+    });
   });
 
   test('source.id embedded in messages even when source.name is set', async () => {

@@ -188,7 +188,18 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
 }
 
 export async function runForget(engine: BrainEngine, args: string[]): Promise<void> {
-  const idArg = args.find(a => /^\d+$/.test(a));
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--reason') {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('-')) continue;
+    positional.push(arg);
+  }
+
+  const idArg = positional.find(a => /^\d+$/.test(a));
   if (!idArg) {
     process.stderr.write('Usage: gbrain forget <fact-id> [--reason <text>]\n');
     process.exit(1);

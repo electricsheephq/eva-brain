@@ -27,17 +27,37 @@
  * or has no second pipe). On a match, returns the cells with surrounding
  * whitespace trimmed, with the outer pipes already stripped.
  *
- * NOTE: does NOT unescape `\|` back to `|`. Round-trip-on-pipes is a
- * separate concern callers handle if their domain text legitimately
- * contains pipes (currently neither takes nor facts do at the LLM-extract
- * layer; if a hand-edit introduces one, escape-on-write at render time
- * protects the table shape).
+ * Escaped pipes (`\|`) stay inside their cell, and escaped backslashes
+ * round-trip to literal backslashes. This matches `escapeFenceCell()`.
  */
 export function parseRowCells(line: string): string[] | null {
   const trimmed = line.trim();
   if (!trimmed.startsWith('|') || !trimmed.includes('|', 1)) return null;
   const inner = trimmed.replace(/^\|/, '').replace(/\|$/, '');
-  return inner.split('|').map(c => c.trim());
+  const cells: string[] = [];
+  let current = '';
+  let escaped = false;
+
+  for (const ch of inner) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (ch === '|') {
+      cells.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += '\\';
+  cells.push(current.trim());
+  return cells;
 }
 
 /**

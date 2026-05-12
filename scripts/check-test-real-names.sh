@@ -79,7 +79,7 @@ IFS='|' eval 'PATTERN="${PATTERN_PARTS[*]}"'
 
 # Find tool.
 if command -v rg >/dev/null 2>&1; then
-  matches="$(rg -niH --no-heading -t ts "$PATTERN" test/ 2>/dev/null || true)"
+  matches="$(rg -niH --no-heading --glob '*.test.ts' "$PATTERN" test/ 2>/dev/null || true)"
 elif command -v grep >/dev/null 2>&1; then
   matches="$(grep -rniE --include='*.test.ts' "$PATTERN" test/ 2>/dev/null || true)"
 else
