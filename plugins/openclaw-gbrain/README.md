@@ -97,7 +97,7 @@ default; the hard plugin cap is 20 MiB.
 ```bash
 gbrain --version
 gbrain health
-openclaw infer model run --gateway --model openai-codex/gpt-5.4-mini --prompt 'Return only JSON: {"ok":true}' --json
+openclaw infer model run --local --model openai-codex/gpt-5.4-mini --prompt 'Return only JSON: {"ok":true}' --json
 openclaw gbrain status
 ```
 

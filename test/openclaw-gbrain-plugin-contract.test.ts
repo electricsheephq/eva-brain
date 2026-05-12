@@ -14,6 +14,8 @@ describe('OpenClaw GBrain plugin boundary', () => {
     expect(pluginSource).toContain('GBRAIN_ROUTE_PATH = "/plugins/gbrain/extract"');
     expect(pluginSource).toContain('api.registerHttpRoute');
     expect(pluginSource).toContain('auth: "gateway"');
+    expect(pluginSource).toContain('"--local"');
+    expect(pluginSource).not.toContain('"--gateway"');
     expect(pluginSource).toContain('protocol: "gbrain.media-extraction.v1"');
     expect(pluginSource).toContain('provider: "openai-codex"');
   });

@@ -102,6 +102,26 @@ describe('doctor command', () => {
     expect(source).toMatch(/table:\s*'files'.*col:\s*'metadata'/);
   });
 
+  test('pgvector check skips on PGLite because vector support is bundled', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const block = source.slice(
+      source.indexOf('// 4. pgvector extension'),
+      source.indexOf('// 4b. PgBouncer'),
+    );
+    expect(block).toContain("engine.kind === 'pglite'");
+    expect(block).toContain('PGLite bundles vector support');
+  });
+
+  test('jsonb_integrity skips on PGLite because raw Postgres JSONB probe is not applicable', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const block = source.slice(
+      source.indexOf('// 10. JSONB integrity'),
+      source.indexOf('// 10b. Takes weight grid integrity'),
+    );
+    expect(block).toContain("engine.kind === 'pglite'");
+    expect(block).toContain('PGLite JSONB probe not applicable');
+  });
+
   // v0.31.2 — facts_extraction_health check added in PR1 commit 12.
   // Reads ingest_log rows with source_type='facts:absorb' (written by
   // writeFactsAbsorbLog from src/core/facts/absorb-log.ts), groups by

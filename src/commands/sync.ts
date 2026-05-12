@@ -541,6 +541,8 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       detachedWorkingTreeManifest.renamed.length > 0);
 
   if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !hasDetachedWorkingTreeChanges) {
+    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', headCommit);
+    await engine.setConfig('sync.last_run', new Date().toISOString());
     return {
       status: 'up_to_date',
       fromCommit: lastCommit,
