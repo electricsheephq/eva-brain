@@ -17,6 +17,23 @@ If you fetched this file by URL without cloning yet, the companion files live at
 
 ## Step 1: Install GBrain
 
+Recommended public updater path:
+
+```bash
+git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain
+cd ~/eva-brain
+scripts/update-local-install.sh
+```
+
+That script is idempotent: it updates the checkout, runs `bun install`, links
+the `gbrain` CLI, applies safe PGLite migrations, and refreshes optional host
+plugins when those hosts are present.
+
+To require host plugin setup instead of auto-detecting it, pass
+`--with-openclaw` and/or `--with-codex-plugin`.
+
+Manual path:
+
 ```bash
 git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain && cd ~/eva-brain
 curl -fsSL https://bun.sh/install | bash
@@ -103,15 +120,36 @@ continues to shrink toward upstream-native writes.
 
 If OpenClaw is not installed, skip this step and keep the CLI/MCP path.
 
-## Step 3.6: Install The OpenClaw Support KB
+## Step 3.6: Install The Codex Desktop Plugin
+
+If Codex Desktop is installed on this machine, install the local Codex plugin
+from the same Eva Brain checkout:
+
+```bash
+cd ~/eva-brain
+node scripts/install-codex-plugin.mjs
+```
+
+Then restart Codex Desktop. The installer creates `~/plugins/gbrain-codex`,
+links the repo-owned plugin package plus the current repo `skills/` tree, and
+updates `~/.agents/plugins/marketplace.json`.
+
+The plugin is a thin MCP adapter over the local `gbrain` CLI. It does not embed
+a second brain runtime. If Codex cannot see `gbrain` on the GUI PATH, set
+`GBRAIN_CODEX_BIN` to the desired executable path before launching Codex.
+
+## Step 3.7: Install The OpenClaw Support KB
 
 For OpenClaw customer/support work, install the KB source and support skills
 after GBrain is healthy:
 
 ```bash
 export OPENCLAW_SUPPORT_KB_REPO="https://github.com/electricsheephq/openclaw-support-kb.git"
-export GBRAIN_PARENT="${GBRAIN_HOME:-$HOME}"
-export OPENCLAW_SUPPORT_KB_DIR="$GBRAIN_PARENT/.gbrain/sources/openclaw-support-kb"
+export GBRAIN_ROOT="${GBRAIN_HOME:-$HOME}"
+if [ "${GBRAIN_ROOT%/.gbrain}" != "$GBRAIN_ROOT" ]; then
+  export GBRAIN_ROOT="$(dirname "$GBRAIN_ROOT")"
+fi
+export OPENCLAW_SUPPORT_KB_DIR="$GBRAIN_ROOT/.gbrain/sources/openclaw-support-kb"
 
 if [ -d "$OPENCLAW_SUPPORT_KB_DIR/.git" ]; then
   git -C "$OPENCLAW_SUPPORT_KB_DIR" pull --ff-only
@@ -236,8 +274,8 @@ actually works) is the most important.
 ## Upgrade
 
 ```bash
-cd ~/eva-brain && git pull origin master && bun install
-gbrain init                           # apply schema migrations (idempotent)
+cd ~/eva-brain
+scripts/update-local-install.sh
 gbrain post-upgrade                   # show migration notes for the version range
 ```
 

@@ -1,0 +1,47 @@
+{
+  "name": "gbrain-codex",
+  "version": "0.33.0",
+  "description": "Full-surface Codex Desktop adapter for a local Eva Brain/GBrain install.",
+  "author": {
+    "name": "Electric Sheep",
+    "url": "https://github.com/electricsheephq"
+  },
+  "homepage": "https://github.com/electricsheephq/eva-brain",
+  "repository": "https://github.com/electricsheephq/eva-brain",
+  "license": "MIT",
+  "keywords": [
+    "gbrain",
+    "eva-brain",
+    "codex",
+    "mcp",
+    "knowledge-base",
+    "search",
+    "agent"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Eva Brain",
+    "shortDescription": "Use a local Eva Brain/GBrain from Codex Desktop",
+    "longDescription": "Eva Brain for Codex Desktop is a thin local adapter over an already-installed GBrain CLI. It launches `gbrain serve`, exposes the same MCP tools GBrain already serves to other hosts, and uses the repo's current skillpack so Codex can search, write, sync, and operate the brain with upstream behavior.",
+    "developerName": "Electric Sheep",
+    "category": "Engineering",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/electricsheephq/eva-brain",
+    "privacyPolicyURL": "https://github.com/electricsheephq/eva-brain/blob/master/SECURITY.md",
+    "termsOfServiceURL": "https://github.com/electricsheephq/eva-brain/blob/master/LICENSE",
+    "defaultPrompt": [
+      "Search my Eva Brain for prior context on this topic",
+      "Write this note into Eva Brain and link it correctly",
+      "Sync the brain and tell me what changed"
+    ],
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/gbrain-codex.svg",
+    "logo": "./assets/gbrain-codex.svg",
+    "screenshots": []
+  }
+}

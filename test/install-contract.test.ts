@@ -27,7 +27,8 @@ describe('Eva Brain install contract', () => {
     expect(guide).toContain('/plugins/gbrain/extract');
     expect(guide).toContain('openclaw plugins install');
     expect(guide).toContain('OPENCLAW_SUPPORT_KB_REPO');
-    expect(guide).toContain('GBRAIN_PARENT="${GBRAIN_HOME:-$HOME}"');
+    expect(guide).toContain('GBRAIN_ROOT="${GBRAIN_HOME:-$HOME}"');
+    expect(guide).toContain('GBRAIN_ROOT/.gbrain/sources/openclaw-support-kb');
     expect(guide).toContain('https://github.com/electricsheephq/openclaw-support-kb.git');
     expect(guide).toContain('node scripts/update-client.mjs');
     expect(guide).toContain('node scripts/status.mjs');
