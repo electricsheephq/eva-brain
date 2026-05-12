@@ -1586,6 +1586,25 @@ plugins when those hosts are present.
 To require host plugin setup instead of auto-detecting it, pass
 `--with-openclaw` and/or `--with-codex-plugin`.
 
+Full Eva/OpenClaw/Codex/support-KB install:
+
+```bash
+git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain
+cd ~/eva-brain
+scripts/update-local-install.sh --with-openclaw --with-codex-plugin --with-support-kb --stop-stale-serve
+```
+
+What that command does:
+
+- installs or updates the local `gbrain` CLI from this checkout
+- initializes PGLite if no brain exists yet
+- keeps existing local brain data under `~/.gbrain`
+- installs the OpenClaw native plugin from `plugins/openclaw-gbrain`
+- installs the Codex Desktop plugin from `plugins/gbrain-codex`
+- installs or updates the OpenClaw support KB as source `openclaw-support-kb`
+- embeds only stale chunks for that KB source
+- runs provider probe and `gbrain doctor` when possible
+
 Manual path:
 
 ```bash
@@ -1664,6 +1683,11 @@ The plugin provides:
 - `gbrain_query`
 - `/plugins/gbrain/extract` for OAuth-backed extraction through OpenClaw/Codex
 
+What is different from normal GBrain: normal GBrain exposes CLI and MCP tools.
+The OpenClaw plugin lets OpenClaw agents call those tools natively and adds a
+host-owned extraction route. That route uses OpenClaw's logged-in Codex runtime;
+users do not need an OpenAI API key for extraction.
+
 Media boundary: upstream GBrain owns native image indexing through image pages,
 file records, multimodal embeddings, OCR, and `query --image`. Eva's OpenClaw
 plugin owns OAuth-backed enrichment/extraction and returns
@@ -1691,6 +1715,10 @@ updates `~/.agents/plugins/marketplace.json`.
 The plugin is a thin MCP adapter over the local `gbrain` CLI. It does not embed
 a second brain runtime. If Codex cannot see `gbrain` on the GUI PATH, set
 `GBRAIN_CODEX_BIN` to the desired executable path before launching Codex.
+
+What is different from normal GBrain: normal GBrain can already be configured as
+an MCP server manually. The Codex plugin packages that MCP launch path in a
+repo-owned plugin directory so agents can install it repeatably with one script.
 
 ## Step 3.7: Install The OpenClaw Support KB
 
@@ -2028,7 +2056,15 @@ GBrain, sets up a Voyage 4 Large 2048d brain when `VOYAGE_API_KEY` is available,
 installs host plugins such as OpenClaw and Codex Desktop when those hosts are
 present, and verifies the local doctor score. ~30 minutes.
 
-For manual installs or upgrades from an existing checkout:
+For a full local OpenClaw/Codex/support-KB install from a shell:
+
+```bash
+git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain
+cd ~/eva-brain
+scripts/update-local-install.sh --with-openclaw --with-codex-plugin --with-support-kb --stop-stale-serve
+```
+
+For manual upgrades from an existing checkout:
 
 ```bash
 cd ~/eva-brain
@@ -2036,7 +2072,29 @@ scripts/update-local-install.sh
 ```
 
 Use `--with-openclaw` or `--with-codex-plugin` when you want the script to fail
-instead of auto-skipping a missing host.
+instead of auto-skipping a missing host. Use `--with-support-kb` to install or
+refresh the OpenClaw support knowledge base as a named GBrain source.
+
+### What Eva Adds
+
+Eva Brain tracks upstream GBrain closely. The downstream additions are the host
+and install surfaces our users need:
+
+- **OpenClaw native plugin:** `plugins/openclaw-gbrain` adds GBrain tools and
+  `/plugins/gbrain/extract`, using OpenClaw's logged-in Codex runtime for
+  extraction instead of asking users for an OpenAI API key.
+- **Codex Desktop plugin:** `plugins/gbrain-codex` is a thin local MCP package
+  that launches the installed `gbrain serve` for Codex Desktop.
+- **One-command updater:** `scripts/update-local-install.sh` safely updates the
+  checkout, links the CLI, runs idempotent local init/migrations, and optionally
+  refreshes host plugins and the support KB.
+- **Opinionated defaults:** Voyage 4 Large at 2048 dimensions for technical
+  workspaces, `~/.gbrain/gbrain.env` support, and safe local install behavior.
+
+Upstream GBrain still owns the database, search, sync, graph, facts, native
+media, provider recipes, and MCP core. Eva's media extraction schema is an
+adapter payload for host runtimes; it is not intended to replace upstream's
+native image/file/media storage model.
 
 For provider choice, embedding dimensions, Voyage 4 Large 2048d setup, and the OpenClaw Codex OAuth extraction boundary, read [`docs/guides/provider-install-matrix.md`](docs/guides/provider-install-matrix.md).
 
