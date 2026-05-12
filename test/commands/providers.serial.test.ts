@@ -163,6 +163,22 @@ describe('providers command auth hardening', () => {
     expect(output).not.toContain('oc-secret');
   });
 
+  test('providers explain recommends Voyage when Voyage auth is available, even with OpenClaw OpenAI auth', async () => {
+    loadGbrainEnvMock.mockReturnValueOnce({
+      VOYAGE_API_KEY: 'from-gbrain-env',
+    });
+    const { runProviders } = await import('../../src/commands/providers.ts');
+    await runProviders('explain', []);
+
+    const output = logSpy.mock.calls
+      .flatMap(call => call)
+      .map(arg => (typeof arg === 'string' ? arg : JSON.stringify(arg)))
+      .join('\n');
+    expect(output).toContain('Recommended: voyage:voyage-4-large');
+    expect(output).toContain('Eva Brain recommends Voyage 4 Large at 2048 dims');
+    expect(output).not.toContain('from-gbrain-env');
+  });
+
   test('providers explain reads env detected state from gbrain.env loader', async () => {
     loadGbrainEnvMock.mockReturnValueOnce({
       VOYAGE_API_KEY: 'from-gbrain-env',

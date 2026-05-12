@@ -49,4 +49,12 @@ describe('OpenClaw GBrain plugin boundary', () => {
     expect(pluginSource).not.toContain('refreshToken');
     expect(pluginSource).not.toContain('accessToken');
   });
+
+  test('spawned helper commands keep runtime env precedence over gbrain.env', () => {
+    expect(pluginSource).toContain('...fileEnv,');
+    expect(pluginSource).toContain('...process.env,');
+    expect(pluginSource.indexOf('...fileEnv,')).toBeLessThan(pluginSource.indexOf('...process.env,'));
+    expect(pluginSource).toContain('process.env.BUN_INSTALL ?? fileEnv.BUN_INSTALL');
+    expect(pluginSource).toContain('process.env.PATH ?? fileEnv.PATH');
+  });
 });

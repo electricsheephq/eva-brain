@@ -404,7 +404,7 @@ function prosFor(r: Recipe, touchpoint: TouchpointFilter): string[] {
   else if (r.id === 'google') out.push('Smaller vectors', 'Matryoshka dim flex');
   else if (r.id === 'anthropic') out.push('Default expansion model', 'Best-in-class reasoning');
   else if (r.id === 'ollama') out.push('Local', 'Free', 'Private');
-  else if (r.id === 'voyage') out.push('Best rerank pairing');
+  else if (r.id === 'voyage') out.push('Eva default', 'High-recall retrieval', '2048d ready');
   else if (r.id === 'litellm') out.push('Universal coverage (Bedrock/Vertex/Azure/any)');
   else if (r.id === 'deepseek') out.push('Low-cost chat');
   else if (r.id === 'groq') out.push('Fast chat');
@@ -423,6 +423,10 @@ function consFor(r: Recipe): string[] {
 
 function pickRecommended(options: ProviderOption[], env: Record<string, boolean>, ollamaReady: boolean): { id: string; reason: string } {
   const embOpts = options.filter(o => o.touchpoint === 'embedding');
+  if (env.VOYAGE_API_KEY) {
+    const voyage = embOpts.find(o => o.id.startsWith('voyage:'));
+    if (voyage) return { id: voyage.id, reason: 'VOYAGE_API_KEY set — Eva Brain recommends Voyage 4 Large at 2048 dims for technical-doc retrieval.' };
+  }
   const readyOpenAI = embOpts.find(o => o.id.startsWith('openai:') && o.env_ready);
   if (readyOpenAI) {
     const reason = readyOpenAI.auth_source === 'env'
@@ -438,12 +442,8 @@ function pickRecommended(options: ProviderOption[], env: Record<string, boolean>
     const google = embOpts.find(o => o.id.startsWith('google:'));
     if (google) return { id: google.id, reason: 'GOOGLE_GENERATIVE_AI_API_KEY set — Gemini embedding at 768 dims.' };
   }
-  if (env.VOYAGE_API_KEY) {
-    const voyage = embOpts.find(o => o.id.startsWith('voyage:'));
-    if (voyage) return { id: voyage.id, reason: 'VOYAGE_API_KEY set — Voyage at 2048 dims.' };
-  }
   return {
     id: 'openai:text-embedding-3-large',
-    reason: 'No provider auth detected. OpenAI is the fastest setup — get a key at https://platform.openai.com/api-keys or configure OpenClaw provider_auth.',
+    reason: 'No embedding provider auth detected. For Eva installs, set VOYAGE_API_KEY for voyage:voyage-4-large at 2048 dims; OpenAI remains the upstream compatibility fallback.',
   };
 }

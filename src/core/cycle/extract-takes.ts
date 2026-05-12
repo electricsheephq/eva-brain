@@ -176,8 +176,14 @@ export async function extractTakesFromFs(
 
 /**
  * Iterate engine pages and re-extract takes from each `compiled_truth` body.
- * Snapshot-stable (uses getAllSlugs). Doesn't read disk — works on
+ * Snapshot-stable (uses listAllPageRefs). Doesn't read disk — works on
  * Postgres-only deployments without a local checkout.
+ *
+ * v0.32.8: replaces the prior `getAllSlugs() → getPage(slug)` pattern. The
+ * old version dropped `source_id` between the enumeration and the lookup,
+ * so a non-default-source page either matched the wrong (default-source)
+ * row or returned null when it didn't exist in default. Now we enumerate
+ * (slug, source_id) pairs and pass `sourceId` to getPage explicitly.
  */
 export async function extractTakesFromDb(
   engine: BrainEngine,
@@ -187,23 +193,19 @@ export async function extractTakesFromDb(
     pagesScanned: 0, pagesWithTakes: 0, takesUpserted: 0, warnings: [], failedFiles: [],
   };
   const dryRun = opts.dryRun ?? false;
-  const pages = opts.slugs && opts.slugs.length > 0
-    ? null
-    : await engine.listPages({
-      sourceId: opts.sourceId ?? '__all__',
-      limit: 100000,
-    });
-  const slugs = opts.slugs && opts.slugs.length > 0
-    ? opts.slugs
-    : pages!.map((p) => p.slug);
+  // v0.32.8: when caller supplies bare slugs, default sourceId='default'
+  // (back-compat with pre-v0.32.8 callers). When no slugs supplied, enumerate
+  // every (slug, source_id) pair across all sources.
+  const refs: Array<{ slug: string; source_id: string }> = opts.slugs && opts.slugs.length > 0
+    ? opts.slugs.map(slug => ({ slug, source_id: opts.sourceId ?? 'default' }))
+    : (opts.sourceId
+      ? (await engine.listAllPageRefs()).filter(ref => ref.source_id === opts.sourceId)
+      : await engine.listAllPageRefs());
   const buffer: TakeBatchInput[] = [];
 
-  for (let i = 0; i < slugs.length; i++) {
-    const slug = slugs[i];
+  for (const { slug, source_id } of refs) {
     result.pagesScanned++;
-    const page = pages
-      ? pages[i]
-      : await engine.getPage(slug, { sourceId: opts.sourceId ?? 'default' });
+    const page = await engine.getPage(slug, { sourceId: source_id });
     if (!page) continue;
     const body = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`;
     const { takes, warnings } = parseTakesFence(body);

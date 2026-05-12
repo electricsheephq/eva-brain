@@ -14,7 +14,11 @@ export interface EmbedOpts {
   slugs?: string[];
   /** Embed a single page. */
   slug?: string;
-  /** Restrict page/chunk work to one source id. Omit for all sources. */
+  /**
+   * v0.31.12: scope to a specific source. When set, only pages from this
+   * source are embedded. When omitted, all sources are processed (but
+   * source_id is still threaded correctly per-page via Page.source_id).
+   */
   sourceId?: string;
   /**
    * Dry run: enumerate what WOULD be embedded (stale chunk counts)

@@ -90,4 +90,43 @@ describe('media evidence import', () => {
     expect(data.kind).toBe('video');
     expect(data.segments.some((segment: any) => segment.kind === 'transcript_segment')).toBe(true);
   });
+
+  test('CLI import-media --source writes page, raw data, chunks, and ingest log to that source', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-media-import-source-'));
+    const contentPath = join(dir, 'page.md');
+    const extractionPath = join(dir, 'evidence.json');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+       VALUES ('media-corpus', 'Media Corpus', '{}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    writeFileSync(contentPath, `---\ntype: media\ntitle: Source-scoped media\ncustom_flag: keep-me\n---\n\nSource-scoped media evidence page.`);
+    writeFileSync(extractionPath, readFileSync(join(FIXTURES, 'media-extraction-image.json'), 'utf-8'));
+
+    try {
+      await runImportMedia(engine, [
+        '--slug', 'media/source-scoped',
+        '--content-file', contentPath,
+        '--extraction', extractionPath,
+        '--source', 'media-corpus',
+        '--source-ref', 'fixture:stripe-screenshot',
+        '--no-embed',
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    expect(await engine.getPage('media/source-scoped')).toBeNull();
+    const page = await engine.getPage('media/source-scoped', { sourceId: 'media-corpus' });
+    expect(page?.frontmatter.custom_flag).toBe('keep-me');
+    expect(page?.frontmatter.source_ref).toBe('fixture:stripe-screenshot');
+
+    expect(await engine.getRawData('media/source-scoped', 'gbrain.media-evidence.v1', { sourceId: 'default' })).toHaveLength(0);
+    const raw = await engine.getRawData('media/source-scoped', 'gbrain.media-evidence.v1', { sourceId: 'media-corpus' });
+    expect(raw).toHaveLength(1);
+    const chunks = await engine.getChunks('media/source-scoped', { sourceId: 'media-corpus' });
+    expect(chunks.some(c => c.chunk_text.includes('Stripe API key invalid'))).toBe(true);
+    const log = await engine.getIngestLog({ limit: 5 });
+    expect(log.find(entry => entry.source_ref === 'media/source-scoped')?.source_id).toBe('media-corpus');
+  });
 });

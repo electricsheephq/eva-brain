@@ -1,7 +1,7 @@
 {
   "id": "gbrain",
   "name": "gbrain",
-  "version": "0.32.5",
+  "version": "0.33.0",
   "description": "Eva Brain/GBrain skills and personal knowledge brain with provider-neutral hybrid search",
   "family": "bundle-plugin",
   "configSchema": {
@@ -9,14 +9,6 @@
       "type": "string",
       "required": false,
       "description": "Optional PostgreSQL connection URL. Omit for local PGLite.",
-      "uiHints": {
-        "sensitive": true
-      }
-    },
-    "voyage_api_key": {
-      "type": "string",
-      "required": false,
-      "description": "Optional Voyage API key for Voyage 4 Large embeddings (uses VOYAGE_API_KEY env var if not set)",
       "uiHints": {
         "sensitive": true
       }

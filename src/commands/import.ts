@@ -284,6 +284,7 @@ export async function runImport(
   await engine.logIngest({
     source_type: 'directory',
     source_ref: dir,
+    source_id: sourceId ?? 'default',
     pages_updated: importedSlugs,
     summary: `Imported ${imported} pages, ${skipped} skipped, ${chunksCreated} chunks`,
   });

@@ -150,11 +150,13 @@ function stripInlineComment(raw) {
 function commandEnv(config) {
   const fileEnv = readEnvFile(config.envFile);
   const bunBin = join(homedir(), ".bun", "bin");
-  const basePath = fileEnv.PATH ?? process.env.PATH ?? "";
+  // Match core gbrain.env precedence: runtime/OpenClaw env wins, and the
+  // optional file only fills missing values for spawned helper commands.
+  const basePath = process.env.PATH ?? fileEnv.PATH ?? "";
   return {
-    ...process.env,
     ...fileEnv,
-    BUN_INSTALL: fileEnv.BUN_INSTALL ?? process.env.BUN_INSTALL ?? join(homedir(), ".bun"),
+    ...process.env,
+    BUN_INSTALL: process.env.BUN_INSTALL ?? fileEnv.BUN_INSTALL ?? join(homedir(), ".bun"),
     PATH: prependPathEntry(basePath, bunBin),
   };
 }
