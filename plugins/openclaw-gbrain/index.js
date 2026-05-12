@@ -332,7 +332,7 @@ async function handleExtractionRoute(config, req, res) {
       "infer",
       "model",
       "run",
-      "--gateway",
+      "--local",
       "--model",
       resolveExtractionModel(request.model, config.extractionModel),
       "--prompt",

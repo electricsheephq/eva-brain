@@ -309,6 +309,42 @@ describe('performSync dry-run never writes', () => {
     expect(rows[0].last_sync_at).toBeTruthy();
   });
 
+  test('source-scoped up-to-date sync refreshes last_sync_at for freshness doctor', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const head = execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf8' }).trim();
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, last_commit, config)
+       VALUES ('supportkb', 'Support KB', $1, NULL, '{}'::jsonb)`,
+      [repoPath],
+    );
+
+    const first = await performSync(engine, {
+      sourceId: 'supportkb',
+      noPull: true,
+      noEmbed: true,
+    });
+    expect(first.status).toBe('first_sync');
+
+    const staleIso = '2026-01-01T00:00:00.000Z';
+    await engine.executeRaw(
+      `UPDATE sources SET last_sync_at = $1 WHERE id = 'supportkb'`,
+      [staleIso],
+    );
+
+    const second = await performSync(engine, {
+      sourceId: 'supportkb',
+      noPull: true,
+      noEmbed: true,
+    });
+    expect(second.status).toBe('up_to_date');
+
+    const rows = await engine.executeRaw<{ last_commit: string | null; last_sync_at: unknown }>(
+      `SELECT last_commit, last_sync_at FROM sources WHERE id = 'supportkb'`,
+    );
+    expect(rows[0].last_commit).toBe(head);
+    expect(new Date(rows[0].last_sync_at as string).getTime()).toBeGreaterThan(new Date(staleIso).getTime());
+  });
+
   test('incremental dry-run does NOT write to DB or advance the bookmark', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     // First do a real sync to seed the bookmark.
