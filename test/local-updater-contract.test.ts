@@ -37,6 +37,7 @@ describe('public local updater and Codex plugin packaging', () => {
     expect(script).toMatch(/GBRAIN_ROOT="\$\{GBRAIN_HOME:-\$HOME\}"/);
     expect(script).toMatch(/GBRAIN_DIR="\$GBRAIN_ROOT\/\.gbrain"/);
     expect(script).toMatch(/config_path="\$GBRAIN_DIR\/config\.json"/);
+    expect(script).toMatch(/stop_stale_serve_if_requested\s*\n\s*local config_path="\$GBRAIN_DIR\/config\.json"/);
     expect(script).toMatch(/init\s+--pglite\s+--embedding-model\s+voyage:voyage-4-large\s+--embedding-dimensions\s+2048/);
     expect(script).toMatch(/if \[ -f "\$config_path" \]; then/);
     expect(script).toMatch(/run "\$HOME\/\.bun\/bin\/gbrain" init/);

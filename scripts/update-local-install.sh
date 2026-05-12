@@ -36,7 +36,7 @@ Options:
   --with-codex-plugin          Install/update the Codex Desktop local plugin entry
   --without-codex-plugin       Skip Codex plugin install
   --with-support-kb            Install/update the OpenClaw Support KB source
-  --stop-stale-serve           Stop stale local gbrain serve processes before doctor
+  --stop-stale-serve           Stop stale local gbrain serve processes before init/doctor
   --skip-doctor                Skip gbrain doctor
   --skip-provider-test         Skip provider probe
   --allow-dirty                Allow updating a dirty existing checkout
@@ -135,6 +135,7 @@ install_gbrain() {
   export PATH="$HOME/.bun/bin:$PATH"
   run bun install
   run bun link
+  stop_stale_serve_if_requested
   local config_path="$GBRAIN_DIR/config.json"
   if [ -f "$config_path" ]; then
     run "$HOME/.bun/bin/gbrain" init
@@ -148,7 +149,7 @@ stop_stale_serve_if_requested() {
     return
   fi
   if pgrep -f 'gbrain serve' >/dev/null 2>&1; then
-    log "Stopping stale gbrain serve processes before local PGLite doctor"
+    log "Stopping stale gbrain serve processes before local PGLite work"
     run pkill -f 'gbrain serve'
     sleep 1
   fi
