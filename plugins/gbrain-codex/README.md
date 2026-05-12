@@ -47,6 +47,17 @@ The installer creates `~/plugins/gbrain-codex`, links this package plus the
 repo's current `skills/` tree, and updates
 `~/.agents/plugins/marketplace.json`.
 
+For the full public install path, including the CLI and optional host plugins:
+
+```bash
+git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain
+cd ~/eva-brain
+scripts/update-local-install.sh --with-codex-plugin
+```
+
+Add `--with-openclaw --with-support-kb` when this Codex install should share the
+same machine with OpenClaw and the OpenClaw support knowledge base.
+
 ## Local Repo Smoke
 
 From the Eva Brain repo root:
