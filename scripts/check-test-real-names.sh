@@ -103,24 +103,25 @@ while IFS= read -r line; do
   # rest is "lineno:content" — strip lineno.
   content="${rest#*:}"
 
-  matched_needle=""
+  line_allowed=1
   for needle in "${BANNED_EMAILS[@]}" "${BANNED_NAMES[@]}"; do
     if echo "$content" | grep -qi -- "$needle"; then
-      matched_needle="$needle"
-      break
+      allow_key="${file}:${needle}"
+      allowed=0
+      for allow_entry in "${ALLOWLIST[@]}"; do
+        if [ "$allow_entry" = "$allow_key" ]; then
+          allowed=1
+          break
+        fi
+      done
+      if [ "$allowed" = "0" ]; then
+        line_allowed=0
+        break
+      fi
     fi
   done
 
-  allow_key="${file}:${matched_needle}"
-  allowed=0
-  for allow_entry in "${ALLOWLIST[@]}"; do
-    if [ "$allow_entry" = "$allow_key" ]; then
-      allowed=1
-      break
-    fi
-  done
-
-  if [ "$allowed" = "0" ]; then
+  if [ "$line_allowed" = "0" ]; then
     filtered+="${line}"$'\n'
   fi
 done <<< "$matches"

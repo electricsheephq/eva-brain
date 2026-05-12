@@ -162,6 +162,19 @@ describe('parseFactsFence — strikethrough semantics (Codex R2-#3 contract)', (
     });
   });
 
+  test('strikethrough + appended "forgotten: <reason>" context → forgotten=true', () => {
+    const body = wrapFenceBody(
+      `| 1 | ~~Stale fact~~ | fact | 1.0 | private | low | 2018-01-01 | 2026-05-10 | inferred | original context; forgotten: user asked to remove |`,
+    );
+    const r = parseFactsFence(body);
+    expect(r.facts[0]).toMatchObject({
+      claim: 'Stale fact',
+      active: false,
+      forgotten: true,
+      context: 'original context; forgotten: user asked to remove',
+    });
+  });
+
   test('strikethrough with unrecognized context → inactive but no superseded/forgotten flag', () => {
     const body = wrapFenceBody(
       `| 1 | ~~Something~~ | fact | 1.0 | world | medium | 2026-01-01 |  | src | random note |`,
@@ -472,6 +485,27 @@ describe('upsertFactRow', () => {
     expect(out).toContain('~~Old~~');
     expect(out).toContain('superseded by #2');
     expect(out).toContain('Replacement');
+  });
+
+  test('malformed hand-edited rows survive an unrelated append', () => {
+    const body = wrapFenceBody(
+      `| 1 | First | fact | 1.0 | world | medium | 2026-01-01 |  | src |  |
+| 7 | Hand-edited malformed row | bogus | 1.0 | world | medium | 2026-01-01 |  | src | keep me |`,
+    );
+    const { body: out, rowNum } = upsertFactRow(body, {
+      claim: 'New row',
+      kind: 'fact',
+      confidence: 1.0,
+      visibility: 'world',
+      notability: 'medium',
+    });
+
+    expect(rowNum).toBe(8);
+    expect(out).toContain('| 7 | Hand-edited malformed row | bogus |');
+    expect(out).toContain('| 8 | New row | fact |');
+    const reparsed = parseFactsFence(out);
+    expect(reparsed.warnings.some(w => w.includes('unknown kind "bogus"'))).toBe(true);
+    expect(reparsed.facts.map(f => f.rowNum)).toEqual([1, 8]);
   });
 });
 

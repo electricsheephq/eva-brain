@@ -722,7 +722,7 @@ If you do not want credential-helper today, run Phases 1 (markdown) and 5-8 (con
 
 ### For contributors
 
-Cold-start originated as PR #802. The branch shipped three commits including one that flipped credential-helper from "recommended" to "required for API access." Codex outside-voice review of the v0.31.10 ship plan flagged that as vendor-coupling that prematurely cements credential-helper as the public contract. The known-limitation above is the bridge: v0.31.10 ships the contributor's posture, v0.32 restores the dual-recipe pattern. Privacy scrub on the merging PR replaced "Hermes Agent" references in the new `ask-user` skill (which conflated the public NousResearch agent with private deployment names) with the canonical "OpenClaw agents" phrasing per CLAUDE.md doctrine.
+Cold-start originated as PR #802. The branch shipped three commits including one that flipped credential-helper from "recommended" to "required for API access." Codex outside-voice review of the v0.31.10 ship plan flagged that as vendor-coupling that prematurely cements credential-helper as the public contract. The known-limitation above is the bridge: v0.31.10 ships the contributor's posture, v0.32 restores the dual-recipe pattern. Privacy scrub on the merging PR replaced private agent references in the new `ask-user` skill (which conflated public agents with private deployment names) with the canonical "OpenClaw agents" phrasing per CLAUDE.md doctrine.
 
 The version slot is deliberate. v0.31.4 through v0.31.9 are reserved for in-flight work; v0.31.10 was chosen so this user-facing skillpack expansion lands clearly above the patch-train.
 
@@ -1179,9 +1179,9 @@ Tests: 4570 unit pass / 1 pre-existing master flake (`BrainRegistry — lazy ini
 **Thin-client mode actually works now. `gbrain init --mcp-only` is no longer a half-built bridge.**
 **Every read + write + admin op routes through MCP; refused commands carry pinpoint hints.**
 
-Hermes/delegate-agent hit this in production: thin-client install of wintermute (102k pages,
-265k chunks). Every CLI search returned zero rows. Exit code 0. No warning. The agent
-configured `gbrain init --mcp-only`, then walked into a wall of "no results found" against
+A production deployment hit this in thin-client mode: a remote brain with 102k pages and
+265k chunks. Every CLI search returned zero rows. Exit code 0. No warning. The agent
+configured `gbrain init --mcp-only`, then encountered "no results found" against
 a brain that had everything it needed. The CLI was opening the empty local PGLite,
 running 38 migrations, and reporting "No results." while the real brain sat untouched
 behind an HTTPS endpoint.
@@ -1248,7 +1248,7 @@ warns about the new `oauth_client_scopes_probe` check:
    gbrain stats
    ```
    Both should now show real numbers and an identity banner like
-   `[thin-client → wintermute:3131 · brain: 102k pages, 265k chunks · v0.31.1]`.
+   `[thin-client -> remote-agent:3131 · brain: 102k pages, 265k chunks · v0.31.1]`.
 
 4. **If any step fails or the numbers look wrong**, file an issue at
    https://github.com/garrytan/gbrain/issues with `gbrain remote doctor` output.
@@ -2011,7 +2011,7 @@ stops being a search engine and starts being an aide who notices.
    ```bash
    gbrain dream --phase recompute_emotional_weight
    ```
-3. **Try the the operator test** to verify routing changed:
+3. **Try the operator test** to verify routing changed:
    ```bash
    gbrain salience --days 14
    gbrain anomalies
@@ -7524,7 +7524,7 @@ The four issues this release closes, with measured impact:
 | #170 `SELECT * FROM pages ORDER BY updated_at DESC` on 31k rows (Postgres) | ~14.6s seqscan | <20ms index scan | ~700x |
 | #219 `max_stalled` default on `minion_jobs` | 3 (three rescues before dead, v0.14.2 set this) | 5 (four rescues before dead) | extra headroom for flaky deploys |
 | #219 existing waiting/active jobs with `max_stalled<5` | would still dead-letter earlier than expected | backfilled to 5 on upgrade | closes the pain today |
-| #218 `bun install -g github:example/gbrain` postinstall failure | silent `|| true` | visible stderr warning with recovery URL | users know it's broken |
+| #218 `bun install -g github:example/gbrain` postinstall failure | silent `\|\| true` | visible stderr warning with recovery URL | users know it's broken |
 | #223 PGLite WASM crash on macOS 26.3 | raw `Aborted()`, no hint | pinned `@electric-sql/pglite` to `0.4.3` + actionable error message naming the issue | users can route to #223 |
 
 ### What this means for you

@@ -28,13 +28,13 @@ cd "$ROOT"
 # post-v0.32.2 every call site must either route through the
 # reconcile layer OR carry an explicit allow-direct-insert comment.
 PATTERNS=(
-  'engine\.insertFact\('
-  'engine\.insertFacts\('
-  'engine\.addLink\('
-  'engine\.addLinksBatch\('
-  'engine\.addTimelineEntry\('
-  'engine\.upsertTake\('
-  'engine\.expireFact\('
+  'engine\.insertFact[[:space:]]*\('
+  'engine\.insertFacts[[:space:]]*\('
+  'engine\.addLink[[:space:]]*\('
+  'engine\.addLinksBatch[[:space:]]*\('
+  'engine\.addTimelineEntry[[:space:]]*\('
+  'engine\.upsertTake[[:space:]]*\('
+  'engine\.expireFact[[:space:]]*\('
 )
 
 # Build an OR-regex for one grep pass.

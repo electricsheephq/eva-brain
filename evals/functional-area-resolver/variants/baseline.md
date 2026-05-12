@@ -80,7 +80,7 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 - Any brain read/write/lookup/citation → `brain-ops`
 - Any brain page write OR chat reply mentioning a repo/project → `brain-link-refs`
 - Any outbound reply to the owner that references a brain page or workspace file → `brain-link-report`
-- Any outbound report/alert with external links (oppo alerts → `report-quality-gate`
+- Any outbound report/alert with external links (oppo alerts) → `report-quality-gate`
 - Any outbound reply in a multi-user group (floor scope < FULL) that references... → `brain-pdf-auto`
 - Any time-sensitive claim: "in N minutes" → `context-now`
 - the owner corrects a behavior, output, or decision → `correction-pipeline`
@@ -253,7 +253,7 @@ Read the skill file before acting. If two could match, read both. Non-the owner 
 ### Product / building
 - "Review this plan" / "CEO review" / "think bigger" → `gstack-openclaw-ceo-review`
 - "Debug this" / "investigate" / "root cause" → `gstack-openclaw-investigate`
-- "Office hours" / "brainstorm" / "is this worth building" / startup advice / f... → `gstack-openclaw-office-hours`
+- "Office hours" / "brainstorm" / "is this worth building" / startup advice / fundraising advice → `gstack-openclaw-office-hours`
 - Weekly engineering retrospective → `gstack-openclaw-retro`
 - "Create a skill" / "improve this skill" → `skill-creator`
 - "Skillify this", convert workflow to skill → `skillify`
