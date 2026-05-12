@@ -22,6 +22,13 @@ Options:
 }
 
 function parseArgs(argv) {
+  const requireValue = (flag, value) => {
+    if (!value || value.startsWith('-')) {
+      throw new Error(`Missing value for ${flag}`);
+    }
+    return value;
+  };
+
   const opts = {
     repoDir: REPO_ROOT,
     home: process.env.HOME || '',
@@ -30,8 +37,8 @@ function parseArgs(argv) {
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === '--repo-dir') opts.repoDir = resolve(argv[++i] || '');
-    else if (arg === '--home') opts.home = resolve(argv[++i] || '');
+    if (arg === '--repo-dir') opts.repoDir = resolve(requireValue('--repo-dir', argv[++i]));
+    else if (arg === '--home') opts.home = resolve(requireValue('--home', argv[++i]));
     else if (arg === '--dry-run') opts.dryRun = true;
     else if (arg === '--force') opts.force = true;
     else if (arg === '-h' || arg === '--help') {

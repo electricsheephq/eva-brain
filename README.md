@@ -44,6 +44,7 @@ present, and verifies the local doctor score. ~30 minutes.
 For manual installs or upgrades from an existing checkout:
 
 ```bash
+cd ~/eva-brain
 scripts/update-local-install.sh
 ```
 

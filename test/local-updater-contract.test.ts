@@ -29,14 +29,17 @@ describe('public local updater and Codex plugin packaging', () => {
   test('update script is public-host phrased and syntax-valid', () => {
     const script = readFileSync(join(root, 'scripts/update-local-install.sh'), 'utf8');
 
-    expect(script).toContain('Usage: scripts/update-local-install.sh [options]');
-    expect(script).toContain('--with-openclaw');
-    expect(script).toContain('--with-codex-plugin');
-    expect(script).toContain('node scripts/install-codex-plugin.mjs');
-    expect(script).toContain('switch --detach FETCH_HEAD');
-    expect(script).toContain('init --pglite --embedding-model voyage:voyage-4-large --embedding-dimensions 2048');
-    expect(script).toContain('if [ -f "$config_path" ]; then');
-    expect(script).toContain('run "$HOME/.bun/bin/gbrain" init');
+    expect(script).toMatch(/Usage:\s+scripts\/update-local-install\.sh\s+\[options\]/);
+    expect(script).toMatch(/--with-openclaw\b/);
+    expect(script).toMatch(/--with-codex-plugin\b/);
+    expect(script).toMatch(/node\s+scripts\/install-codex-plugin\.mjs/);
+    expect(script).toMatch(/switch\s+--detach\s+FETCH_HEAD/);
+    expect(script).toMatch(/GBRAIN_ROOT="\$\{GBRAIN_HOME:-\$HOME\}"/);
+    expect(script).toMatch(/GBRAIN_DIR="\$GBRAIN_ROOT\/\.gbrain"/);
+    expect(script).toMatch(/config_path="\$GBRAIN_DIR\/config\.json"/);
+    expect(script).toMatch(/init\s+--pglite\s+--embedding-model\s+voyage:voyage-4-large\s+--embedding-dimensions\s+2048/);
+    expect(script).toMatch(/if \[ -f "\$config_path" \]; then/);
+    expect(script).toMatch(/run "\$HOME\/\.bun\/bin\/gbrain" init/);
     expect(script).not.toMatch(/\bfleet\b/i);
 
     const result = Bun.spawnSync({
@@ -123,5 +126,18 @@ describe('public local updater and Codex plugin packaging', () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(home, 'plugins/gbrain-codex'))).toBe(false);
     expect(existsSync(join(home, '.agents/plugins/marketplace.json'))).toBe(false);
+  });
+
+  test('Codex installer rejects missing option values instead of falling back to cwd', () => {
+    for (const flag of ['--home', '--repo-dir']) {
+      const result = Bun.spawnSync({
+        cmd: ['node', 'scripts/install-codex-plugin.mjs', flag],
+        cwd: root,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      expect(result.exitCode).toBe(1);
+      expect(new TextDecoder().decode(result.stderr)).toContain(`Missing value for ${flag}`);
+    }
   });
 });

@@ -4,7 +4,12 @@ set -euo pipefail
 REPO_URL="${EVA_BRAIN_REPO_URL:-https://github.com/electricsheephq/eva-brain.git}"
 INSTALL_DIR="${EVA_BRAIN_DIR:-$HOME/eva-brain}"
 REF="${EVA_BRAIN_REF:-master}"
-GBRAIN_PARENT="${GBRAIN_HOME:-$HOME}"
+GBRAIN_ROOT="${GBRAIN_HOME:-$HOME}"
+if [ "${GBRAIN_ROOT%/.gbrain}" != "$GBRAIN_ROOT" ]; then
+  GBRAIN_ROOT="$(dirname "$GBRAIN_ROOT")"
+  export GBRAIN_HOME="$GBRAIN_ROOT"
+fi
+GBRAIN_DIR="$GBRAIN_ROOT/.gbrain"
 WITH_OPENCLAW="auto"
 WITH_CODEX_PLUGIN="auto"
 WITH_SUPPORT_KB="false"
@@ -42,7 +47,8 @@ Environment:
   VOYAGE_API_KEY               Used by gbrain provider probes and embeddings
   EVA_BRAIN_DIR                Same as --dir
   EVA_BRAIN_REF                Same as --ref
-  GBRAIN_HOME                  Parent for ~/.gbrain runtime data
+  GBRAIN_HOME                  Parent for .gbrain runtime data. If it points
+                               directly at a .gbrain dir, the updater normalizes it.
 
 Examples:
   scripts/update-local-install.sh
@@ -129,7 +135,7 @@ install_gbrain() {
   export PATH="$HOME/.bun/bin:$PATH"
   run bun install
   run bun link
-  local config_path="$GBRAIN_PARENT/.gbrain/config.json"
+  local config_path="$GBRAIN_DIR/config.json"
   if [ -f "$config_path" ]; then
     run "$HOME/.bun/bin/gbrain" init
   else
@@ -205,7 +211,7 @@ install_support_kb() {
   need_cmd git
   need_cmd node
   local kb_repo="${OPENCLAW_SUPPORT_KB_REPO:-https://github.com/electricsheephq/openclaw-support-kb.git}"
-  local kb_dir="${OPENCLAW_SUPPORT_KB_DIR:-$GBRAIN_PARENT/.gbrain/sources/openclaw-support-kb}"
+  local kb_dir="${OPENCLAW_SUPPORT_KB_DIR:-$GBRAIN_DIR/sources/openclaw-support-kb}"
   if [ -d "$kb_dir/.git" ]; then
     run git -C "$kb_dir" pull --ff-only
   else

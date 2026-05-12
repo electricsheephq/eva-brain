@@ -1699,8 +1699,11 @@ after GBrain is healthy:
 
 ```bash
 export OPENCLAW_SUPPORT_KB_REPO="https://github.com/electricsheephq/openclaw-support-kb.git"
-export GBRAIN_PARENT="${GBRAIN_HOME:-$HOME}"
-export OPENCLAW_SUPPORT_KB_DIR="$GBRAIN_PARENT/.gbrain/sources/openclaw-support-kb"
+export GBRAIN_ROOT="${GBRAIN_HOME:-$HOME}"
+if [ "${GBRAIN_ROOT%/.gbrain}" != "$GBRAIN_ROOT" ]; then
+  export GBRAIN_ROOT="$(dirname "$GBRAIN_ROOT")"
+fi
+export OPENCLAW_SUPPORT_KB_DIR="$GBRAIN_ROOT/.gbrain/sources/openclaw-support-kb"
 
 if [ -d "$OPENCLAW_SUPPORT_KB_DIR/.git" ]; then
   git -C "$OPENCLAW_SUPPORT_KB_DIR" pull --ff-only
@@ -2028,6 +2031,7 @@ present, and verifies the local doctor score. ~30 minutes.
 For manual installs or upgrades from an existing checkout:
 
 ```bash
+cd ~/eva-brain
 scripts/update-local-install.sh
 ```
 
