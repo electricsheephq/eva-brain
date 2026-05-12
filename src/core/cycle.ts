@@ -527,6 +527,8 @@ async function runPhaseBacklinks(brainDir: string, dryRun: boolean): Promise<Pha
 interface SyncPhaseResult extends PhaseResult {
   /** Slugs that sync added or modified. Used by extract for incremental processing. */
   pagesAffected?: string[];
+  /** Source id resolved from the brain directory. Used by source-aware downstream phases. */
+  sourceId?: string;
 }
 
 /**
@@ -589,9 +591,11 @@ async function runPhaseSync(
         chunksCreated: result.chunksCreated,
         failedFiles: result.failedFiles ?? 0,
         syncStatus: result.status,
+        sourceId,
         dryRun,
       },
       pagesAffected: result.pagesAffected,
+      sourceId,
     };
   } catch (e) {
     return {
@@ -664,6 +668,7 @@ async function runPhaseExtract(
 async function runPhaseExtractFacts(
   engine: BrainEngine,
   dryRun: boolean,
+  sourceId?: string,
   changedSlugs?: string[],
 ): Promise<PhaseResult> {
   try {
@@ -671,6 +676,7 @@ async function runPhaseExtractFacts(
     const result = await runExtractFacts(engine, {
       slugs: changedSlugs,
       dryRun,
+      sourceId,
     });
 
     // Empty-fence guard: pre-v51 legacy rows pending the v0_32_2 backfill.
@@ -701,6 +707,7 @@ async function runPhaseExtractFacts(
         pagesWithFacts: result.pagesWithFacts,
         factsInserted: result.factsInserted,
         factsDeleted: result.factsDeleted,
+        sourceId,
         warnings: result.warnings.slice(0, 5),
       },
     };
@@ -978,6 +985,7 @@ export async function runCycle(
     // and which slugs synthesize wrote so recompute_emotional_weight can
     // pick up the union of (sync ∪ synthesize) for v0.29 incremental mode.
     let syncPagesAffected: string[] | undefined;
+    let syncSourceId: string | undefined;
     let synthesizeWrittenSlugs: string[] | undefined;
     if (phases.includes('sync')) {
       checkAborted(opts.signal);
@@ -995,6 +1003,7 @@ export async function runCycle(
         result.duration_ms = duration_ms;
         // Capture changed slugs for incremental extract.
         syncPagesAffected = (result as SyncPhaseResult).pagesAffected;
+        syncSourceId = (result as SyncPhaseResult).sourceId;
         phaseResults.push(result);
         progress.finish();
       }
@@ -1079,8 +1088,9 @@ export async function runCycle(
         });
       } else {
         progress.start('cycle.extract_facts');
+        const sourceId = syncSourceId ?? await resolveSourceForDir(engine, opts.brainDir);
         const { result, duration_ms } = await timePhase(() =>
-          runPhaseExtractFacts(engine, dryRun, syncPagesAffected));
+          runPhaseExtractFacts(engine, dryRun, sourceId, syncPagesAffected));
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();

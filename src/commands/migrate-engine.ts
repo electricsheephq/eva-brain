@@ -185,7 +185,7 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
     // Copy timeline
     const timeline = await sourceEngine.getTimeline(page.slug);
     for (const entry of timeline) {
-      await targetEngine.addTimelineEntry(page.slug, {
+      await targetEngine.addTimelineEntry(page.slug, { // gbrain-allow-direct-insert: migrate-engine copies existing derived timeline rows during database migration
         date: entry.date,
         source: entry.source,
         summary: entry.summary,
@@ -218,7 +218,7 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
   for (const page of allPages) {
     const links = await sourceEngine.getLinks(page.slug);
     for (const link of links) {
-      await targetEngine.addLink(link.from_slug, link.to_slug, link.context, link.link_type);
+      await targetEngine.addLink(link.from_slug, link.to_slug, link.context, link.link_type); // gbrain-allow-direct-insert: migrate-engine copies existing derived link rows during database migration
     }
     progress.tick(1);
   }

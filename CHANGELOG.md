@@ -1475,7 +1475,7 @@ PGLite test (CI default) and a Postgres parity test
 
 The v0.30 dream cycle has been stalled since May 2 for one user — daily aggregated transcripts at 2.7-4.5MB each generate 1.7M-token Anthropic prompts, which hit the 1M-token hard limit and 400. The subagent handler treated those failures as renewable, so every doomed transcript stalled three times before dead-lettering, and every new cycle re-discovered and re-submitted the same fat transcripts. Six days of synth backlog, queue full of doomed work.
 
-v0.30.2 adds model-aware chunking + terminal-error classification + a poison-pill-free skip path. Wintermute's [PR #748](https://github.com/garrytan/gbrain/pull/748) supplied the boundary heuristics (`## Topic:` → `---` → `\n` ladder) and the `dream.synthesize.max_prompt_tokens` config surface. the operator's branch extended that with model-aware budgets, deterministic chunk identity for partial-progress safety, orchestrator-side slug rewriting for zero Sonnet trust on collisions, and doctor-surface visibility.
+v0.30.2 adds model-aware chunking + terminal-error classification + a poison-pill-free skip path. A downstream private-fork [PR #748](https://github.com/garrytan/gbrain/pull/748) supplied the boundary heuristics (`## Topic:` → `---` → `\n` ladder) and the `dream.synthesize.max_prompt_tokens` config surface. the operator's branch extended that with model-aware budgets, deterministic chunk identity for partial-progress safety, orchestrator-side slug rewriting for zero Sonnet trust on collisions, and doctor-surface visibility.
 
 ### What you can now do
 
@@ -3773,7 +3773,7 @@ If you're a contributor:
 - The privacy gate (`scripts/check-privacy.sh`) was previously only in the now-removed `bun run test` chain. It now runs via `bun run verify` and CI's `.github/workflows/test.yml` calls `bun run verify` directly — single source of truth for "what's the ship gate."
 
 #### CI tightening
-- **`.github/workflows/test.yml`** now runs `bun run verify` (was: 4 specific scripts inlined). Privacy check now actually fires on every CI run; previously it ran only when somebody manually invoked `bun run test`. The pre-existing `Wintermute` references in `src/core/mounts-cache.ts:6` and `:324` (introduced in earlier commits and surviving every CI green) were caught by the now-firing gate and replaced with `your OpenClaw` per the privacy rule.
+- **`.github/workflows/test.yml`** now runs `bun run verify` (was: 4 specific scripts inlined). Privacy check now actually fires on every CI run; previously it ran only when somebody manually invoked `bun run test`. The pre-existing private-fork references in `src/core/mounts-cache.ts:6` and `:324` (introduced in earlier commits and surviving every CI green) were caught by the now-firing gate and replaced with `your OpenClaw` per the privacy rule.
 
 #### Failure-first logging
 - **`.context/test-failures.log`** — extracted failure blocks per shard, prefixed with `--- shard N: <test name> ---`. Cleared at the start of every wrapper run. Falls back to `/tmp/gbrain-test-failures.log` if `.context/` is unwritable.
@@ -4242,7 +4242,7 @@ Eight more skills ship alongside book-mirror: `article-enrichment` turns raw art
 
 Three existing skills got drift-backports from the maintainer's private fork: `citation-fixer` resolves broken tweet/post references to deterministic `x.com/handle/status/id` URLs via social API; `testing` splits into skill conformance + project test-suite health with regression-aware classification (REGRESSION / STALE / FLAKE / NEW / INFRA); `cross-modal-review` adds explicit gating ("when to invoke" vs "do NOT invoke") and a `/codex review` handoff for diff review.
 
-The privacy CI guard now also blocks `/data/brain/` and `/data/.openclaw/` literals. Seven historical files are allow-listed (frozen migration files, test fixtures, env-var fallback defaults).
+The privacy CI guard now also blocks private deployment path literals. Seven historical files are allow-listed (frozen migration files, test fixtures, env-var fallback defaults).
 
 ### The numbers that matter
 
@@ -4253,7 +4253,7 @@ Counted against this branch's diff vs master and against the local test suite at
 | Skills shipped in `openclaw.plugin.json` | 25 | 34 | +9 |
 | New CLI commands | (existing) | `gbrain book-mirror`, `gbrain skillpack uninstall` | +2 |
 | Skills with drift-backport from upstream | 0 | 3 (citation-fixer, testing, cross-modal-review) | +3 |
-| Privacy CI guard banned-pattern coverage | 1 (fork-name literal) | 3 (+ `/data/brain/`, `/data/.openclaw/`) | +2 |
+| Privacy CI guard banned-pattern coverage | 1 (fork-name literal) | 3 (+ private deployment path literals) | +2 |
 | `gbrain skillpack` subcommands | 4 (list, install, diff, check) | 5 (+ uninstall) | +1 |
 | Skill-routing trust regression detector | 0 | media-ingest ↔ book-mirror routing-eval adversarial intents | +1 |
 | Filing-rule directories sanctioned | 12 | 16 (+ ideas, research, original, voice-note) | +4 |
@@ -4340,7 +4340,7 @@ No schema migration. Existing brains work unchanged.
 
 #### Added (CI guard)
 
-- **`scripts/check-privacy.sh`** extended with `BANNED_PATHS` for `/data/brain/` and `/data/.openclaw/`. 7 historical files allow-listed.
+- **`scripts/check-privacy.sh`** extended with `BANNED_PATHS` for private deployment path literals. 7 historical files allow-listed.
 
 #### Added (config schema)
 
@@ -8337,7 +8337,7 @@ CLI wrappers (`runExtract`, `runEmbed`, etc.) stay as thin arg-parsers that catc
 
 ### Added — skillify ships as a first-class gbrain skill
 
-Ported from the operator's OpenClaw, proven in production. Paired with `gbrain check-resolvable` gives a user-controllable equivalent of Hermes' auto-skill-creation — you decide when and what, the tooling keeps the 10-item checklist honest.
+Ported from the operator's OpenClaw, proven in production. Paired with `gbrain check-resolvable` gives a user-controllable equivalent of host-agent auto-skill-creation — you decide when and what, the tooling keeps the 10-item checklist honest.
 
 - `skills/skillify/SKILL.md` — the meta skill. Triggers: "skillify this", "is this a skill?", "make this proper".
 - `scripts/skillify-check.ts` — machine-readable audit. `--json` for CI, `--recent` to check files modified in the last 7 days.

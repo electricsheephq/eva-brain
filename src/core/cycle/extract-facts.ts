@@ -122,6 +122,10 @@ export async function runExtractFacts(
       result.warnings.push(
         ...parsed.warnings.map(w => `${slug}: ${w}`),
       );
+      // Parse warnings mean the markdown fence is not a trustworthy source
+      // of record for this page. Preserve the existing DB index rather than
+      // deleting good rows and replacing them with a partial parse.
+      continue;
     }
 
     if (parsed.facts.length > 0) result.pagesWithFacts += 1;

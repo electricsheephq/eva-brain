@@ -24,17 +24,19 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT"
 
 # Banned direct-call patterns. Each is a method on BrainEngine that
-# writes to a derived table. Pre-v0.32.2 callers used these freely;
-# post-v0.32.2 every call site must either route through the
+# writes to a derived table. Match any receiver (`engine.insertFact`,
+# `db.insertFact`, `this.engine.insertFact`) so aliasing the engine
+# object cannot bypass the invariant. Pre-v0.32.2 callers used these
+# freely; post-v0.32.2 every call site must either route through the
 # reconcile layer OR carry an explicit allow-direct-insert comment.
 PATTERNS=(
-  'engine\.insertFact[[:space:]]*\('
-  'engine\.insertFacts[[:space:]]*\('
-  'engine\.addLink[[:space:]]*\('
-  'engine\.addLinksBatch[[:space:]]*\('
-  'engine\.addTimelineEntry[[:space:]]*\('
-  'engine\.upsertTake[[:space:]]*\('
-  'engine\.expireFact[[:space:]]*\('
+  '\.[[:space:]]*insertFact[[:space:]]*\('
+  '\.[[:space:]]*insertFacts[[:space:]]*\('
+  '\.[[:space:]]*addLink[[:space:]]*\('
+  '\.[[:space:]]*addLinksBatch[[:space:]]*\('
+  '\.[[:space:]]*addTimelineEntry[[:space:]]*\('
+  '\.[[:space:]]*upsertTake[[:space:]]*\('
+  '\.[[:space:]]*expireFact[[:space:]]*\('
 )
 
 # Build an OR-regex for one grep pass.

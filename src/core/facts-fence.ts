@@ -403,7 +403,9 @@ export function stripFactsFence(body: string, opts: StripFactsFenceOpts = {}): s
   const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
   if (beginIdx === -1) return body;
   const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-  if (endIdx === -1) return body;
+  if (endIdx === -1) {
+    return body.slice(0, beginIdx).trimEnd();
+  }
 
   // Whole-fence strip mode (chunker case).
   if (!opts.keepVisibility || opts.keepVisibility.length === 0) {

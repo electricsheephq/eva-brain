@@ -1,6 +1,6 @@
 /**
- * Tier 2 e2e: spawn REAL openclaw, install our plugin from a built bundle of
- * `src/openclaw-context-engine.ts`, and assert the OpenClaw runtime actually
+ * Tier 2 e2e: spawn REAL openclaw, install our plugin from the repo package
+ * root, and assert the OpenClaw runtime actually
  * loads it, registers our default-export metadata, accepts it as the
  * `contextEngine` slot, and runs `plugins doctor` with zero error-level
  * diagnostics for our plugin id.
@@ -14,10 +14,10 @@
  *   accepts the registration. This test closes that gap.
  *
  * What this exercises end-to-end:
- *   1. `bun build` our entry → JS bundle (the same build the release would
- *      ship to ClawHub).
+ *   1. `bun run build:openclaw` produces the JS extension artifact named in
+ *      package.json's `openclaw.extensions`.
  *   2. `openclaw plugins install --link` against an isolated `--profile`
- *      directory.
+ *      directory using the actual package root.
  *   3. `openclaw plugins inspect <id> --runtime --json` reads our default-export shape
  *      back from the runtime registry (`status: 'loaded'`, `imported: true`,
  *      id/name/description match).
@@ -37,7 +37,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { spawnSync } from 'child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, realpathSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, realpathSync } from 'fs';
 import { join, dirname } from 'path';
 import { tmpdir, homedir } from 'os';
 
@@ -53,15 +53,14 @@ function which(bin: string): string | null {
   return path || null;
 }
 
-// Hardcoded plugin id matches src/openclaw-context-engine.ts default export.
-const PLUGIN_ID = 'gbrain-context-engine';
+// Hardcoded plugin id matches openclaw.plugin.json and the entry default export.
+const PLUGIN_ID = 'gbrain';
 const ENGINE_ID = 'gbrain-context';
 // Use a process-unique profile name so two concurrent test runs (e.g.,
 // Conductor sibling workspaces) don't collide on `~/.openclaw-<profile>`.
 const PROFILE = `gbrain-ctx-e2e-${process.pid}`;
 const PROFILE_DIR = join(homedir(), `.openclaw-${PROFILE}`);
 
-let fixtureDir = '';
 let repoRoot = '';
 
 function runOpenclaw(args: string[], opts: { timeoutMs?: number } = {}): {
@@ -91,9 +90,6 @@ function cleanup() {
   try {
     if (existsSync(PROFILE_DIR)) rmSync(PROFILE_DIR, { recursive: true, force: true });
   } catch { /* noop */ }
-  try {
-    if (fixtureDir && existsSync(fixtureDir)) rmSync(fixtureDir, { recursive: true, force: true });
-  } catch { /* noop */ }
 }
 
 describe('openclaw-plugin-load-real (Tier 2 e2e)', () => {
@@ -107,39 +103,19 @@ describe('openclaw-plugin-load-real (Tier 2 e2e)', () => {
       .stdout.trim();
     if (!repoRoot) throw new Error('not in a git repo — cannot resolve plugin source path');
 
-    fixtureDir = mkdtempSync(join(tmpdir(), 'gbrain-ctx-plugin-real-'));
-
-    // Write the fixture's package.json + openclaw.plugin.json from templates.
-    const fixtureTemplate = join(repoRoot, 'test', 'fixtures', 'openclaw-plugin-real');
-    writeFileSync(
-      join(fixtureDir, 'package.json'),
-      readFileSync(join(fixtureTemplate, 'package.json.template'), 'utf8'),
-    );
-    writeFileSync(
-      join(fixtureDir, 'openclaw.plugin.json'),
-      readFileSync(join(fixtureTemplate, 'openclaw.plugin.json.template'), 'utf8'),
-    );
-
-    // Build our real entry to a single JS bundle. This is the same source
-    // (`src/openclaw-context-engine.ts`) that the release ships; only the
-    // packaging layer (test fixture's package.json) is test-specific.
-    const buildResult = spawnSync(
-      'bun',
-      [
-        'build',
-        join(repoRoot, 'src', 'openclaw-context-engine.ts'),
-        '--target=node',
-        '--format=cjs',
-        '--outfile',
-        join(fixtureDir, 'entry.cjs'),
-      ],
-      { encoding: 'utf8', timeout: 60_000 },
-    );
+    // Build the package artifact named by package.json's openclaw.extensions.
+    // Installing the real repo root catches package-shape regressions that a
+    // hand-written test fixture can accidentally hide.
+    const buildResult = spawnSync('bun', ['run', 'build:openclaw'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      timeout: 60_000,
+    });
     if (buildResult.status !== 0) {
       throw new Error(`bun build failed (exit ${buildResult.status}): ${buildResult.stderr}`);
     }
-    if (!existsSync(join(fixtureDir, 'entry.cjs'))) {
-      throw new Error('bun build did not produce entry.cjs');
+    if (!existsSync(join(repoRoot, 'dist', 'openclaw-context-engine.js'))) {
+      throw new Error('bun build:openclaw did not produce dist/openclaw-context-engine.js');
     }
 
     // Install via openclaw plugins install --link into the isolated profile.
@@ -151,7 +127,7 @@ describe('openclaw-plugin-load-real (Tier 2 e2e)', () => {
       'plugins', 'install',
       '--link',
       '--dangerously-force-unsafe-install',
-      fixtureDir,
+      repoRoot,
     ], { timeoutMs: 60_000 });
     if (install.exitCode !== 0) {
       throw new Error(
@@ -159,7 +135,7 @@ describe('openclaw-plugin-load-real (Tier 2 e2e)', () => {
         `stdout: ${install.stdout}\nstderr: ${install.stderr}`,
       );
     }
-  });
+  }, 120_000);
 
   afterAll(() => {
     cleanup();
@@ -250,6 +226,7 @@ describe('openclaw-plugin-load-real (Tier 2 e2e)', () => {
       }
       expect(errorLines).toEqual([]);
     },
+    60_000,
   );
 
   it.skipIf(SKIP)(

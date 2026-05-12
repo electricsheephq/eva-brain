@@ -50,7 +50,7 @@ interface PluginCtx {
 }
 
 const entry: PluginEntry = {
-  id: 'gbrain-context-engine',
+  id: 'gbrain',
   name: 'GBrain Context Engine',
   description: 'Deterministic temporal/spatial context injection on every turn',
 

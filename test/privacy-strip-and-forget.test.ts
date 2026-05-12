@@ -95,6 +95,24 @@ describe('Layer A — chunker strips private fact rows (Codex R2-#1)', () => {
     expect(allText).toContain('Some text.');
   });
 
+  test('unbalanced facts fence is stripped before chunking', () => {
+    const body = `# Page
+
+Some text.
+
+${FACTS_FENCE_BEGIN}
+| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |
+|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|
+| 1 | PRIVATE_UNBALANCED_CHUNK_PROOF | fact | 1.0 | private | high | 2026-01-01 |  | s |  |
+`;
+    const chunks = chunkText(body);
+    const allText = chunks.map(c => c.text).join('\n');
+
+    expect(allText).toContain('Some text.');
+    expect(allText).not.toContain('PRIVATE_UNBALANCED_CHUNK_PROOF');
+    expect(allText).not.toContain(FACTS_FENCE_BEGIN);
+  });
+
   test('no fence at all → chunker behavior unchanged', () => {
     const body = '# Just a page\n\nNo fence here.\n';
     const chunks = chunkText(body);

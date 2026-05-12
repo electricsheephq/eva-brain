@@ -296,9 +296,9 @@ function resolveLocation(
     try {
       new Intl.DateTimeFormat('en-US', { timeZone: hb.currentLocation.timezone }).format(new Date());
       return {
-        city: hb.currentLocation.city ?? DEFAULT_HOME,
+        city: sanitizeForPrompt(hb.currentLocation.city ?? DEFAULT_HOME, 80),
         tz: hb.currentLocation.timezone,
-        source: hb.currentLocation.source ?? 'heartbeat',
+        source: sanitizeForPrompt(hb.currentLocation.source ?? 'heartbeat', 80),
       };
     } catch {
       // Fall through to active-flight or default resolution instead of
@@ -312,7 +312,8 @@ function resolveLocation(
     const destUpper = active.destination.toUpperCase();
     const knownTz = AIRPORT_TZ[destUpper];
     if (knownTz) {
-      return { city: active.destination, tz: knownTz, source: `flight:${active.flightNumber}` };
+      const flightNumber = sanitizeForPrompt(active.flightNumber ?? 'unknown', 40);
+      return { city: sanitizeForPrompt(active.destination, 40), tz: knownTz, source: `flight:${flightNumber}` };
     }
     // Unknown airport. Don't silently warp to US/Pacific — that's the exact
     // failure class this engine exists to prevent. Return UNKNOWN_TZ so
@@ -321,9 +322,9 @@ function resolveLocation(
     // path returned tz: DEFAULT_TZ with a "tz-unknown" sticker in source,
     // which was cosmetic — the engine still injected a wrong concrete time.
     return {
-      city: hb?.currentLocation?.city ?? active.destination,
+      city: sanitizeForPrompt(hb?.currentLocation?.city ?? active.destination, 80),
       tz: UNKNOWN_TZ,
-      source: `flight:${active.flightNumber}:tz-unknown:${destUpper}`,
+      source: `flight:${sanitizeForPrompt(active.flightNumber ?? 'unknown', 40)}:tz-unknown:${sanitizeForPrompt(destUpper, 40)}`,
     };
   }
 
@@ -459,7 +460,7 @@ function generateLiveContext(workspaceDir: string): LiveContext {
   // Active travel
   const activeFlight = flights?.flights?.find(f => f.status === 'active');
   const activeTravel = activeFlight
-    ? `${activeFlight.flightNumber}: ${activeFlight.origin}→${activeFlight.destination}`
+    ? `${sanitizeForPrompt(activeFlight.flightNumber ?? 'unknown', 40)}: ${sanitizeForPrompt(activeFlight.origin ?? 'unknown', 40)}→${sanitizeForPrompt(activeFlight.destination ?? 'unknown', 40)}`
     : null;
 
   // Calendar activity
@@ -515,17 +516,17 @@ function formatContextBlock(ctx: LiveContext): string {
   } else {
     // Active flight to an unmapped airport. Refuse to emit a guessed local
     // time — the LLM should see the gap explicitly.
-    lines.push(`- **Timezone:** unknown (${ctx.location.source})`);
+    lines.push(`- **Timezone:** unknown (${sanitizeForPrompt(ctx.location.source, 80)})`);
     lines.push(`- ⚠️ Local time NOT computed — verify timezone before time-sensitive actions`);
   }
 
-  lines.push(`- **Location:** ${ctx.location.city} (source: ${ctx.location.source})`);
+  lines.push(`- **Location:** ${sanitizeForPrompt(ctx.location.city, 80)} (source: ${sanitizeForPrompt(ctx.location.source, 80)})`);
 
   if (ctx.homeTime) {
     lines.push(`- **Home (SF):** ${ctx.homeTime}`);
   }
   if (ctx.activeTravel) {
-    lines.push(`- **Active travel:** ${ctx.activeTravel}`);
+    lines.push(`- **Active travel:** ${sanitizeForPrompt(ctx.activeTravel, 140)}`);
   }
   if (!ctx.userAwake) {
     lines.push(`- **User awake:** no (quiet hours ${ctx.quietHoursActive ? 'active' : 'paused'})`);

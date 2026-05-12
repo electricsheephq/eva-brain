@@ -751,7 +751,7 @@ async function runAutoLink(
     // Add outgoing edges.
     for (const c of out) {
       try {
-        await tx.addLink(
+        await tx.addLink( // gbrain-allow-direct-insert: put_page transaction reconciles frontmatter/markdown links from the source page
           slug, c.targetSlug, c.context, c.linkType,
           c.linkSource, c.originSlug, c.originField,
           linkSourceOpts,
@@ -769,7 +769,7 @@ async function runAutoLink(
     // Add incoming edges (other page → slug).
     for (const c of inc) {
       try {
-        await tx.addLink(
+        await tx.addLink( // gbrain-allow-direct-insert: put_page transaction reconciles frontmatter incoming links from the source page
           c.fromSlug!, c.targetSlug, c.context, c.linkType,
           'frontmatter', c.originSlug, c.originField,
           linkSourceOpts,

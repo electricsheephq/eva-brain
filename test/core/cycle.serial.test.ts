@@ -19,6 +19,7 @@ let lintCalls: Array<{ target: string; fix: boolean; dryRun: boolean | undefined
 let backlinksCalls: Array<{ action: string; dir: string; dryRun: boolean | undefined }> = [];
 let syncCalls: Array<{ dryRun: boolean | undefined; noPull: boolean | undefined; noExtract: boolean | undefined; sourceId: string | undefined }> = [];
 let extractCalls: Array<{ mode: string; dir: string; slugs: string[] | undefined }> = [];
+let extractFactsCalls: Array<{ dryRun: boolean | undefined; slugs: string[] | undefined; sourceId: string | undefined }> = [];
 let embedCalls: Array<{ stale: boolean | undefined; dryRun: boolean | undefined }> = [];
 let orphansCalls: number = 0;
 
@@ -78,6 +79,22 @@ mock.module('../../src/commands/extract.ts', () => ({
   walkMarkdownFiles: () => [],
   extractMarkdownLinks: () => [],
   resolveSlug: () => null,
+}));
+
+// Mock extract_facts
+mock.module('../../src/core/cycle/extract-facts.ts', () => ({
+  runExtractFacts: async (_engine: any, opts: any) => {
+    extractFactsCalls.push({ dryRun: opts.dryRun, slugs: opts.slugs, sourceId: opts.sourceId });
+    return {
+      pagesScanned: opts.slugs?.length ?? 0,
+      pagesWithFacts: 0,
+      factsInserted: 0,
+      factsDeleted: 0,
+      legacyRowsPending: 0,
+      guardTriggered: false,
+      warnings: [],
+    };
+  },
 }));
 
 // Mock embed
@@ -146,6 +163,7 @@ beforeEach(() => {
   backlinksCalls = [];
   syncCalls = [];
   extractCalls = [];
+  extractFactsCalls = [];
   embedCalls = [];
   orphansCalls = 0;
 });
@@ -541,5 +559,25 @@ describe('runCycle — sourceId resolution (regression #475)', () => {
     );
     await runCycle(sharedEngine, { brainDir: '/tmp/brain-475-f' });
     expect(syncCalls.at(-1)?.sourceId).toBe('');
+  });
+
+  test('sync-resolved source id is forwarded into extract_facts', async () => {
+    await (sharedEngine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES ('work', 'work', '/tmp/brain-475-g')`,
+    );
+    await runCycle(sharedEngine, { brainDir: '/tmp/brain-475-g', phases: ['sync', 'extract_facts'] });
+    expect(syncCalls.at(-1)?.sourceId).toBe('work');
+    expect(extractFactsCalls.at(-1)?.sourceId).toBe('work');
+    expect(extractFactsCalls.at(-1)?.slugs).toEqual(['a', 'b']);
+  });
+
+  test('extract_facts resolves source id even when sync phase is not selected', async () => {
+    await (sharedEngine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES ('facts-only', 'facts-only', '/tmp/brain-475-h')`,
+    );
+    await runCycle(sharedEngine, { brainDir: '/tmp/brain-475-h', phases: ['extract_facts'] });
+    expect(syncCalls.length).toBe(0);
+    expect(extractFactsCalls.at(-1)?.sourceId).toBe('facts-only');
+    expect(extractFactsCalls.at(-1)?.slugs).toBeUndefined();
   });
 });

@@ -567,4 +567,22 @@ describe('stripFactsFence', () => {
     expect(stripped).not.toContain('something');
     expect(stripped).not.toContain(FACTS_FENCE_BEGIN);
   });
+
+  test('unbalanced begin marker fails closed and strips the trailing fence', () => {
+    const body = `# Page
+
+Visible prose.
+
+## Facts
+
+${FACTS_FENCE_BEGIN}
+| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |
+|---|-------|------|------------|------------|------------|------------|-------------|--------|---------|
+| 1 | PRIVATE_UNBALANCED_PROOF | fact | 1.0 | private | high | 2026-01-01 |  | s |  |
+`;
+    const stripped = stripFactsFence(body, { keepVisibility: ['world'] });
+    expect(stripped).toContain('Visible prose.');
+    expect(stripped).not.toContain('PRIVATE_UNBALANCED_PROOF');
+    expect(stripped).not.toContain(FACTS_FENCE_BEGIN);
+  });
 });

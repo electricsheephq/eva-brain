@@ -125,6 +125,32 @@ async function tricky(engine: BrainEngine) {
       rmSync(fakeRepo, { recursive: true, force: true });
     }
   });
+
+  test('engine aliases do NOT bypass the gate', () => {
+    const fakeRepo = mkdtempSync(join(tmpdir(), 'gate-test-alias-'));
+    try {
+      spawnSync('git', ['init', '-q'], { cwd: fakeRepo });
+      const fakeSrc = join(fakeRepo, 'src');
+      mkdirSync(fakeSrc, { recursive: true });
+      writeFileSync(
+        join(fakeSrc, 'alias.ts'),
+        `// Aliasing BrainEngine must not bypass the source-of-record gate.
+import type { BrainEngine } from './engine.ts';
+async function sneaky(engine: BrainEngine) {
+  const db = engine;
+  await db.insertFact({ fact: 'alias bypass' } as any, { source_id: 'default' });
+}
+`,
+        'utf-8',
+      );
+
+      const r = runGate(fakeRepo);
+      expect(r.code).toBe(1);
+      expect(r.stdout).toContain('alias.ts');
+    } finally {
+      rmSync(fakeRepo, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('check-system-of-record.sh — scope correctness', () => {

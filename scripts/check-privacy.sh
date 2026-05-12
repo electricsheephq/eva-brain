@@ -92,8 +92,8 @@ fi
 
 # Allow-list: files in which the banned name is legitimate.
 # Meta-rule docs (define the rule itself), auto-generated LLM indexes,
-# historical upgrade guides, and the test that enforces the rule
-# against recipes/ all reference the banned name by necessity.
+# historical upgrade guides, and tests that enforce the rule all reference
+# the banned name by necessity.
 ALLOW_LIST=(
   'scripts/check-privacy.sh'
   'CLAUDE.md'
@@ -112,11 +112,6 @@ ALLOW_LIST=(
   'skills/migrations/v0.9.0.md'
   'skills/migrations/v0.14.0.md'
   'test/storage-status.test.ts'
-  # CHANGELOG.md documents the rule (the v0.25.1 entry references the
-  # banned literals in describing what's banned). Same exception status
-  # as CLAUDE.md and this script itself: meta-documentation needs to
-  # name the patterns it forbids.
-  'CHANGELOG.md'
   # skills/migrations/v0.25.1.md is the agent-readable upgrade
   # walkthrough; it explains the privacy-guard extension to the
   # operating agent and references the banned literals while doing so.

@@ -43,7 +43,7 @@ describe('openclaw-context-engine plugin entry', () => {
   it('default export has the expected plugin-entry shape', () => {
     const entry = pluginEntry as PluginEntryShape;
     expect(entry).toBeDefined();
-    expect(entry.id).toBe('gbrain-context-engine');
+    expect(entry.id).toBe('gbrain');
     expect(entry.name).toBe('GBrain Context Engine');
     expect(typeof entry.description).toBe('string');
     expect(entry.description.length).toBeGreaterThan(0);
