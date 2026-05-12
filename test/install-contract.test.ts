@@ -13,6 +13,9 @@ describe('Eva Brain install contract', () => {
     expect(pkg.scripts?.postinstall).toContain('INSTALL_FOR_AGENTS.md');
     expect(pkg.scripts?.postinstall).not.toContain('apply-migrations');
     expect(pkg.scripts?.postinstall).not.toContain('openclaw gateway restart');
+
+    const manifest = JSON.parse(readFileSync(join(root, 'openclaw.plugin.json'), 'utf8'));
+    expect(manifest.configSchema).not.toHaveProperty('voyage_api_key');
   });
 
   test('agent install guide preserves Eva, Voyage, OpenClaw, and support KB setup', () => {

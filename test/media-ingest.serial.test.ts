@@ -158,4 +158,34 @@ describe('ingest-media normalized integration', () => {
     const versions = await engine.getVersions('media/evidence/receipt');
     expect(versions.length).toBe(1);
   }, 30000);
+
+  test('re-import without content-file preserves existing frontmatter', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-ingest-media-preserve-frontmatter-'));
+    const mediaPath = join(dir, 'receipt.png');
+    const extractionPath = join(dir, 'receipt.extraction.json');
+    const contentPath = join(dir, 'first.md');
+    writeFileSync(mediaPath, 'fake-image-binary');
+    writeFileSync(extractionPath, readFileSync(join(FIXTURES, 'media-extraction-image.json'), 'utf-8'));
+    writeFileSync(contentPath, '---\ntitle: Store receipt\nreviewed: false\nowner: support\n---\n\nSame curated receipt narrative.\n');
+
+    try {
+      await runIngestMedia(engine, [
+        mediaPath,
+        '--extract', extractionPath,
+        '--slug', 'media/evidence/receipt',
+        '--content-file', contentPath,
+      ]);
+      await runIngestMedia(engine, [
+        mediaPath,
+        '--extract', extractionPath,
+        '--slug', 'media/evidence/receipt',
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    const after = await engine.getPage('media/evidence/receipt');
+    expect(after?.frontmatter.reviewed).toBe(false);
+    expect(after?.frontmatter.owner).toBe('support');
+  }, 30000);
 });

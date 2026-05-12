@@ -18,7 +18,7 @@ gbrain init --pglite --model voyage            # use a non-default provider
 | Provider | env vars | default dims | cost ($/1M tokens) | local? | multimodal? |
 |---|---|---|---|---|---|
 | `openai` | `OPENAI_API_KEY` | 1536 | 0.13 | no | no |
-| `voyage` | `VOYAGE_API_KEY` | 1024 | 0.18 | no | yes (`voyage-multimodal-3`) |
+| `voyage` | `VOYAGE_API_KEY` | 2048 | 0.12 for `voyage-4-large` | no | yes (`voyage-multimodal-3`) |
 | `google` | `GOOGLE_GENERATIVE_AI_API_KEY` | 768 | 0.025 | no | no |
 | `azure-openai` | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT` | 1536 | 0.13 | no | no |
 | `minimax` | `MINIMAX_API_KEY` | 1536 | 0.07 | no | no |
@@ -35,7 +35,7 @@ gbrain init --pglite --model voyage            # use a non-default provider
 ## Decision tree
 
 - **Cost-sensitive, English-only**: Ollama (free, local) or Voyage (paid, best quality per dollar).
-- **Quality-first**: Voyage `voyage-4-large` (1024-2048 dims, ~3-4× more dense tokens than OpenAI tiktoken).
+- **Quality-first**: Voyage `voyage-4-large` (Eva default: 2048 dims, ~3-4× more dense tokens than OpenAI tiktoken).
 - **Reranking pair**: Voyage (their reranker `rerank-2.5` pairs cleanly with Voyage embeddings).
 - **Enterprise compliance**: Azure OpenAI (data residency + private endpoints) or self-hosted via llama-server / Ollama.
 - **China region**: DashScope (Alibaba) or Zhipu (BigModel). DashScope's international endpoint at `dashscope-intl.aliyuncs.com`; override `provider_base_urls.dashscope` for the China endpoint.

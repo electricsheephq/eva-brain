@@ -173,6 +173,8 @@ describe('dims.dimsProviderOptions', () => {
     expect(opts).toEqual({ openaiCompatible: { dimensions: 1024 } });
     const v4Opts = dimsProviderOptions('openai-compatible', 'voyage-4-large', 2048);
     expect(v4Opts).toEqual({ openaiCompatible: { dimensions: 2048 } });
+    const v4NanoOpts = dimsProviderOptions('openai-compatible', 'voyage-4-nano', 512);
+    expect(v4NanoOpts).toEqual({ openaiCompatible: { dimensions: 512 } });
   });
 
   test('Voyage model without flexible dimensions returns undefined', () => {

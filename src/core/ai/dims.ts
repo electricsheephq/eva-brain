@@ -15,6 +15,7 @@ const VOYAGE_OUTPUT_DIMENSION_MODELS = new Set([
   'voyage-4-large',
   'voyage-4',
   'voyage-4-lite',
+  'voyage-4-nano',
   'voyage-3-large',
   'voyage-3.5',
   'voyage-3.5-lite',

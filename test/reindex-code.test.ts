@@ -91,7 +91,7 @@ describe('Layer 13 E2 — runReindexCode', () => {
     const result = await runReindexCode(engine, { dryRun: true, noEmbed: true });
     expect(result.status).toBe('dry_run');
     expect(result.model).toBe('voyage:voyage-4-large');
-    expect(result.costUsd).toBeCloseTo((result.totalTokens / 1_000_000) * 0.18, 8);
+    expect(result.costUsd).toBeCloseTo((result.totalTokens / 1_000_000) * 0.12, 8);
     resetGateway();
   });
 

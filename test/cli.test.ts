@@ -34,6 +34,7 @@ describe('CLI structure', () => {
     expect(cliSource).toContain("'export'");
     expect(cliSource).toContain("'embed'");
     expect(cliSource).toContain("'files'");
+    expect(cliSource).toContain("'reindex'");
   });
 
   test('has formatResult function for CLI output', () => {
@@ -119,6 +120,22 @@ describe('CLI dispatch integration', () => {
     const stdout = await new Response(proc.stdout).text();
     const exitCode = await proc.exited;
     expect(stdout).toContain('Usage: gbrain upgrade');
+    expect(exitCode).toBe(0);
+  });
+
+  test('reindex --help is registered as a CLI-only command', async () => {
+    const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'reindex', '--help'], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    expect(stdout).toContain('Usage: gbrain reindex');
+    expect(stderr).not.toContain('Unknown command');
     expect(exitCode).toBe(0);
   });
 

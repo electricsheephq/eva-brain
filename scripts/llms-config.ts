@@ -26,13 +26,13 @@ export type DocSection = {
 };
 
 export const PROJECT = {
-  name: "GBrain",
+  name: "Eva Brain",
   summary:
-    "GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable engines (PGLite default, Postgres+pgvector for scale), contract-first operations, 26 fat-markdown skills. Teaches agents brain ops, ingestion, enrichment, scheduling, identity, and access control.",
-  repoUrl: "https://github.com/garrytan/gbrain",
+    "Eva Brain is a thin OpenClaw-native distribution of GBrain. Pluggable engines (PGLite default, Postgres+pgvector for scale), contract-first operations, OpenClaw plugin defaults, support-KB setup, Voyage 4 Large 2048d posture, and 43 fat-markdown skills.",
+  repoUrl: "https://github.com/electricsheephq/eva-brain",
   rawBaseUrl:
     process.env.LLMS_REPO_BASE ??
-    "https://raw.githubusercontent.com/garrytan/gbrain/master",
+    "https://raw.githubusercontent.com/electricsheephq/eva-brain/master",
 };
 
 export const SECTIONS: DocSection[] = [

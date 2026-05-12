@@ -2,8 +2,15 @@ import { execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
 import { join, dirname, resolve } from 'path';
 import { VERSION } from '../version.ts';
+import type { GBrainConfig } from '../core/config.ts';
 
 const GBRAIN_GITHUB_REPO = 'electricsheephq/eva-brain';
+const DEFAULT_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
+
+export function resolvePostUpgradeEmbeddingModel(config: Pick<GBrainConfig, 'embedding_model'> | null | undefined): string {
+  const model = config?.embedding_model?.trim();
+  return model || DEFAULT_EMBEDDING_MODEL;
+}
 
 export async function runUpgrade(args: string[]) {
   if (args.includes('--help') || args.includes('-h')) {
@@ -259,6 +266,22 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
         await engine.connect(toCfgSchema(cfgSchema));
         await engine.initSchema();
         console.log('  Schema up to date.');
+
+        // v0.32.7 CJK wave: chunker-version bump → re-embed advisory.
+        // Eva policy: upgrade must not automatically reindex or embed user
+        // content. The advisory prints a cost/size estimate and manual command.
+        try {
+          const { runPostUpgradeReembedPrompt } = await import('../core/post-upgrade-reembed.ts');
+          // Use the loaded config directly. The gateway may not be configured
+          // yet during upgrade, and falling back through it can mislabel a
+          // Voyage/other-provider brain as OpenAI in the cost prompt.
+          const modelString = resolvePostUpgradeEmbeddingModel(cfgSchema);
+          await runPostUpgradeReembedPrompt(engine, modelString);
+        } catch (re) {
+          const msg = re instanceof Error ? re.message : String(re);
+          console.warn(`\nChunker-bump advisory skipped: ${msg}`);
+          console.warn('Run `gbrain reindex --markdown --repo <brain-repo>` manually when ready.');
+        }
       } finally {
         try { await engine.disconnect(); } catch { /* best-effort */ }
       }

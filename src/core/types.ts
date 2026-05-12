@@ -49,8 +49,6 @@ export function assertNever(x: never): never {
 
 export interface Page {
   id: number;
-  /** v0.18.0: owning source id. Slugs are unique per source, not globally. */
-  source_id?: string;
   slug: string;
   type: PageType;
   title: string;
@@ -97,6 +95,18 @@ export interface Page {
    * surface in `get_recent_salience`.
    */
   salience_touched_at?: Date | null;
+  /**
+   * v0.31.12: source that owns this page. Populated by rowToPage from the
+   * `source_id` column so callers like `embed` can thread it through
+   * getChunks / upsertChunks without defaulting to 'default'.
+   *
+   * v0.32.8: required. The DB column is `NOT NULL DEFAULT 'default'`, so
+   * `rowToPage` always returns it from the engine. Callers can now thread
+   * `page.source_id` directly without `!` non-null assertions.
+   *
+   * Test fixtures building synthetic Page rows must include this field.
+   */
+  source_id: string;
 }
 
 export type EffectiveDateSource =
@@ -136,12 +146,32 @@ export interface PageInput {
   effective_date_source?: EffectiveDateSource | null;
   /** v0.29.1: basename without extension captured at import. */
   import_filename?: string | null;
+  /**
+   * v0.32.7 CJK wave: bumped to MARKDOWN_CHUNKER_VERSION (2) on import so the
+   * post-upgrade `gbrain reindex --markdown` sweep can find pre-bump pages
+   * via `WHERE chunker_version < 2`. Defaults to 1 at the schema level when
+   * omitted (existing rows pre-migration inherit 1; new imports overwrite
+   * with the current version).
+   */
+  chunker_version?: number | null;
+  /**
+   * v0.32.7 CJK wave: repo-relative import path. Lets sync's delete/rename
+   * paths resolve a frontmatter-fallback slug back to its filesystem source
+   * (CJK + emoji + exotic-script files whose path doesn't derive a slug).
+   * NULL on legacy / non-file callers (MCP `put_page`, fixture seeds).
+   */
+  source_path?: string | null;
 }
 
 export interface PageFilters {
   type?: PageType;
   tag?: string;
-  /** Filter to one source. Omit or pass '__all__' to include all sources. */
+  /**
+   * Filter to one source. Omit or pass '__all__' to include all sources.
+   *
+   * v0.31.12: used to scope embed/extract operations to a single source while
+   * preserving pre-existing all-source listPages semantics when omitted.
+   */
   sourceId?: string;
   limit?: number;
   offset?: number;
@@ -305,6 +335,7 @@ export interface Chunk {
  * rows) embedding bytes over the wire. See `embed --stale` egress fix.
  */
 export interface StaleChunkRow {
+  /** v0.31.12: source_id so embed --stale can thread it through getChunks/upsertChunks. */
   source_id: string;
   slug: string;
   chunk_index: number;
