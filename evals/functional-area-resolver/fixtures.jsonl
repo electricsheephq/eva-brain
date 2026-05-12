@@ -1,0 +1,20 @@
+{"intent":"Create a person page for alice-example and enrich it from their GitHub","expected_skill":"enrich"}
+{"intent":"What do we know about acme-example","expected_skill":"gbrain"}
+{"intent":"Make a PDF from my brain page on dispatcher patterns","expected_skill":"brain-pdf"}
+{"intent":"Publish this brain page as a shareable link","expected_skill":"brain-publish"}
+{"intent":"Run brain integrity — what's lost in my archive","expected_skill":"brain-librarian"}
+{"intent":"Fix the broken citations on this page","expected_skill":"citation-fixer"}
+{"intent":"Make a personalized version of Example Playbook with my brain context","expected_skill":"book-mirror"}
+{"intent":"Read Example Decision Book through the lens of my product work","expected_skill":"strategic-reading"}
+{"intent":"Synthesize my concepts about resolver design and routing","expected_skill":"concept-synthesis"}
+{"intent":"Crawl my dropbox archive for old notes I should pull in","expected_skill":"archive-crawler"}
+{"intent":"Ingest this article from an example publication into my brain","expected_skill":"idea-ingest"}
+{"intent":"Process this YouTube video into the brain","expected_skill":"media-ingest"}
+{"intent":"I have a meeting transcript to file from this morning","expected_skill":"meeting-ingestion"}
+{"intent":"Save this voice memo and transcribe it","expected_skill":"voice-note-ingest"}
+{"intent":"What's on my calendar tomorrow","expected_skill":"google-calendar"}
+{"intent":"Draft a reply email to sam-example","expected_skill":"executive-assistant"}
+{"intent":"Research what's new about WebGPU adoption","expected_skill":"perplexity-research"}
+{"intent":"Pull my recent social posts and ingest them","expected_skill":"x-ingest"}
+{"intent":"Check me into the coffee shop I'm at","expected_skill":"checkin"}
+{"intent":"Add a task for tomorrow's meeting prep","expected_skill":"daily-task-manager"}

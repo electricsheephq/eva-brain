@@ -351,7 +351,7 @@ export async function importFromContent(
       const codeSlug = slugifyCodePath(ref.path);
       // Forward: markdown guide → code page (this guide documents that code)
       try {
-        await tx.addLink(
+        await tx.addLink( // gbrain-allow-direct-insert: import-file transaction reconciles code-reference links from source markdown
           slug, codeSlug,
           ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
           'documents', 'markdown', slug, 'compiled_truth',
@@ -360,7 +360,7 @@ export async function importFromContent(
       } catch { /* code page not yet imported — reconcile-links will catch it */ }
       // Reverse: code page → markdown guide (this code is documented by the guide)
       try {
-        await tx.addLink(
+        await tx.addLink( // gbrain-allow-direct-insert: import-file transaction reconciles reverse code-reference links from source markdown
           codeSlug, slug,
           ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
           linkOpts,
@@ -1109,7 +1109,7 @@ export async function importImageFile(
         const sibling = await tx.getPage(candidate, sourceId ? { sourceId } : undefined);
         if (sibling) {
           try {
-            await tx.addLink(
+            await tx.addLink( // gbrain-allow-direct-insert: import-file transaction reconciles image sibling link from source frontmatter
               imageSlug, candidate,
               filename,
               'image_of', 'manual', imageSlug, 'frontmatter',

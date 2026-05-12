@@ -1,6 +1,7 @@
 {
+  "id": "gbrain",
   "name": "gbrain",
-  "version": "0.31.10",
+  "version": "0.32.5",
   "description": "Eva Brain/GBrain skills and personal knowledge brain with provider-neutral hybrid search",
   "family": "bundle-plugin",
   "configSchema": {
@@ -8,19 +9,25 @@
       "type": "string",
       "required": false,
       "description": "Optional PostgreSQL connection URL. Omit for local PGLite.",
-      "uiHints": { "sensitive": true }
+      "uiHints": {
+        "sensitive": true
+      }
     },
     "voyage_api_key": {
       "type": "string",
       "required": false,
       "description": "Optional Voyage API key for Voyage 4 Large embeddings (uses VOYAGE_API_KEY env var if not set)",
-      "uiHints": { "sensitive": true }
+      "uiHints": {
+        "sensitive": true
+      }
     }
   },
   "mcpServers": {
     "gbrain": {
       "command": "gbrain",
-      "args": ["serve"]
+      "args": [
+        "serve"
+      ]
     }
   },
   "skills": [
@@ -39,6 +46,7 @@
     "skills/daily-task-prep",
     "skills/data-research",
     "skills/enrich",
+    "skills/functional-area-resolver",
     "skills/idea-ingest",
     "skills/ingest",
     "skills/maintain",
@@ -74,5 +82,10 @@
     "compat": {
       "pluginApi": ">=2026.4.0"
     }
+  },
+  "contracts": {
+    "contextEngines": [
+      "gbrain-context"
+    ]
   }
 }

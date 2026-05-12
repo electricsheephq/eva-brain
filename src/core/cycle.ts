@@ -54,7 +54,7 @@ import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 // ─── Types ─────────────────────────────────────────────────────────
 
 export type CyclePhase =
-  | 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract'
+  | 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract' | 'extract_facts'
   | 'patterns' | 'recompute_emotional_weight' | 'consolidate'
   | 'embed' | 'orphans' | 'purge';
 
@@ -64,6 +64,12 @@ export const ALL_PHASES: CyclePhase[] = [
   'sync',
   'synthesize',
   'extract',
+  // v0.32.2 — reconcile DB facts index from the `## Facts` fence on
+  // every affected entity page. Runs AFTER extract (link/timeline
+  // materialization) and BEFORE patterns (which reads graph state).
+  // The empty-fence guard refuses to run if pre-v51 legacy facts are
+  // pending the v0_32_2 backfill (Codex R2-#7).
+  'extract_facts',
   'patterns',
   // v0.29 — runs AFTER extract + synthesize so it sees the union of
   // sync-touched + synthesize-written pages with fresh tag + take state.
@@ -96,6 +102,8 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'sync',
   'synthesize',
   'extract',
+  // v0.32.2 — wipes + re-inserts facts per affected page.
+  'extract_facts',
   'patterns',
   // v0.29 — writes pages.emotional_weight column.
   'recompute_emotional_weight',
@@ -519,6 +527,8 @@ async function runPhaseBacklinks(brainDir: string, dryRun: boolean): Promise<Pha
 interface SyncPhaseResult extends PhaseResult {
   /** Slugs that sync added or modified. Used by extract for incremental processing. */
   pagesAffected?: string[];
+  /** Source id resolved from the brain directory. Used by source-aware downstream phases. */
+  sourceId?: string;
 }
 
 /**
@@ -581,9 +591,11 @@ async function runPhaseSync(
         chunksCreated: result.chunksCreated,
         failedFiles: result.failedFiles ?? 0,
         syncStatus: result.status,
+        sourceId,
         dryRun,
       },
       pagesAffected: result.pagesAffected,
+      sourceId,
     };
   } catch (e) {
     return {
@@ -647,6 +659,64 @@ async function runPhaseExtract(
       status: 'fail',
       duration_ms: 0,
       summary: 'extract phase failed',
+      details: {},
+      error: makeErrorFromException(e),
+    };
+  }
+}
+
+async function runPhaseExtractFacts(
+  engine: BrainEngine,
+  dryRun: boolean,
+  sourceId?: string,
+  changedSlugs?: string[],
+): Promise<PhaseResult> {
+  try {
+    const { runExtractFacts } = await import('./cycle/extract-facts.ts');
+    const result = await runExtractFacts(engine, {
+      slugs: changedSlugs,
+      dryRun,
+      sourceId,
+    });
+
+    // Empty-fence guard: pre-v51 legacy rows pending the v0_32_2 backfill.
+    // Surface as 'warn' so doctor + the cycle report can see it; don't fail
+    // the cycle because the workaround is well-defined (run apply-migrations).
+    if (result.guardTriggered) {
+      return {
+        phase: 'extract_facts',
+        status: 'warn',
+        duration_ms: 0,
+        summary: `extract_facts skipped: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill`,
+        details: {
+          legacyRowsPending: result.legacyRowsPending,
+          hint: 'gbrain apply-migrations --yes',
+          warnings: result.warnings,
+        },
+      };
+    }
+
+    return {
+      phase: 'extract_facts',
+      status: result.warnings.length > 0 ? 'warn' : 'ok',
+      duration_ms: 0,
+      summary: `${result.factsInserted} fact(s) reconciled across ${result.pagesScanned} page(s)` +
+        (result.warnings.length > 0 ? ` (${result.warnings.length} warning(s))` : ''),
+      details: {
+        pagesScanned: result.pagesScanned,
+        pagesWithFacts: result.pagesWithFacts,
+        factsInserted: result.factsInserted,
+        factsDeleted: result.factsDeleted,
+        sourceId,
+        warnings: result.warnings.slice(0, 5),
+      },
+    };
+  } catch (e) {
+    return {
+      phase: 'extract_facts',
+      status: 'fail',
+      duration_ms: 0,
+      summary: 'extract_facts phase failed',
       details: {},
       error: makeErrorFromException(e),
     };
@@ -915,6 +985,7 @@ export async function runCycle(
     // and which slugs synthesize wrote so recompute_emotional_weight can
     // pick up the union of (sync ∪ synthesize) for v0.29 incremental mode.
     let syncPagesAffected: string[] | undefined;
+    let syncSourceId: string | undefined;
     let synthesizeWrittenSlugs: string[] | undefined;
     if (phases.includes('sync')) {
       checkAborted(opts.signal);
@@ -932,6 +1003,7 @@ export async function runCycle(
         result.duration_ms = duration_ms;
         // Capture changed slugs for incremental extract.
         syncPagesAffected = (result as SyncPhaseResult).pagesAffected;
+        syncSourceId = (result as SyncPhaseResult).sourceId;
         phaseResults.push(result);
         progress.finish();
       }
@@ -990,6 +1062,35 @@ export async function runCycle(
         // is undefined → extract falls back to full walk (safe default).
         progress.start('cycle.extract');
         const { result, duration_ms } = await timePhase(() => runPhaseExtract(engine, opts.brainDir, dryRun, syncPagesAffected));
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── Phase 5b: extract_facts (v0.32.2) ───────────────────────
+    // Reconcile DB facts index from the `## Facts` fence on every
+    // affected entity page. Runs AFTER extract (link/timeline
+    // materialization) and BEFORE patterns/recompute_emotional_weight
+    // so downstream phases see fresh DB facts. Empty-fence guard
+    // refuses to run while v0.31 legacy facts are pending the
+    // v0_32_2 backfill (Codex R2-#7).
+    if (phases.includes('extract_facts')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'extract_facts',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.extract_facts');
+        const sourceId = syncSourceId ?? await resolveSourceForDir(engine, opts.brainDir);
+        const { result, duration_ms } = await timePhase(() =>
+          runPhaseExtractFacts(engine, dryRun, sourceId, syncPagesAffected));
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();
