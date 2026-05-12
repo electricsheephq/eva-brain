@@ -104,8 +104,8 @@ while IFS= read -r line; do
   content="${rest#*:}"
 
   line_allowed=1
-  for needle in "${BANNED_EMAILS[@]}" "${BANNED_NAMES[@]}"; do
-    if echo "$content" | grep -qi -- "$needle"; then
+  for needle in "${BANNED_EMAILS[@]}"; do
+    if printf '%s\n' "$content" | grep -qiF -- "$needle"; then
       allow_key="${file}:${needle}"
       allowed=0
       for allow_entry in "${ALLOWLIST[@]}"; do
@@ -120,6 +120,27 @@ while IFS= read -r line; do
       fi
     fi
   done
+  if [ "$line_allowed" = "1" ]; then
+    name_scan_content="$(printf '%s\n' "$content" | sed -E 's/[[:alnum:]_.%+-]+@[[:alnum:].-]+/[email]/g')"
+    for needle in "${BANNED_NAMES[@]}"; do
+      escaped="${needle//./\\.}"
+      escaped="${escaped// /\\s}"
+      if printf '%s\n' "$name_scan_content" | grep -qiE -- "\\b${escaped}\\b"; then
+        allow_key="${file}:${needle}"
+        allowed=0
+        for allow_entry in "${ALLOWLIST[@]}"; do
+          if [ "$allow_entry" = "$allow_key" ]; then
+            allowed=1
+            break
+          fi
+        done
+        if [ "$allowed" = "0" ]; then
+          line_allowed=0
+          break
+        fi
+      fi
+    done
+  fi
 
   if [ "$line_allowed" = "0" ]; then
     filtered+="${line}"$'\n'
