@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -33,6 +33,7 @@ describe('public local updater and Codex plugin packaging', () => {
     expect(script).toContain('--with-openclaw');
     expect(script).toContain('--with-codex-plugin');
     expect(script).toContain('node scripts/install-codex-plugin.mjs');
+    expect(script).toContain('switch --detach FETCH_HEAD');
     expect(script).toContain('init --pglite --embedding-model voyage:voyage-4-large --embedding-dimensions 2048');
     expect(script).toContain('if [ -f "$config_path" ]; then');
     expect(script).toContain('run "$HOME/.bun/bin/gbrain" init');
@@ -91,6 +92,24 @@ describe('public local updater and Codex plugin packaging', () => {
     expect(entry.source.path).toBe('./plugins/gbrain-codex');
     expect(entry.policy.installation).toBe('AVAILABLE');
     expect(entry.policy.authentication).toBe('ON_INSTALL');
+  });
+
+  test('Codex installer replaces stale or broken local gbrain-codex symlinks', () => {
+    const home = tempHome();
+    const pluginDir = join(home, 'plugins/gbrain-codex');
+    mkdirSync(join(home, 'plugins'), { recursive: true });
+    symlinkSync('/path/that/does/not/exist', pluginDir);
+    expect(lstatSync(pluginDir).isSymbolicLink()).toBe(true);
+
+    const result = Bun.spawnSync({
+      cmd: ['node', 'scripts/install-codex-plugin.mjs', '--home', home, '--repo-dir', root],
+      cwd: root,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(result.exitCode).toBe(0);
+    expect(lstatSync(pluginDir).isDirectory()).toBe(true);
+    expect(readlinkSync(join(pluginDir, 'skills'))).toBe(join(root, 'skills'));
   });
 
   test('Codex installer dry-run does not create home plugin files', () => {

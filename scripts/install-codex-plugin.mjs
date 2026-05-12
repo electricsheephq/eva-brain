@@ -70,8 +70,13 @@ function assertRepoShape(repoDir) {
 }
 
 function safeRemovePluginDir(pluginDir, force) {
-  if (!existsSync(pluginDir)) return;
-  const stat = lstatSync(pluginDir);
+  let stat;
+  try {
+    stat = lstatSync(pluginDir);
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return;
+    throw error;
+  }
   if (stat.isSymbolicLink()) {
     rmSync(pluginDir, { force: true });
     return;

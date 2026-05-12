@@ -103,8 +103,12 @@ checkout_repo() {
       die "Checkout is dirty. Commit/stash changes or pass --allow-dirty."
     fi
     run git -C "$INSTALL_DIR" fetch origin "$REF"
-    run git -C "$INSTALL_DIR" switch "$REF"
-    run git -C "$INSTALL_DIR" pull --ff-only origin "$REF"
+    if git -C "$INSTALL_DIR" rev-parse --verify --quiet "refs/heads/$REF" >/dev/null; then
+      run git -C "$INSTALL_DIR" switch "$REF"
+      run git -C "$INSTALL_DIR" pull --ff-only origin "$REF"
+    else
+      run git -C "$INSTALL_DIR" switch --detach FETCH_HEAD
+    fi
   elif [ -e "$INSTALL_DIR" ]; then
     die "Install dir exists but is not a git checkout: $INSTALL_DIR"
   else
