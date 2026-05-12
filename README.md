@@ -41,7 +41,15 @@ GBrain, sets up a Voyage 4 Large 2048d brain when `VOYAGE_API_KEY` is available,
 installs host plugins such as OpenClaw and Codex Desktop when those hosts are
 present, and verifies the local doctor score. ~30 minutes.
 
-For manual installs or upgrades from an existing checkout:
+For a full local OpenClaw/Codex/support-KB install from a shell:
+
+```bash
+git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain
+cd ~/eva-brain
+scripts/update-local-install.sh --with-openclaw --with-codex-plugin --with-support-kb --stop-stale-serve
+```
+
+For manual upgrades from an existing checkout:
 
 ```bash
 cd ~/eva-brain
@@ -49,7 +57,29 @@ scripts/update-local-install.sh
 ```
 
 Use `--with-openclaw` or `--with-codex-plugin` when you want the script to fail
-instead of auto-skipping a missing host.
+instead of auto-skipping a missing host. Use `--with-support-kb` to install or
+refresh the OpenClaw support knowledge base as a named GBrain source.
+
+### What Eva Adds
+
+Eva Brain tracks upstream GBrain closely. The downstream additions are the host
+and install surfaces our users need:
+
+- **OpenClaw native plugin:** `plugins/openclaw-gbrain` adds GBrain tools and
+  `/plugins/gbrain/extract`, using OpenClaw's logged-in Codex runtime for
+  extraction instead of asking users for an OpenAI API key.
+- **Codex Desktop plugin:** `plugins/gbrain-codex` is a thin local MCP package
+  that launches the installed `gbrain serve` for Codex Desktop.
+- **One-command updater:** `scripts/update-local-install.sh` safely updates the
+  checkout, links the CLI, runs idempotent local init/migrations, and optionally
+  refreshes host plugins and the support KB.
+- **Opinionated defaults:** Voyage 4 Large at 2048 dimensions for technical
+  workspaces, `~/.gbrain/gbrain.env` support, and safe local install behavior.
+
+Upstream GBrain still owns the database, search, sync, graph, facts, native
+media, provider recipes, and MCP core. Eva's media extraction schema is an
+adapter payload for host runtimes; it is not intended to replace upstream's
+native image/file/media storage model.
 
 For provider choice, embedding dimensions, Voyage 4 Large 2048d setup, and the OpenClaw Codex OAuth extraction boundary, read [`docs/guides/provider-install-matrix.md`](docs/guides/provider-install-matrix.md).
 

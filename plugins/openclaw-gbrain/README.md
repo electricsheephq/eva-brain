@@ -19,13 +19,10 @@ From a fresh Eva Brain checkout:
 ```bash
 git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain
 cd ~/eva-brain
-curl -fsSL https://bun.sh/install | bash
-export PATH="$HOME/.bun/bin:$PATH"
-bun install && bun link
-gbrain --version
+scripts/update-local-install.sh --with-openclaw
 ```
 
-Then install the OpenClaw plugin from the same checkout:
+Or install the plugin manually from an existing checkout:
 
 ```bash
 openclaw plugins install --dangerously-force-unsafe-install ./plugins/openclaw-gbrain
@@ -44,6 +41,13 @@ or you can link it:
 
 ```bash
 openclaw plugins install --link --dangerously-force-unsafe-install ./plugins/openclaw-gbrain
+```
+
+For a full local support setup that also installs the Codex Desktop plugin and
+OpenClaw support KB:
+
+```bash
+scripts/update-local-install.sh --with-openclaw --with-codex-plugin --with-support-kb --stop-stale-serve
 ```
 
 ## Configure

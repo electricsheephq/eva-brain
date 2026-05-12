@@ -32,6 +32,25 @@ plugins when those hosts are present.
 To require host plugin setup instead of auto-detecting it, pass
 `--with-openclaw` and/or `--with-codex-plugin`.
 
+Full Eva/OpenClaw/Codex/support-KB install:
+
+```bash
+git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain
+cd ~/eva-brain
+scripts/update-local-install.sh --with-openclaw --with-codex-plugin --with-support-kb --stop-stale-serve
+```
+
+What that command does:
+
+- installs or updates the local `gbrain` CLI from this checkout
+- initializes PGLite if no brain exists yet
+- keeps existing local brain data under `~/.gbrain`
+- installs the OpenClaw native plugin from `plugins/openclaw-gbrain`
+- installs the Codex Desktop plugin from `plugins/gbrain-codex`
+- installs or updates the OpenClaw support KB as source `openclaw-support-kb`
+- embeds only stale chunks for that KB source
+- runs provider probe and `gbrain doctor` when possible
+
 Manual path:
 
 ```bash
@@ -110,6 +129,11 @@ The plugin provides:
 - `gbrain_query`
 - `/plugins/gbrain/extract` for OAuth-backed extraction through OpenClaw/Codex
 
+What is different from normal GBrain: normal GBrain exposes CLI and MCP tools.
+The OpenClaw plugin lets OpenClaw agents call those tools natively and adds a
+host-owned extraction route. That route uses OpenClaw's logged-in Codex runtime;
+users do not need an OpenAI API key for extraction.
+
 Media boundary: upstream GBrain owns native image indexing through image pages,
 file records, multimodal embeddings, OCR, and `query --image`. Eva's OpenClaw
 plugin owns OAuth-backed enrichment/extraction and returns
@@ -137,6 +161,10 @@ updates `~/.agents/plugins/marketplace.json`.
 The plugin is a thin MCP adapter over the local `gbrain` CLI. It does not embed
 a second brain runtime. If Codex cannot see `gbrain` on the GUI PATH, set
 `GBRAIN_CODEX_BIN` to the desired executable path before launching Codex.
+
+What is different from normal GBrain: normal GBrain can already be configured as
+an MCP server manually. The Codex plugin packages that MCP launch path in a
+repo-owned plugin directory so agents can install it repeatably with one script.
 
 ## Step 3.7: Install The OpenClaw Support KB
 
