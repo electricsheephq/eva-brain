@@ -12,6 +12,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 let engine: PGLiteEngine;
 
@@ -26,10 +27,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (engine as any).db.query('DELETE FROM facts');
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (engine as any).db.query('DELETE FROM pages');
+  await resetPgliteState(engine);
 });
 
 async function putPage(slug: string, body: string): Promise<void> {

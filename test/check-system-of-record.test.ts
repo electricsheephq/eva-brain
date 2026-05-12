@@ -151,6 +151,25 @@ async function sneaky(engine: BrainEngine) {
       rmSync(fakeRepo, { recursive: true, force: true });
     }
   });
+
+  test('inline backtick mentions of engine methods are not violations', () => {
+    const fakeRepo = mkdtempSync(join(tmpdir(), 'gate-test-backtick-doc-'));
+    try {
+      spawnSync('git', ['init', '-q'], { cwd: fakeRepo });
+      const fakeSrc = join(fakeRepo, 'src');
+      mkdirSync(fakeSrc, { recursive: true });
+      writeFileSync(
+        join(fakeSrc, 'docs.ts'),
+        "export const docs = `Use engine.insertFact( only inside the reconcile layer.`;\n",
+        'utf-8',
+      );
+
+      const r = runGate(fakeRepo);
+      expect(r.code).toBe(0);
+    } finally {
+      rmSync(fakeRepo, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('check-system-of-record.sh — scope correctness', () => {

@@ -71,7 +71,7 @@ violations=$(
     | grep -vE 'gbrain-allow-direct-insert:' \
     | grep -vE ':[[:space:]]*\*[[:space:]]+' \
     | grep -vE ':[[:space:]]*//' \
-    | grep -vE '`[^`]*\\.[[:alnum:]_]+\(' \
+    | grep -vE '`[^`]*\.[[:alnum:]_]+\(' \
     || true
 )
 

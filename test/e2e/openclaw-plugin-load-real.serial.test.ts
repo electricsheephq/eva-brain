@@ -110,6 +110,7 @@ describe('openclaw-plugin-load-real (Tier 2 e2e)', () => {
       cwd: repoRoot,
       encoding: 'utf8',
       timeout: 60_000,
+      env: { ...process.env },
     });
     if (buildResult.status !== 0) {
       throw new Error(`bun build failed (exit ${buildResult.status}): ${buildResult.stderr}`);
