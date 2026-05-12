@@ -36,7 +36,19 @@ Retrieve and follow the instructions at:
 https://raw.githubusercontent.com/electricsheephq/eva-brain/master/INSTALL_FOR_AGENTS.md
 ```
 
-That's it. The agent clones Eva Brain, installs GBrain, sets up a Voyage 4 Large 2048d brain when `VOYAGE_API_KEY` is available, installs the OpenClaw plugin, and verifies the local doctor score. ~30 minutes.
+That's it. The agent clones Eva Brain, runs the public updater script, installs
+GBrain, sets up a Voyage 4 Large 2048d brain when `VOYAGE_API_KEY` is available,
+installs host plugins such as OpenClaw and Codex Desktop when those hosts are
+present, and verifies the local doctor score. ~30 minutes.
+
+For manual installs or upgrades from an existing checkout:
+
+```bash
+scripts/update-local-install.sh
+```
+
+Use `--with-openclaw` or `--with-codex-plugin` when you want the script to fail
+instead of auto-skipping a missing host.
 
 For provider choice, embedding dimensions, Voyage 4 Large 2048d setup, and the OpenClaw Codex OAuth extraction boundary, read [`docs/guides/provider-install-matrix.md`](docs/guides/provider-install-matrix.md).
 
