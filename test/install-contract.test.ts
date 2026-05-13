@@ -18,6 +18,27 @@ describe('Eva Brain install contract', () => {
     expect(manifest.configSchema).not.toHaveProperty('voyage_api_key');
   });
 
+  test('root bundle plugin launches the installed gbrain serve runtime', () => {
+    const manifest = JSON.parse(readFileSync(join(root, 'openclaw.plugin.json'), 'utf8'));
+    const server = manifest.mcpServers?.gbrain;
+
+    expect(server?.command).toBe('gbrain');
+    expect(server?.args).toEqual(['serve']);
+  });
+
+  test('repo-owned version surfaces track the package version', () => {
+    const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+    const rootManifest = JSON.parse(readFileSync(join(root, 'openclaw.plugin.json'), 'utf8'));
+    const codexPkg = JSON.parse(readFileSync(join(root, 'plugins/gbrain-codex/package.json'), 'utf8'));
+    const codexPlugin = JSON.parse(readFileSync(join(root, 'plugins/gbrain-codex/.codex-plugin/plugin.json'), 'utf8'));
+    const versionSource = readFileSync(join(root, 'src/version.ts'), 'utf8');
+
+    expect(rootManifest.version).toBe(pkg.version);
+    expect(codexPkg.version).toBe(pkg.version);
+    expect(codexPlugin.version).toBe(pkg.version);
+    expect(versionSource).toContain('pkg.version');
+  });
+
   test('agent install guide preserves Eva, Voyage, OpenClaw, and support KB setup', () => {
     const guide = readFileSync(join(root, 'INSTALL_FOR_AGENTS.md'), 'utf8');
 
