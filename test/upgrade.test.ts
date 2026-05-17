@@ -13,7 +13,8 @@ describe('upgrade command', () => {
     const stdout = await new Response(proc.stdout).text();
     const exitCode = await proc.exited;
     expect(stdout).toContain('Usage: gbrain upgrade');
-    expect(stdout).toContain('Detects install method');
+    expect(stdout).toContain('Self-update the Eva Brain CLI');
+    expect(stdout).toContain('public source updater');
     expect(exitCode).toBe(0);
   });
 
@@ -73,7 +74,7 @@ describe('detectInstallMethod heuristic (source analysis)', () => {
   });
 
   // v0.28.5 cluster D: 3-signal layered detection.
-  test('bun-link signal walks .git/config for garrytan/gbrain match', () => {
+  test('bun-link signal walks .git/config for the Eva Brain repo match', () => {
     expect(source).toContain('function detectBunLink');
     expect(source).toContain('GBRAIN_GITHUB_REPO');
     expect(source).toContain('toLowerCase()');
@@ -118,6 +119,14 @@ describe('detectInstallMethod heuristic (source analysis)', () => {
     expect(source).toContain('git clone');
     expect(source).toContain('releases');
     expect(source).toContain('#658');
+  });
+
+  test('Eva upgrade messages point at the fork updater, not upstream package commands', () => {
+    expect(source).toContain('electricsheephq/eva-brain');
+    expect(source).toContain('scripts/update-local-install.sh');
+    expect(source).not.toContain('bun update gbrain');
+    expect(source).not.toContain('clawhub update gbrain');
+    expect(source).not.toContain('https://github.com/garrytan/gbrain/releases');
   });
 });
 

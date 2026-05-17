@@ -62,6 +62,19 @@ describe('skillpack sync-guard', () => {
     }
   });
 
+  it('openclaw.plugin.json skills equal manifest skills minus explicit exclusions', () => {
+    const plugin = readJson(pluginPath);
+    const skillsManifest = readJson(skillsManifestPath);
+    const excluded = new Set(plugin.excluded_from_install ?? []);
+    const expected = skillsManifest.skills
+      .map((s: { path: string }) => `skills/${s.path.replace(/\/SKILL\.md$/, '')}`)
+      .filter((path: string) => !excluded.has(path))
+      .sort();
+    const actual = [...plugin.skills].sort();
+
+    expect(actual).toEqual(expected);
+  });
+
   it('excluded skills are not listed in plugin.skills (install list is curated)', () => {
     const plugin = readJson(pluginPath);
     const excluded = new Set(plugin.excluded_from_install ?? []);
@@ -78,5 +91,14 @@ describe('skillpack sync-guard', () => {
     const minor = parseInt(plugin.version.split('.')[1], 10);
     expect(major).toBe(0);
     expect(minor).toBeGreaterThanOrEqual(17);
+  });
+
+  it('plugin version matches package.json and skills/manifest.json', () => {
+    const plugin = readJson(pluginPath);
+    const skillsManifest = readJson(skillsManifestPath);
+    const pkg = readJson(join(REPO, 'package.json'));
+
+    expect(plugin.version).toBe(pkg.version);
+    expect(plugin.version).toBe(skillsManifest.version);
   });
 });

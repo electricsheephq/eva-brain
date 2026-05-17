@@ -32,6 +32,7 @@ import {
 import { tryAcquireDbLock, SYNC_LOCK_ID } from '../core/db-lock.ts';
 import { loadStorageConfig } from '../core/storage-config.ts';
 import { getDefaultSourcePath } from '../core/source-resolver.ts';
+import { sortNewestFirst } from '../core/sort-newest-first.ts';
 
 const DEFAULT_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
 
@@ -243,10 +244,21 @@ export function buildGitInvocation(repoPath: string, args: string[], configs: st
   return [...cfg, '-C', repoPath, ...args];
 }
 
+/**
+ * Shell out to git with a generous maxBuffer.
+ *
+ * Node's default maxBuffer is 1 MiB.  `git diff --name-status -M` on a
+ * 60–100K file repo easily exceeds that, causing an ENOBUFS crash that
+ * kills the sync process with no error message in the log.
+ *
+ * 100 MiB is generous but still bounded — a 100K-file diff with long
+ * paths tops out around 10–20 MiB in practice.
+ */
 function git(repoPath: string, args: string[], configs: string[] = []): string {
   return execFileSync('git', buildGitInvocation(repoPath, args, configs), {
     encoding: 'utf-8',
     timeout: 30000,
+    maxBuffer: 100 * 1024 * 1024,
   }).trim();
 }
 
@@ -722,6 +734,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // gate `sync.last_commit` advancement and record recoverable errors.
   const failedFiles: Array<{ path: string; error: string; line?: number }> = [];
   const addsAndMods = [...filtered.added, ...filtered.modified];
+
+  // Sort newest-first so date-prefixed brain paths get embedded before older
+  // ones. See src/core/sort-newest-first.ts for the policy.
+  sortNewestFirst(addsAndMods);
 
   // v0.22.13 (PR #490 Q5): one source of truth for the concurrency decision.
   // engine.kind === 'pglite' → forced 1; explicit opts.concurrency wins;

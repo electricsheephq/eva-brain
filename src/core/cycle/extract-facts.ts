@@ -96,7 +96,7 @@ export async function runExtractFacts(
 
   // ── Resolve target slug set ───────────────────────────────────
   let slugs: string[];
-  if (opts.slugs && opts.slugs.length > 0) {
+  if (opts.slugs !== undefined) {
     slugs = opts.slugs;
   } else {
     // Full walk: every page in the brain. Bounded by engine.getAllSlugs

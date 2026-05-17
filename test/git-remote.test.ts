@@ -4,6 +4,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   GIT_SSRF_FLAGS,
+  GIT_SSRF_SUBCOMMAND_FLAGS,
   parseRemoteUrl,
   RemoteUrlError,
   cloneRepo,
@@ -81,11 +82,18 @@ const fakePath = (): string => `${FAKE_GIT_DIR}:${process.env.PATH ?? ''}`;
 // ---------------------------------------------------------------------------
 
 describe('GIT_SSRF_FLAGS', () => {
-  test('exact shape — codex SSRF lockdown', () => {
+  test('exact shape — global config flags spread before the verb', () => {
     expect([...GIT_SSRF_FLAGS]).toEqual([
       '-c', 'http.followRedirects=false',
       '-c', 'protocol.file.allow=never',
       '-c', 'protocol.ext.allow=never',
+    ]);
+  });
+});
+
+describe('GIT_SSRF_SUBCOMMAND_FLAGS', () => {
+  test('exact shape — subcommand flags spread after the verb', () => {
+    expect([...GIT_SSRF_SUBCOMMAND_FLAGS]).toEqual([
       '--no-recurse-submodules',
     ]);
   });
@@ -229,12 +237,17 @@ describe('cloneRepo', () => {
     const calls = readArgvLog();
     expect(calls.length).toBe(1);
     const argv = calls[0];
-    // Pin the SSRF flags before the 'clone' verb (codex Q2 invariant).
+    // Pin global SSRF flags before the 'clone' verb.
     expect(argv.slice(0, GIT_SSRF_FLAGS.length)).toEqual([...GIT_SSRF_FLAGS]);
     expect(argv).toContain('clone');
     expect(argv).toContain('--depth=1');
     expect(argv).toContain('https://example.com/repo');
     expect(argv[argv.length - 1]).toBe(dest);
+    const cloneIdx = argv.indexOf('clone');
+    expect(cloneIdx).toBeGreaterThan(-1);
+    for (const subFlag of GIT_SSRF_SUBCOMMAND_FLAGS) {
+      expect(argv.indexOf(subFlag)).toBeGreaterThan(cloneIdx);
+    }
   });
 
   test('depth=0 means no --depth flag (full clone)', async () => {
@@ -309,6 +322,11 @@ describe('pullRepo', () => {
     expect(argv.slice(2, 2 + GIT_SSRF_FLAGS.length)).toEqual([...GIT_SSRF_FLAGS]);
     expect(argv).toContain('pull');
     expect(argv).toContain('--ff-only');
+    const pullIdx = argv.indexOf('pull');
+    expect(pullIdx).toBeGreaterThan(-1);
+    for (const subFlag of GIT_SSRF_SUBCOMMAND_FLAGS) {
+      expect(argv.indexOf(subFlag)).toBeGreaterThan(pullIdx);
+    }
     rmSync(repo, { recursive: true, force: true });
   });
 

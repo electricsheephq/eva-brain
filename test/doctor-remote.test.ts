@@ -353,7 +353,7 @@ describe('runUpgradeDriftCheck', () => {
         expect(result.message).toContain('major upgrade available');
         // Manual-install hint, NOT the auto-upgrade hint
         expect(result.message).toContain('Prior `gbrain upgrade` did not advance');
-        expect(result.message).toContain('https://github.com/garrytan/gbrain/releases');
+        expect(result.message).toContain('https://github.com/electricsheephq/eva-brain/releases');
         expect(result.message).not.toContain('Run `gbrain upgrade`');
         expect(result.detail?.prior_failed).toBe(true);
       });

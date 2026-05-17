@@ -50,7 +50,12 @@ describe('Eva Brain install contract', () => {
     expect(setupSkill).not.toContain('bun add github:garrytan/gbrain');
     expect(upgrade).toContain('git clone https://github.com/electricsheephq/eva-brain.git ~/eva-brain');
     expect(upgrade).toContain('cd ~/eva-brain && bun install && bun link');
+    expect(upgrade).toContain('scripts/update-local-install.sh');
+    expect(upgrade).toContain('https://github.com/electricsheephq/eva-brain/releases');
     expect(upgrade).not.toContain('cd gbrain && bun install && bun link');
+    expect(upgrade).not.toContain('bun update gbrain');
+    expect(upgrade).not.toContain('clawhub update gbrain');
+    expect(upgrade).not.toContain('https://github.com/garrytan/gbrain/releases');
   });
 
   test('recurring job docs do not use git sync for local-only brains', () => {

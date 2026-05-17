@@ -146,7 +146,6 @@ describe('Layer 13 E2 — runReindexCode', () => {
       compiled_truth: 'export const source = "kb";',
       timeline: '',
       frontmatter: { language: 'typescript', file: 'src/shared.ts' },
-      source_id: 'kb-code',
     }, { sourceId: 'kb-code' });
 
     const result = await runReindexCode(engine, {

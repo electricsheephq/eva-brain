@@ -1,6 +1,10 @@
 import { VERSION } from '../version.ts';
 import { detectInstallMethod } from './upgrade.ts';
 
+const EVA_BRAIN_REPO = 'electricsheephq/eva-brain';
+const EVA_BRAIN_REPO_URL = `https://github.com/${EVA_BRAIN_REPO}`;
+const EVA_SOURCE_UPDATE_COMMAND = 'cd ~/eva-brain && scripts/update-local-install.sh';
+
 interface CheckUpdateResult {
   current_version: string;
   current_source: 'package-json';
@@ -33,16 +37,17 @@ export function isMinorOrMajorBump(current: string, latest: string): boolean {
 
 function upgradeCommandForMethod(method: string): string {
   switch (method) {
-    case 'bun': return 'bun update gbrain';
-    case 'clawhub': return 'clawhub update gbrain';
-    case 'binary': return 'Download from https://github.com/garrytan/gbrain/releases';
+    case 'bun':
+    case 'clawhub':
+    case 'binary':
+      return EVA_SOURCE_UPDATE_COMMAND;
     default: return 'gbrain upgrade';
   }
 }
 
 async function fetchLatestRelease(): Promise<{ tag: string; published_at: string; url: string } | null> {
   try {
-    const res = await fetch('https://api.github.com/repos/garrytan/gbrain/releases/latest', {
+    const res = await fetch(`https://api.github.com/repos/${EVA_BRAIN_REPO}/releases/latest`, {
       headers: { 'User-Agent': `gbrain/${VERSION}` },
       signal: AbortSignal.timeout(10_000),
     });
@@ -60,7 +65,7 @@ async function fetchLatestRelease(): Promise<{ tag: string; published_at: string
 
 async function fetchChangelog(currentVersion: string, latestVersion: string): Promise<string> {
   try {
-    const res = await fetch('https://raw.githubusercontent.com/garrytan/gbrain/master/CHANGELOG.md', {
+    const res = await fetch(`${EVA_BRAIN_REPO_URL}/raw/master/CHANGELOG.md`, {
       signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) return '';

@@ -186,7 +186,8 @@ export interface Take {
 export interface TakesListOpts {
   page_id?: number;
   page_slug?: string;       // resolved via JOIN
-  sourceId?: string;        // optional source filter for duplicate slugs
+  /** Scope page joins to one source. Omitted means all sources for listing/search paths that explicitly opt into this filter. */
+  sourceId?: string;
   holder?: string;
   kind?: TakeKind;
   active?: boolean;         // default true (only active rows)
@@ -436,6 +437,9 @@ export interface BrainEngine {
    * filter contract). Pass `opts.includeDeleted: true` to surface them with
    * `deleted_at` populated — used by `gbrain pages purge-deleted` listing,
    * by `restore_page` flow, and by operator diagnostics.
+   * Source behavior: omitted `opts.sourceId` targets the historical
+   * `default` source. Federated or multi-source callers must pass an explicit
+   * source for non-default rows.
    */
   getPage(slug: string, opts?: GetPageOpts): Promise<Page | null>;
   /**
@@ -458,7 +462,7 @@ export interface BrainEngine {
   /**
    * v0.18.0+ multi-source: `opts.sourceId` scopes the DELETE so a source-A
    * delete doesn't hard-delete the same-slug pages in sources B/C/D. Without
-   * it, the bare DELETE matches every row with that slug across all sources.
+   * it, the operation targets the historical `default` source only.
    * Cascades through content_chunks / page_links / chunk_relations via FKs.
    */
   deletePage(slug: string, opts?: { sourceId?: string }): Promise<void>;
@@ -467,12 +471,14 @@ export interface BrainEngine {
    * was soft-deleted, null if no row matched (already soft-deleted OR not found).
    * Idempotent-as-null. The page stays in the DB and cascade rows (chunks,
    * links) stay intact; the autopilot purge phase hard-deletes after 72h.
+   * Omitted `opts.sourceId` targets `default`, not every same-slug source row.
    */
   softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null>;
   /**
    * v0.26.5 — clear `deleted_at` on a soft-deleted page. Returns true iff a
    * row was restored. False if the slug is unknown OR the page is not
    * currently soft-deleted (idempotent-as-false).
+   * Omitted `opts.sourceId` targets `default`, not every same-slug source row.
    */
   restorePage(slug: string, opts?: { sourceId?: string }): Promise<boolean>;
   /**
@@ -534,20 +540,38 @@ export interface BrainEngine {
    */
   getChunks(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]>;
   /**
-   * Count chunks across the entire brain where embedded_at IS NULL.
+   * Count chunks across the brain where embedding IS NULL.
    * Pre-flight short-circuit for `embed --stale` so a 100%-embedded brain
    * does no further work after a single SELECT count(*) (~50 bytes wire).
+   *
+   * `opts.sourceId` scopes the count to a single source. When omitted,
+   * counts across every source in the brain. Operators running
+   * `gbrain embed --stale --source media-corpus` expect only that
+   * source's NULLs touched; the caller threads `sourceId` here.
    */
   countStaleChunks(opts?: { sourceId?: string }): Promise<number>;
   /**
-   * Return every chunk where embedded_at IS NULL, with the metadata needed
+   * Return every chunk where embedding IS NULL, with the metadata needed
    * to call embedBatch + upsertChunks. The `embedding` column is omitted
    * by design — stale rows have NULL embeddings, so shipping them wastes
    * wire bytes for no gain. Caller groups by slug, embeds, and re-upserts.
    *
-   * Bounded by an internal LIMIT of 100000 to mirror listPages.
+   * v0.33.3: cursor-paginated — yields up to `batchSize` rows per call
+   * (default 2000) to stay within Supabase's statement_timeout. Pass the
+   * last row's `(page_id, chunk_index)` as `afterPageId`/`afterChunkIndex`
+   * to fetch the next page.  When fewer than `batchSize` rows come back,
+   * the caller has reached the end.
+   *
+   * `opts.sourceId` scopes the scan to a single source (matches the
+   * countStaleChunks contract). Paired with embedAllStale's --source
+   * support.
    */
-  listStaleChunks(opts?: { sourceId?: string }): Promise<StaleChunkRow[]>;
+  listStaleChunks(opts?: {
+    batchSize?: number;
+    afterPageId?: number;
+    afterChunkIndex?: number;
+    sourceId?: string;
+  }): Promise<StaleChunkRow[]>;
   /**
    * Delete every chunk for a page. Internal page-id lookup is sourceId-scoped
    * when `opts.sourceId` is given; otherwise the bare-slug subquery returns
@@ -630,18 +654,31 @@ export interface BrainEngine {
     dirPrefix?: string,
     minSimilarity?: number,
   ): Promise<{ slug: string; similarity: number } | null>;
-  traverseGraph(slug: string, depth?: number): Promise<GraphNode[]>;
+  /**
+   * v0.34.1 (#861 — P0 leak seal): `opts.sourceId` / `opts.sourceIds`
+   * constrain visited nodes to a single source or array of sources.
+   * Pre-fix, the walk ignored source scope and an authenticated MCP
+   * client could enumerate cross-source topology + page metadata via
+   * the graph op. MCP-bound callers MUST pass the auth'd scope; local
+   * CLI callers omit it for the historical unscoped behavior.
+   */
+  traverseGraph(
+    slug: string,
+    depth?: number,
+    opts?: { sourceId?: string; sourceIds?: string[] },
+  ): Promise<GraphNode[]>;
   /**
    * Edge-based graph traversal with optional type and direction filters.
    * Returns a list of edges (GraphPath[]) instead of nodes. Supports:
    * - linkType: per-edge filter, only follows matching edges (per-edge semantics)
    * - direction: 'in' (follow to->from), 'out' (follow from->to), 'both'
    * - depth: max depth from root (default 5)
+   * - sourceId/sourceIds: v0.34.1 source-isolation filter, see traverseGraph
    * Uses cycle prevention (visited array in recursive CTE).
    */
   traversePaths(
     slug: string,
-    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
+    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
   ): Promise<GraphPath[]>;
   /**
    * For a list of slugs, return how many inbound links each has.
@@ -728,8 +765,7 @@ export interface BrainEngine {
   // Raw data
   /**
    * v0.31.8 (D21): `opts.sourceId` source-scopes the page-id lookup. When
-   * omitted, the write targets the bare slug (pre-v0.31.8 behavior); the
-   * Postgres 21000 hazard for multi-source brains exists on this path.
+   * omitted, the write targets the historical `default` source.
    * Multi-source callers MUST pass sourceId to land on the intended row.
    */
   putRawData(slug: string, source: string, data: object, opts?: { sourceId?: string }): Promise<void>;
@@ -1040,7 +1076,7 @@ export interface BrainEngine {
    * until the v0_32_2 migration backfills them. Cycle-phase callers in
    * commit 7 add the empty-fence-guard as a belt-and-suspenders check.
    */
-  deleteFactsForPage(slug: string, sourceId: string): Promise<{ deleted: number }>;
+  deleteFactsForPage(slug: string, source_id: string): Promise<{ deleted: number }>;
 
   /**
    * Mark a fact expired. Never DELETE. Returns true iff a row was updated.
@@ -1148,6 +1184,18 @@ export interface BrainEngine {
   // Config
   getConfig(key: string): Promise<string | null>;
   setConfig(key: string, value: string): Promise<void>;
+  /**
+   * v0.32.3 — delete a config row. Returns the number of rows deleted (0 or 1).
+   * No-op when the key doesn't exist. Used by `gbrain config unset` and by
+   * `gbrain search modes --reset`. Engine-agnostic.
+   */
+  unsetConfig(key: string): Promise<number>;
+  /**
+   * v0.32.3 — list config keys matching a literal prefix (e.g. "search.").
+   * Used by `gbrain config unset --pattern` and the search-modes --reset path.
+   * Does NOT support glob/regex on purpose — the caller knows the prefix.
+   */
+  listConfigKeys(prefix: string): Promise<string[]>;
 
   // Migration support
   runMigration(version: number, sql: string): Promise<void>;
@@ -1224,7 +1272,7 @@ export interface BrainEngine {
   logEvalCandidate(input: EvalCandidateInput): Promise<number>;
   /** Read candidates by time window / limit / tool filter. Used by `gbrain eval export`. */
   listEvalCandidates(filter?: { since?: Date; limit?: number; tool?: 'query' | 'search' }): Promise<EvalCandidate[]>;
-  /** Count candidates created before `date` without deleting them. Used by dry-run prune. */
+  /** Count candidates created before `date` for `gbrain eval prune --dry-run`. */
   countEvalCandidatesBefore(date: Date): Promise<number>;
   /** Delete candidates created before `date`. Returns rows deleted. Used by `gbrain eval prune`. */
   deleteEvalCandidatesBefore(date: Date): Promise<number>;

@@ -319,6 +319,9 @@ export class PostgresEngine implements BrainEngine {
       subagent_provider_id_exists: boolean;
       ingest_log_exists: boolean;
       ingest_log_source_id_exists: boolean;
+      oauth_clients_exists: boolean;
+      oauth_clients_source_id_exists: boolean;
+      oauth_clients_federated_read_exists: boolean;
     }[]>`
       SELECT
         EXISTS (SELECT 1 FROM information_schema.tables
@@ -356,7 +359,13 @@ export class PostgresEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema = current_schema() AND table_name = 'ingest_log') AS ingest_log_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = current_schema() AND table_name = 'ingest_log' AND column_name = 'source_id') AS ingest_log_source_id_exists
+                WHERE table_schema = current_schema() AND table_name = 'ingest_log' AND column_name = 'source_id') AS ingest_log_source_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'oauth_clients') AS oauth_clients_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'oauth_clients' AND column_name = 'source_id') AS oauth_clients_source_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'oauth_clients' AND column_name = 'federated_read') AS oauth_clients_federated_read_exists
     `;
     const probe = probeRows[0]!;
 
@@ -386,11 +395,17 @@ export class PostgresEngine implements BrainEngine {
     // source_id. Old brains have ingest_log without source_id; bootstrap adds
     // the column before SCHEMA_SQL replay creates the index.
     const needsIngestLogSourceId = probe.ingest_log_exists && !probe.ingest_log_source_id_exists;
+    // v0.34.1 (v60-v65): schema replay creates OAuth source/federation indexes
+    // before numbered migrations run. Old brains can already have oauth_clients
+    // without these columns, so add only the forward-referenced columns here and
+    // let v60-v65 keep final FK/backfill/validation ownership.
+    const needsOAuthClientsBootstrap = probe.oauth_clients_exists
+      && (!probe.oauth_clients_source_id_exists || !probe.oauth_clients_federated_read_exists);
 
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsMcpLogBootstrap && !needsSubagentProviderId
         && !needsChunksEmbeddingImage && !needsPagesRecency
-        && !needsIngestLogSourceId) return;
+        && !needsIngestLogSourceId && !needsOAuthClientsBootstrap) return;
 
     console.log('  Pre-v0.21 brain detected, applying forward-reference bootstrap');
 
@@ -518,6 +533,13 @@ export class PostgresEngine implements BrainEngine {
         ALTER TABLE ingest_log ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT 'default';
       `);
     }
+
+    if (needsOAuthClientsBootstrap) {
+      await conn.unsafe(`
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS source_id TEXT;
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS federated_read TEXT[] NOT NULL DEFAULT '{}';
+      `);
+    }
   }
 
   async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
@@ -556,12 +578,11 @@ export class PostgresEngine implements BrainEngine {
     const sourceId = opts?.sourceId ?? 'default';
     // v0.26.5: default hides soft-deleted rows. Compose with optional sourceId
     // filter via fragment chaining (postgres.js supports sql`` composition).
-    const sourceCondition = sql`AND source_id = ${sourceId}`;
     const deletedCondition = includeDeleted ? sql`` : sql`AND deleted_at IS NULL`;
     const rows = await sql`
       SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at
       FROM pages
-      WHERE slug = ${slug} ${sourceCondition} ${deletedCondition}
+      WHERE slug = ${slug} AND source_id = ${sourceId} ${deletedCondition}
       LIMIT 1
     `;
     if (rows.length === 0) return null;
@@ -626,12 +647,10 @@ export class PostgresEngine implements BrainEngine {
     const sql = this.sql;
     const sourceId = opts?.sourceId ?? 'default';
     // Idempotent-as-null contract: only flip rows that are currently active.
-    // Omitted sourceId targets the historical default source, never every
-    // matching slug across sources.
     // RETURNING projects the slug so we can tell hit-vs-miss without a probe.
     const rows = await sql`
       UPDATE pages SET deleted_at = now()
-      WHERE slug = ${slug} AND deleted_at IS NULL AND source_id = ${sourceId}
+      WHERE slug = ${slug} AND source_id = ${sourceId} AND deleted_at IS NULL
       RETURNING slug
     `;
     if (rows.length === 0) return null;
@@ -643,7 +662,7 @@ export class PostgresEngine implements BrainEngine {
     const sourceId = opts?.sourceId ?? 'default';
     const rows = await sql`
       UPDATE pages SET deleted_at = NULL
-      WHERE slug = ${slug} AND deleted_at IS NOT NULL AND source_id = ${sourceId}
+      WHERE slug = ${slug} AND source_id = ${sourceId} AND deleted_at IS NOT NULL
       RETURNING slug
     `;
     return rows.length > 0;
@@ -685,10 +704,14 @@ export class PostgresEngine implements BrainEngine {
     const slugCondition = slugPrefix
       ? sql`AND p.slug LIKE ${slugPrefix.replace(/[\\%_]/g, (c) => '\\' + c) + '%'} ESCAPE '\\'`
       : sql``;
-    // v0.31.12: scope to a single source when requested.
-    const sourceCondition = filters?.sourceId
-      ? sql`AND p.source_id = ${filters.sourceId}`
-      : sql``;
+    // v0.31.12 + v0.34.1 (#876, D9): scope to a single source OR an array
+    // of sources. When BOTH are set, the array wins (federated semantics
+    // subsume the scalar case). When neither is set, no filter applies.
+    const sourceCondition = filters?.sourceIds && filters.sourceIds.length > 0
+      ? sql`AND p.source_id = ANY(${filters.sourceIds}::text[])`
+      : filters?.sourceId
+        ? sql`AND p.source_id = ${filters.sourceId}`
+        : sql``;
     // v0.26.5: hide soft-deleted by default; opt in via filters.includeDeleted.
     const deletedCondition = filters?.includeDeleted === true
       ? sql``
@@ -795,6 +818,13 @@ export class PostgresEngine implements BrainEngine {
       params.push(type);
       typeClause = `AND p.type = $${params.length}`;
     }
+    // v0.33: multi-type filter for whoknows. AND-applied alongside the
+    // single-value `type` filter (callers can use either or both).
+    let typesClause = '';
+    if (opts?.types && opts.types.length > 0) {
+      params.push(opts.types);
+      typesClause = `AND p.type = ANY($${params.length}::text[])`;
+    }
     let excludeSlugsClause = '';
     if (excludeSlugs?.length) {
       params.push(excludeSlugs);
@@ -821,6 +851,22 @@ export class PostgresEngine implements BrainEngine {
       params.push(opts.beforeDate);
       beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // v0.34.1 (#861 — P0 leak seal): source-isolation filter. When the
+    // caller's auth scope is set, narrow the inner CTE candidate set so
+    // an authenticated MCP client cannot see foreign-source pages via
+    // keyword search. Array form wins over scalar (federated subsumes
+    // single-source). Index-backed by idx_pages_source_id; the filter is
+    // pushed to the INNER CTE specifically so HNSW-style downstream
+    // ranking sees a narrowed candidate set rather than re-ranking a
+    // cross-source pool.
+    let sourceClause = '';
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      sourceClause = `AND p.source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      sourceClause = `AND p.source_id = $${params.length}`;
+    }
     params.push(innerLimit);
     const innerLimitParam = `$${params.length}`;
     params.push(limit);
@@ -845,12 +891,14 @@ export class PostgresEngine implements BrainEngine {
         JOIN sources s ON s.id = p.source_id
         WHERE cc.search_vector @@ websearch_to_tsquery('english', $1)
           ${typeClause}
+          ${typesClause}
           ${excludeSlugsClause}
           ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
           ${languageClause}
           ${symbolKindClause}
           ${afterDateClause}
           ${beforeDateClause}
+          ${sourceClause}
           ${hardExcludeClause}
           ${visibilityClause}
           -- v0.27.1: hide image rows from text-keyword search so OCR text
@@ -921,6 +969,13 @@ export class PostgresEngine implements BrainEngine {
       params.push(type);
       typeClause = `AND p.type = $${params.length}`;
     }
+    // v0.33: multi-type filter for whoknows. AND-applied alongside the
+    // single-value `type` filter (callers can use either or both).
+    let typesClause = '';
+    if (opts?.types && opts.types.length > 0) {
+      params.push(opts.types);
+      typesClause = `AND p.type = ANY($${params.length}::text[])`;
+    }
     let excludeSlugsClause = '';
     if (excludeSlugs?.length) {
       params.push(excludeSlugs);
@@ -947,6 +1002,17 @@ export class PostgresEngine implements BrainEngine {
       params.push(opts.beforeDate);
       beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // v0.34.1 (#861 — P0 leak seal): source-isolation. Anchor primitive
+    // for two-pass retrieval, so cross-source anchors would let the walk
+    // discover foreign-source neighbors. Filter at chunk-rank time.
+    let sourceClause = '';
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      sourceClause = `AND p.source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      sourceClause = `AND p.source_id = $${params.length}`;
+    }
     params.push(limit);
     const limitParam = `$${params.length}`;
     params.push(offset);
@@ -966,12 +1032,14 @@ export class PostgresEngine implements BrainEngine {
       JOIN sources s ON s.id = p.source_id
       WHERE cc.search_vector @@ websearch_to_tsquery('english', $1)
         ${typeClause}
+        ${typesClause}
         ${excludeSlugsClause}
         ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
         ${languageClause}
         ${symbolKindClause}
         ${afterDateClause}
         ${beforeDateClause}
+        ${sourceClause}
         ${hardExcludeClause}
         ${visibilityClause}
       ORDER BY score DESC
@@ -1022,6 +1090,13 @@ export class PostgresEngine implements BrainEngine {
       params.push(type);
       typeClause = `AND p.type = $${params.length}`;
     }
+    // v0.33: multi-type filter for whoknows. AND-applied alongside the
+    // single-value `type` filter (callers can use either or both).
+    let typesClause = '';
+    if (opts?.types && opts.types.length > 0) {
+      params.push(opts.types);
+      typesClause = `AND p.type = ANY($${params.length}::text[])`;
+    }
     let excludeSlugsClause = '';
     if (excludeSlugs?.length) {
       params.push(excludeSlugs);
@@ -1047,6 +1122,19 @@ export class PostgresEngine implements BrainEngine {
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
       beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+    }
+    // v0.34.1 (#861, F2 — P0 leak seal): source-isolation in the INNER CTE
+    // specifically. Pushing the filter inside narrows the HNSW candidate set
+    // before re-rank; pushing it to the outer SELECT would force HNSW to
+    // over-fetch then post-filter, wasting candidate slots. Codex flagged
+    // this placement during plan review. Array form wins over scalar.
+    let sourceClause = '';
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      sourceClause = `AND p.source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      sourceClause = `AND p.source_id = $${params.length}`;
     }
     params.push(innerLimit);
     const innerLimitParam = `$${params.length}`;
@@ -1077,11 +1165,13 @@ export class PostgresEngine implements BrainEngine {
         WHERE cc.${col} IS NOT NULL ${modalityFilter}
           ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
           ${typeClause}
+          ${typesClause}
           ${excludeSlugsClause}
           ${languageClause}
           ${symbolKindClause}
           ${afterDateClause}
           ${beforeDateClause}
+          ${sourceClause}
           ${hardExcludeClause}
           ${visibilityClause}
         ORDER BY cc.${col} <=> $1::vector
@@ -1239,32 +1329,72 @@ export class PostgresEngine implements BrainEngine {
 
   async countStaleChunks(opts?: { sourceId?: string }): Promise<number> {
     const sql = this.sql;
-    const sourceJoin = opts?.sourceId ? sql`JOIN pages p ON p.id = cc.page_id` : sql``;
-    const sourceCondition = opts?.sourceId ? sql`AND p.source_id = ${opts.sourceId}` : sql``;
+    // Fast path: no source filter → bare count query, no join.
+    // Slow path: source-scoped count → join pages.
+    // D7: closes the bug where `gbrain embed --stale --source X` silently
+    // dropped X and counted across every source.
+    if (opts?.sourceId === undefined) {
+      const [row] = await sql`
+        SELECT count(*)::int AS count
+        FROM content_chunks
+        WHERE embedding IS NULL
+          AND COALESCE(modality, 'text') <> 'image'
+      `;
+      return Number((row as { count?: number } | undefined)?.count ?? 0);
+    }
     const [row] = await sql`
       SELECT count(*)::int AS count
-      FROM content_chunks cc
-      ${sourceJoin}
-      WHERE cc.embedding IS NULL
-        AND COALESCE(cc.modality, 'text') <> 'image'
-        ${sourceCondition}
-    `;
-    return Number((row as { count?: number } | undefined)?.count ?? 0);
-  }
-
-  async listStaleChunks(opts?: { sourceId?: string }): Promise<StaleChunkRow[]> {
-    const sql = this.sql;
-    const sourceCondition = opts?.sourceId ? sql`AND p.source_id = ${opts.sourceId}` : sql``;
-    const rows = await sql`
-      SELECT p.slug, p.source_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-             cc.model, cc.token_count
       FROM content_chunks cc
       JOIN pages p ON p.id = cc.page_id
       WHERE cc.embedding IS NULL
         AND COALESCE(cc.modality, 'text') <> 'image'
-        ${sourceCondition}
-      ORDER BY p.id, cc.chunk_index
-      LIMIT 100000
+        AND p.source_id = ${opts.sourceId}
+    `;
+    return Number((row as { count?: number } | undefined)?.count ?? 0);
+  }
+
+  async listStaleChunks(opts?: {
+    batchSize?: number;
+    afterPageId?: number;
+    afterChunkIndex?: number;
+    sourceId?: string;
+  }): Promise<StaleChunkRow[]> {
+    const sql = this.sql;
+    const limit = opts?.batchSize ?? 2000;
+    const afterPid = opts?.afterPageId ?? 0;
+    const afterIdx = opts?.afterChunkIndex ?? -1;
+    // Cursor-paginated: keyset pagination on (page_id, chunk_index).
+    // The partial index idx_chunks_embedding_null makes the WHERE fast;
+    // LIMIT keeps each round-trip well within statement_timeout.
+    //
+    // D7: optional source_id filter. NULL/undefined = scan all sources
+    // (pre-existing behavior); a value scopes to that source so
+    // `gbrain embed --stale --source X` actually does what it says.
+    if (opts?.sourceId === undefined) {
+      const rows = await sql`
+        SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+               cc.model, cc.token_count, p.source_id, cc.page_id
+        FROM content_chunks cc
+        JOIN pages p ON p.id = cc.page_id
+        WHERE cc.embedding IS NULL
+          AND COALESCE(cc.modality, 'text') <> 'image'
+          AND (cc.page_id, cc.chunk_index) > (${afterPid}, ${afterIdx})
+        ORDER BY cc.page_id, cc.chunk_index
+        LIMIT ${limit}
+      `;
+      return rows as unknown as StaleChunkRow[];
+    }
+    const rows = await sql`
+      SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+             cc.model, cc.token_count, p.source_id, cc.page_id
+      FROM content_chunks cc
+      JOIN pages p ON p.id = cc.page_id
+      WHERE cc.embedding IS NULL
+        AND COALESCE(cc.modality, 'text') <> 'image'
+        AND p.source_id = ${opts.sourceId}
+        AND (cc.page_id, cc.chunk_index) > (${afterPid}, ${afterIdx})
+      ORDER BY cc.page_id, cc.chunk_index
+      LIMIT ${limit}
     `;
     return rows as unknown as StaleChunkRow[];
   }
@@ -1500,13 +1630,40 @@ export class PostgresEngine implements BrainEngine {
     return { slug: row.slug, similarity: row.sim };
   }
 
-  async traverseGraph(slug: string, depth: number = 5): Promise<GraphNode[]> {
+  async traverseGraph(
+    slug: string,
+    depth: number = 5,
+    opts?: { sourceId?: string; sourceIds?: string[] },
+  ): Promise<GraphNode[]> {
     const sql = this.sql;
+    // v0.34.1 (#861 — P0 leak seal): scope visited nodes to the caller's
+    // source(s). Without this, the walk follows edges into pages from
+    // foreign sources, leaking topology + page metadata. The filter
+    // applies at BOTH the seed (root must be in scope) AND the recursive
+    // step (every visited neighbor must be in scope). The aggregation
+    // subquery also filters so the per-node `links` array only includes
+    // edges to in-scope pages.
+    const useSourceIds = opts?.sourceIds && opts.sourceIds.length > 0;
+    const seedScope = useSourceIds
+      ? sql`AND p.source_id = ANY(${opts!.sourceIds!}::text[])`
+      : opts?.sourceId
+        ? sql`AND p.source_id = ${opts.sourceId}`
+        : sql``;
+    const stepScope = useSourceIds
+      ? sql`AND p2.source_id = ANY(${opts!.sourceIds!}::text[])`
+      : opts?.sourceId
+        ? sql`AND p2.source_id = ${opts.sourceId}`
+        : sql``;
+    const aggScope = useSourceIds
+      ? sql`AND p3.source_id = ANY(${opts!.sourceIds!}::text[])`
+      : opts?.sourceId
+        ? sql`AND p3.source_id = ${opts.sourceId}`
+        : sql``;
     // Cycle prevention: visited array tracks page IDs already in the path.
     const rows = await sql`
       WITH RECURSIVE graph AS (
         SELECT p.id, p.slug, p.title, p.type, 0 as depth, ARRAY[p.id] as visited
-        FROM pages p WHERE p.slug = ${slug}
+        FROM pages p WHERE p.slug = ${slug} ${seedScope}
 
         UNION ALL
 
@@ -1516,6 +1673,7 @@ export class PostgresEngine implements BrainEngine {
         JOIN pages p2 ON p2.id = l.to_page_id
         WHERE g.depth < ${depth}
           AND NOT (p2.id = ANY(g.visited))
+          ${stepScope}
       )
       SELECT DISTINCT g.slug, g.title, g.type, g.depth,
         coalesce(
@@ -1529,7 +1687,7 @@ export class PostgresEngine implements BrainEngine {
           (SELECT jsonb_agg(DISTINCT jsonb_build_object('to_slug', p3.slug, 'link_type', l2.link_type))
            FROM links l2
            JOIN pages p3 ON p3.id = l2.to_page_id
-           WHERE l2.from_page_id = g.id),
+           WHERE l2.from_page_id = g.id ${aggScope}),
           '[]'::jsonb
         ) as links
       FROM graph g
@@ -1547,20 +1705,47 @@ export class PostgresEngine implements BrainEngine {
 
   async traversePaths(
     slug: string,
-    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
+    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
   ): Promise<GraphPath[]> {
     const sql = this.sql;
     const depth = opts?.depth ?? 5;
     const direction = opts?.direction ?? 'out';
     const linkType = opts?.linkType ?? null;
     const linkTypeMatches = linkType !== null;
+    // v0.34.1 (#861 — P0 leak seal): source-scope filter fragments. Applied
+    // at seed (root must be in scope) AND at every recursive step (neighbor
+    // must be in scope) AND in the SELECT join (final edges respect scope).
+    // The 'both' branch needs filters on BOTH endpoint joins.
+    const useSourceIds = opts?.sourceIds && opts.sourceIds.length > 0;
+    const seedScope = useSourceIds
+      ? sql`AND p.source_id = ANY(${opts!.sourceIds!}::text[])`
+      : opts?.sourceId
+        ? sql`AND p.source_id = ${opts.sourceId}`
+        : sql``;
+    const stepScope = useSourceIds
+      ? sql`AND p2.source_id = ANY(${opts!.sourceIds!}::text[])`
+      : opts?.sourceId
+        ? sql`AND p2.source_id = ${opts.sourceId}`
+        : sql``;
+    // For the 'both' direction's final SELECT, both endpoint joins (pf, pt)
+    // get scope filters so edges crossing into a foreign source are dropped.
+    const pfScope = useSourceIds
+      ? sql`AND pf.source_id = ANY(${opts!.sourceIds!}::text[])`
+      : opts?.sourceId
+        ? sql`AND pf.source_id = ${opts.sourceId}`
+        : sql``;
+    const ptScope = useSourceIds
+      ? sql`AND pt.source_id = ANY(${opts!.sourceIds!}::text[])`
+      : opts?.sourceId
+        ? sql`AND pt.source_id = ${opts.sourceId}`
+        : sql``;
 
     let rows;
     if (direction === 'out') {
       rows = await sql`
         WITH RECURSIVE walk AS (
           SELECT p.id, p.slug, 0::int as depth, ARRAY[p.id] as visited
-          FROM pages p WHERE p.slug = ${slug}
+          FROM pages p WHERE p.slug = ${slug} ${seedScope}
           UNION ALL
           SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -1569,6 +1754,7 @@ export class PostgresEngine implements BrainEngine {
           WHERE w.depth < ${depth}
             AND NOT (p2.id = ANY(w.visited))
             AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
+            ${stepScope}
         )
         SELECT w.slug as from_slug, p2.slug as to_slug,
                l.link_type, l.context, w.depth + 1 as depth
@@ -1577,13 +1763,14 @@ export class PostgresEngine implements BrainEngine {
         JOIN pages p2 ON p2.id = l.to_page_id
         WHERE w.depth < ${depth}
           AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
+          ${stepScope}
         ORDER BY depth, from_slug, to_slug
       `;
     } else if (direction === 'in') {
       rows = await sql`
         WITH RECURSIVE walk AS (
           SELECT p.id, p.slug, 0::int as depth, ARRAY[p.id] as visited
-          FROM pages p WHERE p.slug = ${slug}
+          FROM pages p WHERE p.slug = ${slug} ${seedScope}
           UNION ALL
           SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -1592,6 +1779,7 @@ export class PostgresEngine implements BrainEngine {
           WHERE w.depth < ${depth}
             AND NOT (p2.id = ANY(w.visited))
             AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
+            ${stepScope}
         )
         SELECT p2.slug as from_slug, w.slug as to_slug,
                l.link_type, l.context, w.depth + 1 as depth
@@ -1600,13 +1788,14 @@ export class PostgresEngine implements BrainEngine {
         JOIN pages p2 ON p2.id = l.from_page_id
         WHERE w.depth < ${depth}
           AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
+          ${stepScope}
         ORDER BY depth, from_slug, to_slug
       `;
     } else {
       rows = await sql`
         WITH RECURSIVE walk AS (
           SELECT p.id, 0::int as depth, ARRAY[p.id] as visited
-          FROM pages p WHERE p.slug = ${slug}
+          FROM pages p WHERE p.slug = ${slug} ${seedScope}
           UNION ALL
           SELECT p2.id, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -1615,6 +1804,7 @@ export class PostgresEngine implements BrainEngine {
           WHERE w.depth < ${depth}
             AND NOT (p2.id = ANY(w.visited))
             AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
+            ${stepScope}
         )
         SELECT pf.slug as from_slug, pt.slug as to_slug,
                l.link_type, l.context, w.depth + 1 as depth
@@ -1624,6 +1814,8 @@ export class PostgresEngine implements BrainEngine {
         JOIN pages pt ON pt.id = l.to_page_id
         WHERE w.depth < ${depth}
           AND (${!linkTypeMatches} OR l.link_type = ${linkType ?? ''})
+          ${pfScope}
+          ${ptScope}
         ORDER BY depth, from_slug, to_slug
       `;
     }
@@ -1886,34 +2078,19 @@ export class PostgresEngine implements BrainEngine {
     opts?: { sourceId?: string },
   ): Promise<void> {
     const sql = this.sql;
-    // v0.31.8 (D21): source-scoped INSERT-SELECT. Omitting sourceId targets
-    // the default source only; it must never fan out across same-slug pages.
-    // With opts.sourceId, the lookup is source-scoped to the requested row.
-    if (opts?.sourceId) {
-      const result = await sql`
-        INSERT INTO raw_data (page_id, source, data)
-        SELECT id, ${source}, ${sql.json(data as Parameters<typeof sql.json>[0])}
-        FROM pages WHERE slug = ${slug} AND source_id = ${opts.sourceId}
-        ON CONFLICT (page_id, source) DO UPDATE SET
-          data = EXCLUDED.data,
-          fetched_at = now()
-        RETURNING id
-      `;
-      if (result.length === 0) {
-        throw new Error(`putRawData failed: page "${slug}" (source=${opts.sourceId}) not found`);
-      }
-      return;
-    }
+    const sourceId = opts?.sourceId ?? 'default';
     const result = await sql`
       INSERT INTO raw_data (page_id, source, data)
       SELECT id, ${source}, ${sql.json(data as Parameters<typeof sql.json>[0])}
-      FROM pages WHERE slug = ${slug} AND source_id = 'default'
+      FROM pages WHERE slug = ${slug} AND source_id = ${sourceId}
       ON CONFLICT (page_id, source) DO UPDATE SET
         data = EXCLUDED.data,
         fetched_at = now()
       RETURNING id
     `;
-    if (result.length === 0) throw new Error(`putRawData failed: page "${slug}" not found`);
+    if (result.length === 0) {
+      throw new Error(`putRawData failed: page "${slug}" not found (source=${sourceId})`);
+    }
   }
 
   async getRawData(
@@ -2156,10 +2333,10 @@ export class PostgresEngine implements BrainEngine {
     return { inserted: ids.length, ids };
   }
 
-  async deleteFactsForPage(slug: string, sourceId: string): Promise<{ deleted: number }> {
+  async deleteFactsForPage(slug: string, source_id: string): Promise<{ deleted: number }> {
     const sql = this.sql;
     const result = await sql`
-      DELETE FROM facts WHERE source_id = ${sourceId} AND source_markdown_slug = ${slug}
+      DELETE FROM facts WHERE source_id = ${source_id} AND source_markdown_slug = ${slug}
     `;
     return { deleted: result.count ?? 0 };
   }
@@ -3004,7 +3181,9 @@ export class PostgresEngine implements BrainEngine {
       SELECT
         (SELECT count(*) FROM pages) as page_count,
         (SELECT count(*) FROM content_chunks
-          WHERE CASE WHEN modality = 'image' THEN embedding_image IS NOT NULL ELSE embedding IS NOT NULL END)::float /
+         WHERE (COALESCE(modality, 'text') = 'image' AND embedding_image IS NOT NULL)
+            OR (COALESCE(modality, 'text') <> 'image' AND embedding IS NOT NULL)
+        )::float /
           GREATEST((SELECT count(*) FROM content_chunks), 1)::float as embed_coverage,
         (SELECT count(*) FROM pages p
          WHERE p.updated_at < (SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id)
@@ -3017,7 +3196,8 @@ export class PostgresEngine implements BrainEngine {
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
         ) as dead_links,
         (SELECT count(*) FROM content_chunks
-          WHERE NOT (CASE WHEN modality = 'image' THEN embedding_image IS NOT NULL ELSE embedding IS NOT NULL END)
+         WHERE (COALESCE(modality, 'text') = 'image' AND embedding_image IS NULL)
+            OR (COALESCE(modality, 'text') <> 'image' AND embedding IS NULL)
         ) as missing_embeddings,
         (SELECT count(*) FROM links) as link_count,
         (SELECT count(DISTINCT page_id) FROM timeline_entries) as pages_with_timeline,
@@ -3136,6 +3316,23 @@ export class PostgresEngine implements BrainEngine {
       INSERT INTO config (key, value) VALUES (${key}, ${value})
       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
     `;
+  }
+
+  async unsetConfig(key: string): Promise<number> {
+    const sql = this.sql;
+    const result = await sql`DELETE FROM config WHERE key = ${key}` as unknown as { count: number };
+    return result.count ?? 0;
+  }
+
+  async listConfigKeys(prefix: string): Promise<string[]> {
+    const sql = this.sql;
+    // LIKE-escape literal % and _ so a config key with those chars resolves correctly.
+    const escaped = prefix.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const pattern = `${escaped}%`;
+    const rows = await sql<{ key: string }[]>`
+      SELECT key FROM config WHERE key LIKE ${pattern} ESCAPE '\\' ORDER BY key
+    `;
+    return rows.map(r => r.key);
   }
 
   // Migration support
@@ -3402,7 +3599,7 @@ export class PostgresEngine implements BrainEngine {
     const [row] = await sql`
       SELECT count(*)::int AS count FROM eval_candidates WHERE created_at < ${date}
     `;
-    return Number((row as { count?: number } | undefined)?.count ?? 0);
+    return Number(row?.count ?? 0);
   }
 
   async logEvalCaptureFailure(reason: EvalCaptureFailureReason): Promise<void> {

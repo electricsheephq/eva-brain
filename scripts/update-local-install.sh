@@ -160,7 +160,7 @@ doctor() {
     return
   fi
   stop_stale_serve_if_requested
-  run "$HOME/.bun/bin/gbrain" doctor --json
+  run env GBRAIN_SKILLS_DIR="$INSTALL_DIR/skills" "$HOME/.bun/bin/gbrain" doctor --json
 }
 
 provider_test() {
@@ -185,7 +185,17 @@ install_openclaw_plugin() {
   need_cmd openclaw
   run openclaw plugins install --force --dangerously-force-unsafe-install ./plugins/openclaw-gbrain
   run openclaw plugins enable gbrain
-  run openclaw gateway restart
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files openclaw-gateway.service --no-legend 2>/dev/null | grep -q '^openclaw-gateway.service'; then
+    if [ "$(id -u)" -eq 0 ]; then
+      run systemctl restart openclaw-gateway
+    elif sudo -n true >/dev/null 2>&1; then
+      run sudo systemctl restart openclaw-gateway
+    else
+      log "OpenClaw systemd service detected, but passwordless sudo is unavailable; run: sudo systemctl restart openclaw-gateway"
+    fi
+  else
+    run openclaw gateway restart
+  fi
   run openclaw plugins inspect gbrain --runtime --json
 }
 
@@ -221,13 +231,20 @@ install_support_kb() {
   fi
   run node "$kb_dir/scripts/update-client.mjs"
   run node "$kb_dir/scripts/status.mjs"
+  run "$HOME/.bun/bin/gbrain" sync --repo "$kb_dir" --source openclaw-support-kb --no-embed
   run "$HOME/.bun/bin/gbrain" embed --stale --source openclaw-support-kb
 }
 
 main() {
   parse_args "$@"
   checkout_repo
-  cd "$INSTALL_DIR"
+  if [ -d "$INSTALL_DIR" ]; then
+    cd "$INSTALL_DIR"
+  elif [ "$DRY_RUN" = "true" ]; then
+    log "Dry-run: install dir does not exist yet; continuing from current checkout for command preview"
+  else
+    die "Install dir was not created: $INSTALL_DIR"
+  fi
   install_gbrain
   install_openclaw_plugin
   install_codex_plugin

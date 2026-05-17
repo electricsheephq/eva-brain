@@ -133,8 +133,6 @@ export interface PageInput {
    * `query --lang` filtering.
    */
   page_kind?: PageKind;
-  /** Target source for multi-source imports. Defaults to 'default'. */
-  source_id?: string;
   /**
    * v0.29.1: content date from frontmatter precedence (computed by importer
    * via `computeEffectiveDate`). When omitted, putPage leaves the column
@@ -166,13 +164,6 @@ export interface PageInput {
 export interface PageFilters {
   type?: PageType;
   tag?: string;
-  /**
-   * Filter to one source. Omit or pass '__all__' to include all sources.
-   *
-   * v0.31.12: used to scope embed/extract operations to a single source while
-   * preserving pre-existing all-source listPages semantics when omitted.
-   */
-  sourceId?: string;
   limit?: number;
   offset?: number;
   /** ISO date string (YYYY-MM-DD or full ISO timestamp). Filter to pages updated_at > value. */
@@ -199,11 +190,26 @@ export interface PageFilters {
    * Whitelisted enum — no SQL-injection risk; engines map to literal SQL fragments.
    */
   sort?: 'updated_desc' | 'updated_asc' | 'created_desc' | 'slug';
+  /**
+   * v0.31.12: filter to a specific source. When omitted, listPages returns
+   * pages from all sources (pre-existing semantics). Use to scope embed/extract
+   * operations to a single source.
+   */
+  sourceId?: string;
+  /**
+   * v0.34.1 (#876, D9): filter to ANY of these sources (federated read).
+   * Engine applies `WHERE p.source_id = ANY($N::text[])` when array is set.
+   * Caller precedence: if BOTH `sourceId` and `sourceIds` are set, the array
+   * wins (the federated semantics subsume the single-source case via an
+   * array of length 1). When neither is set, no filter applies — the
+   * pre-v0.34 unscoped behavior is preserved for local CLI callers.
+   */
+  sourceIds?: string[];
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
 export interface GetPageOpts {
-  /** Filter to a specific source. When omitted, getPage targets the default source. */
+  /** Filter to a specific source. When omitted, bare-slug page operations target the historical default source. */
   sourceId?: string;
   /** Include soft-deleted pages. Default false. See PageFilters.includeDeleted. */
   includeDeleted?: boolean;
@@ -335,14 +341,16 @@ export interface Chunk {
  * rows) embedding bytes over the wire. See `embed --stale` egress fix.
  */
 export interface StaleChunkRow {
-  /** v0.31.12: source_id so embed --stale can thread it through getChunks/upsertChunks. */
-  source_id: string;
   slug: string;
   chunk_index: number;
   chunk_text: string;
   chunk_source: 'compiled_truth' | 'timeline';
   model: string | null;
   token_count: number | null;
+  /** v0.31.12: source_id so embed --stale can thread it through getChunks/upsertChunks. */
+  source_id: string;
+  /** v0.33.3: page_id for cursor pagination in listStaleChunks. */
+  page_id: number;
 }
 
 export interface ChunkInput {
@@ -408,6 +416,15 @@ export interface SearchOpts {
   limit?: number;
   offset?: number;
   type?: PageType;
+  /**
+   * v0.33: multi-type filter. When set, search results are filtered to
+   * pages whose `type` is in this list, pushed to SQL via
+   * `AND p.type = ANY($N::text[])` in both engines. Stacks with the
+   * single-value `type` filter (both are AND-applied). Primary consumer
+   * is `gbrain whoknows` (filters to ['person','company']); future
+   * entity-only search reuses the parameter.
+   */
+  types?: PageType[];
   exclude_slugs?: string[];
   /**
    * Slug-prefix excludes — additive over DEFAULT_HARD_EXCLUDES (test/, archive/,
@@ -452,6 +469,18 @@ export interface SearchOpts {
    */
   sourceId?: string;
   /**
+   * v0.34.1 (#876, D9): filter to ANY of these sources (federated read).
+   * Engine applies `WHERE p.source_id = ANY($N::text[])` when the array
+   * is set. Caller precedence: if BOTH `sourceId` and `sourceIds` are
+   * provided, the array wins (the federated semantics subsume the
+   * single-source case). When neither is set, no filter applies — the
+   * pre-v0.34 unscoped behavior is preserved for local CLI callers.
+   *
+   * The op-handler layer resolves: `ctx.auth?.allowedSources` (federated
+   * client) → `sourceIds`; otherwise `ctx.sourceId` (scalar) → `sourceId`.
+   */
+  sourceIds?: string[];
+  /**
    * v0.27.1: target column for vector search. 'embedding' (default) hits
    * the brain's primary text-embedding column. 'embedding_image' targets
    * the multimodal column populated by importImageFile. The two columns
@@ -495,6 +524,49 @@ export interface SearchOpts {
    * Boundary semantics: end-of-day for plain YYYY-MM-DD.
    */
   until?: string;
+  /**
+   * v0.32.x (search-lite): cap the cumulative token cost of returned results.
+   * Applied AFTER all scoring, ranking, dedup, and boosts — the budget is the
+   * LAST stage of the pipeline. Token counting uses a char/4 heuristic (no
+   * tokenizer dep). When undefined or <= 0, this is a no-op (pre-v0.32
+   * behavior).
+   *
+   * Use cases: keep an agent's search payload under its context window;
+   * cap an MCP tool response to fit a router budget; emit a deterministic
+   * upper bound on result size.
+   */
+  tokenBudget?: number;
+  /**
+   * v0.32.x (search-lite): enable/disable the semantic query cache for this
+   * call. When undefined, the cache decision falls back to global config
+   * (search.cache.enabled, default true). Set to `false` to force a fresh
+   * search; set to `true` to opt in even when global config has it off.
+   */
+  useCache?: boolean;
+  /**
+   * v0.32.x (search-lite): force enable/disable the zero-LLM intent
+   * classifier weight adjustments. Defaults to enabled. Set to `false` to
+   * pin the legacy (pre-search-lite) weighting — useful when callers want
+   * deterministic behavior independent of query phrasing.
+   */
+  intentWeighting?: boolean;
+  /**
+   * v0.35.0.0+: cross-encoder reranker config. Resolved from mode bundle by
+   * default — tokenmax sets `enabled: true`, conservative + balanced set
+   * `enabled: false`. Per-call SearchOpts.reranker overrides the mode
+   * bundle. Slots in between dedupResults and enforceTokenBudget in
+   * hybrid.ts. Defined here as a structural type to avoid a circular
+   * import on src/core/search/rerank.ts; the runtime type lives there.
+   */
+  reranker?: {
+    enabled: boolean;
+    topNIn: number;
+    topNOut: number | null;
+    model?: string;
+    timeoutMs?: number;
+    // Test seam — never set in production code.
+    rerankerFn?: (input: { query: string; documents: string[]; topN?: number; model?: string; signal?: AbortSignal; timeoutMs?: number }) => Promise<{ index: number; relevanceScore: number }[]>;
+  };
 }
 
 /**
@@ -670,8 +742,6 @@ export interface BrainHealth {
   link_coverage: number;
   /** Fraction of entity pages (person/company) with >= 1 structured timeline entry. */
   timeline_coverage: number;
-  /** Number of entity pages included in link_coverage/timeline_coverage. */
-  entity_page_count?: number;
   /** Top 5 entities by total link count (in + out). */
   most_connected: Array<{ slug: string; link_count: number }>;
   /**
@@ -799,6 +869,45 @@ export interface HybridSearchMeta {
   detail_resolved: 'low' | 'medium' | 'high' | null;
   /** True iff multi-query expansion (Haiku) actually fired and produced variants. */
   expansion_applied: boolean;
+  /**
+   * v0.32.x (search-lite): the intent the zero-LLM classifier inferred for
+   * this query. Surfaced for debugging — agents and the `gbrain query`
+   * command can show "intent: temporal" alongside results to make the
+   * weighting decision auditable.
+   */
+  intent?: 'entity' | 'temporal' | 'event' | 'general';
+  /**
+   * v0.32.x (search-lite): token budget enforcement metadata. Omitted when
+   * no budget was applied (backward-compatible with pre-search-lite
+   * consumers).
+   */
+  token_budget?: {
+    budget: number;
+    used: number;
+    kept: number;
+    dropped: number;
+  };
+  /**
+   * v0.32.x (search-lite): cache hit/miss tracking. Omitted when the
+   * semantic query cache wasn't consulted (cache disabled, vector search
+   * unavailable, etc.).
+   */
+  cache?: {
+    /** 'hit' when results came from the cache; 'miss' when search ran fresh. */
+    status: 'hit' | 'miss' | 'disabled';
+    /** Similarity of the cached query's embedding (0..1). Only set on hit. */
+    similarity?: number;
+    /** Age of the cached entry in seconds. Only set on hit. */
+    age_seconds?: number;
+  };
+  /**
+   * v0.32.3 (search-lite mode): the active search mode for this call.
+   * 'conservative' | 'balanced' | 'tokenmax'. Resolved from
+   * config.search.mode with per-call + per-key overrides applied. Surfaced
+   * so observability sees what mode actually ran (which can differ from
+   * the operator's `config.search.mode` setting if per-call overrides win).
+   */
+  mode?: 'conservative' | 'balanced' | 'tokenmax';
 }
 
 // Config

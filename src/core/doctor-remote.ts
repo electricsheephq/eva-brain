@@ -298,7 +298,7 @@ export async function runUpgradeDriftCheck(config: GBrainConfig): Promise<Remote
   } catch { /* state read is best-effort */ }
 
   const fixHint = priorFailed
-    ? `Prior \`gbrain upgrade\` did not advance the binary. See https://github.com/garrytan/gbrain/releases for manual install.`
+    ? `Prior \`gbrain upgrade\` did not advance the binary. See https://github.com/electricsheephq/eva-brain/releases for manual install.`
     : `Run \`gbrain upgrade\` to install v${remoteVersion}.`;
 
   return {
