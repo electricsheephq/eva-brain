@@ -2,6 +2,827 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.35.1.1] - 2026-05-16
+
+**Fix wave: `gbrain eval longmemeval` actually runs against the public _s split.**
+
+A pre-spend smoke for the upcoming embedder shootout caught three tightly-coupled bugs that would have made all 7 cells fail. Shipping the fixes before anyone burns judge tokens.
+
+### What this fixes
+
+**The longmemeval adapter accepts the public _s dataset shape.** Pre-v0.35.1.1 assumed every dataset used the oracle `{session_id, turns}` shape, but the HuggingFace _s split serializes sessions as a parallel `haystack_session_ids: string[]` + a `LongMemEvalTurn[][]` (each inner array is one session's turns directly). The old adapter crashed `session.turns is undefined` on every question. New `normalizeSessions` helper accepts both shapes, mirroring the proven path in `gbrain-evals/eval/runner/longmemeval.ts`.
+
+**Session IDs that contain underscores or uppercase letters now produce valid slugs.** The _s split's IDs look like `sharegpt_yywfIrx_0`, both of which the v0.32.7 CJK-wave slug validator rejects. New `sanitizeSessionIdForSlug` lowercases and rewrites disallowed chars to `-`. The frontmatter `session_id:` line still carries the original verbatim, so downstream JSONL emit + LongMemEval correctness scoring work unchanged — only the slug gets rewritten to satisfy the validator.
+
+**`gbrain eval longmemeval` now configures the AI gateway before running.** v0.28.8 deliberately skipped `connectEngine()` for this subcommand so it would run on machines without a configured brain. Side effect: the gateway never got configured either, so the first embed call inside `importFromContent` crashed with "AI gateway is not configured." Fix: explicit `configureGateway()` before `runEvalLongMemEval`, reading `~/.gbrain/config.json` if present and falling back to env vars (`GBRAIN_EMBEDDING_MODEL`, `GBRAIN_EMBEDDING_DIMENSIONS`, etc.) when there's no config — preserving the "runs on a fresh machine" property.
+
+### Itemized changes
+
+- `src/eval/longmemeval/adapter.ts`: new `normalizeSessions` accepts both oracle (`{session_id, turns}`) and _s (`Turn[][]` + parallel `haystack_session_ids`) shapes; new `sanitizeSessionIdForSlug` rewrites underscores + uppercase + other disallowed chars to `-`; `LongMemEvalQuestion.haystack_sessions` typed as the union, `haystack_session_ids?: string[]` field added with documentation.
+- `src/cli.ts`: gateway configure step added before the `eval longmemeval` dispatch path, gated on `--help` short-circuit so help still works without a configured gateway.
+- `test/eval-longmemeval.test.ts`: 2 new regression cases pinning the _s shape normalization end-to-end (slugs sanitized, frontmatter preserves original session_id, dates flow through) and the missing-haystack_session_ids fallback to synthesized `lme_<question_id>_<i>` ids.
+
+## To take advantage of v0.35.1.1
+
+`gbrain upgrade` handles the fix transparently. Re-run any LongMemEval-against-_s-split commands that had been crashing.
+
+1. **Upgrade:**
+   ```bash
+   gbrain upgrade
+   ```
+2. **(If you hit the prior crash) re-run with `--resume-from` to skip any questions already scored:**
+   ```bash
+   gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s.json \
+     --output results.jsonl --resume-from results.jsonl --mode tokenmax
+   ```
+3. **No migration, no schema change, no breaking semantics.**
+
+## [0.35.1.0] - 2026-05-15
+
+**Embedder shootout prereqs: pricing, public gateway export, and resume-from for long eval runs.**
+
+A focused infrastructure release setting up the upcoming OpenAI vs Voyage vs ZeroEntropy comparison documented in `docs/designs/2026_05_EVAL_PLAN.md`. Three changes, each independently useful: `gbrain upgrade` now estimates costs correctly for `voyage:voyage-4-large` and `zeroentropyai:zembed-1` (previously fell through to "estimate unavailable"); external eval consumers can swap embedding providers per cell via the newly-public `gbrain/ai/gateway` subpath; multi-hour LongMemEval runs survive mid-run aborts via `--resume-from`.
+
+### What you can now do
+
+**See real cost estimates for Voyage 4 Large and ZeroEntropy zembed-1.** Before this release, `gbrain upgrade`'s post-upgrade reembed prompt silently fell back to "estimate unavailable" for these two models, even though both shipped with first-class recipe support in v0.35.0.0. Now: `voyage:voyage-4-large` resolves at $0.18/MTok (matching voyage-3-large) and `zeroentropyai:zembed-1` at $0.05/MTok. The lookup is case-insensitive on the provider name and falls back cleanly on unknown providers — no fabricated numbers.
+
+**Drive gbrain's embedding gateway from outside the binary.** `package.json` exports gain `gbrain/ai/gateway` so external consumers (`gbrain-evals`, custom eval harnesses, third-party integrations) can call `configureGateway({embedding_model, embedding_dimensions, reranker_model})` directly instead of forking gbrain or duplicating the recipe wiring. This unblocks per-cell provider swapping in eval matrices without a brain DB. The exports surface count goes 17→18, locked by the canary contract test.
+
+**Resume a half-finished LongMemEval run instead of re-paying $50.** `gbrain eval longmemeval --resume-from <jsonl>` skips question_ids already present in the file and continues writing the remaining questions in append mode. Rows whose `hypothesis` is empty AND have an `error` field (per-question failures from a prior run's try/catch) are NOT skipped — those retry. Corrupt trailing lines from a SIGKILL'd writer are silently dropped with a stderr warn. Empty-resume case (every question already answered) returns immediately without spinning up the brain or calling the LLM.
+
+### Itemized changes
+
+- `src/core/embedding-pricing.ts` adds `voyage:voyage-4-large` ($0.18/MTok) and `zeroentropyai:zembed-1` ($0.05/MTok). New test file `test/embedding-pricing.test.ts` pins both entries, case-insensitive provider matching, bare-model openai-default fallback, table integrity (lowercase providers, finite non-negative prices), and the `estimateCostFromChars` approximation — 11 cases, 46 expect() calls.
+- `package.json` exports map adds `"./ai/gateway": "./src/core/ai/gateway.ts"`. `scripts/check-exports-count.sh` bumps `EXPECTED_COUNT` 17→18. `test/public-exports.test.ts` adds canary entries for `configureGateway` and `embed` symbols and bumps the inline count assertion. The pre-existing import-resolution failures in this test file are unchanged (longstanding Bun package self-import behavior, not introduced or worsened by this release).
+- `src/commands/eval-longmemeval.ts` adds `--resume-from <path>` CLI flag. New exported helper `loadResumeSet(path)` is the parser (file-not-found → empty set; corrupt lines silently skipped; error-rows retry). `makeEmitter()` takes a second `append` arg; runner sets it true when `--resume-from path === --output path`. 6 new test cases in `test/eval-longmemeval.test.ts` covering file-not-found, well-formed load, retry semantics, SIGKILL-recovery corrupt-line tolerance, end-to-end append-mode resume against the 5-question mini fixture, and all-done early-return (stub client must NOT be invoked).
+
+## To take advantage of v0.35.1.0
+
+`gbrain upgrade` handles the pricing-table refresh transparently. The new gateway export and `--resume-from` flag are additive — no migration required, nothing breaks if you don't use them.
+
+1. **Run the orchestrator:**
+   ```bash
+   gbrain upgrade
+   ```
+2. **(Eval consumers only) Use the new gateway export.** External code can now:
+   ```ts
+   import { configureGateway, embed } from 'gbrain/ai/gateway';
+   configureGateway({ embedding_model: 'voyage:voyage-4-large', embedding_dimensions: 2048 });
+   const vectors = await embed(['hello']);
+   ```
+3. **(Long eval runs only) Use `--resume-from` to recover from mid-run aborts:**
+   ```bash
+   # First run aborts at question 312:
+   gbrain eval longmemeval dataset.jsonl --output results.jsonl
+
+   # Resume:
+   gbrain eval longmemeval dataset.jsonl --output results.jsonl --resume-from results.jsonl
+   ```
+4. **If anything looks off,** `gbrain doctor` should be clean. File an issue at
+   https://github.com/garrytan/gbrain/issues with `gbrain doctor` output if not.
+
+## [0.35.0.0] - 2026-05-15
+
+**ZeroEntropy in the box: zembed-1 embeddings + zerank-2 cross-encoder reranking, on by default for tokenmax mode.**
+
+ZeroEntropy ships two specialized small models that target the two weakest retrieval moments in a gbrain pipeline: `zembed-1` (a 32K-context embedding distilled from zerank-2 with flexible Matryoshka dims at 2560/1280/640/320/160/80/40) and `zerank-2` (a multilingual cross-encoder reranker, $0.025/1M tokens, ~50% cheaper than Cohere/Voyage rerankers). Both land as a new openai-compatible recipe alongside OpenAI/Voyage. The reranker is the bigger story: search had no reranker stage before this release. Hybrid search now ends with `RRF → dedup → reranker → token-budget` when reranker is enabled, with one configuration flip to opt in.
+
+### What you can now do
+
+**Switch to ZeroEntropy embeddings on either supported plane.** Set `embedding_model: zeroentropyai:zembed-1` and `embedding_dimensions: 2560` (or any of the 7 Matryoshka dims: 1280/640/320/160/80/40) in `~/.gbrain/config.json`, or export `GBRAIN_EMBEDDING_MODEL=zeroentropyai:zembed-1` + `GBRAIN_EMBEDDING_DIMENSIONS=2560`. The `gbrain config set` plane intentionally does NOT live-switch embedding models — they size the schema and must stay stable across engine connects. `gbrain models doctor` now probes the ZE config before spending any tokens, so an invalid `embedding_dimensions` value (the most common trip: leaving it unset and falling back to 1536, which ZE rejects) gets caught at install time with a paste-ready fix hint.
+
+**Get cross-encoder reranking on every tokenmax query, automatically.** `tokenmax` mode now defaults `search.reranker.enabled = true` with `zerank-2` as the model. The cost is ~$0.0003/query at 30-document topNIn (~12K tokens × $0.025/1M) — rounding error against the tier's existing $700/mo @ Opus pairing per the CLAUDE.md cost matrix. `balanced` and `conservative` modes default reranker off; opt in with `gbrain config set search.reranker.enabled true`. The reranker re-orders the top 30 deduped candidates by cross-encoder relevance and preserves the un-reranked long tail in its original RRF order, so recall is protected even when the reranker drops items.
+
+**Search keeps working when the reranker is flaky.** Every error class — auth, rate-limit, network, timeout, payload-too-large — fails open. The original RRF order passes through unchanged and the failure logs to `~/.gbrain/audit/rerank-failures-YYYY-Www.jsonl` (ISO-week rotation, mirrors the slug-fallback audit). `gbrain doctor` reads the audit and warns on any auth failure (config-time problem doctor's own probe should have caught) and on >=5 transient failures in the last 7 days. The check reads `search.reranker.enabled` first so "no events" means different things when reranker is on vs off (disabled = healthy by definition; enabled = healthy because nothing has failed yet).
+
+**Use asymmetric query/document encoding where the provider supports it.** ZE zembed-1 and Voyage v3+ models accept an `input_type: 'query' | 'document'` knob for asymmetric retrieval. Hybrid search's two query-side embed sites (`hybrid.ts:400` vector seed and `hybrid.ts:629` cache lookup) now call a new `embedQuery()` companion that threads `input_type: 'query'`. All ingest paths (sync, import, embed CLI) continue using `embed()` which defaults to document encoding. Symmetric providers (OpenAI text-3, DashScope, Zhipu) ignore the field — no behavior change. MiniMax embo-01's asymmetric quirk stays as it was; opting it into the new seam is a deferred follow-up.
+
+**Cache key versioning is bumped to v=2.** `KNOBS_HASH_VERSION` rolls 1 → 2 to fold the five new reranker fields (`reranker_enabled`, `reranker_model`, `reranker_top_n_in`, `reranker_top_n_out`, `reranker_timeout_ms`) into the `query_cache.knobs_hash` column. A tokenmax-with-reranker cache write can't be served to a reranker-off lookup. Mid-rolling-deploy operators should expect a temporary cache hit-rate dip and a brief doubling of cache rows for hot queries — v=1 rows TTL out within `cache.ttl_seconds` (default 3600s), then the hit rate recovers.
+
+### Itemized changes
+
+- `src/core/ai/recipes/zeroentropyai.ts` declares the new recipe with `implementation: 'openai-compatible'` (NOT the misspelled `'openai-compat'` the original plan draft had — pinned by F1 regression test). Both `touchpoints.embedding` (`zembed-1`, 7 Matryoshka dims) and `touchpoints.reranker` (`zerank-2` / `zerank-1` / `zerank-1-small`, 5MB payload cap) are declared.
+- `src/core/ai/gateway.ts` adds `zeroEntropyCompatFetch` — a fetch wrapper that rewrites the request URL from `/embeddings` to `/models/embed` (since ZE is NOT OpenAI-compatible at the wire level), injects `input_type` + explicit `encoding_format: 'float'`, and rewrites the response from `{results: [{embedding}]}` to `{data: [{embedding, index}]}` with `usage.prompt_tokens` added (Voyage's shim hit the same SDK schema requirement at `:655`). Layer 1 (Content-Length) + Layer 2 (per-embedding) OOM caps mirror Voyage's pattern via a new `ZeroEntropyResponseTooLargeError` class.
+- `gateway.rerank()` is the new native HTTP path — no AI-SDK reranking abstraction exists. Returns `RerankResult[]` sorted by `relevanceScore`; errors classify into `RerankError.reason` (`auth | rate_limit | network | timeout | payload_too_large | unknown`). 5-second default timeout (search hot path; long stalls degrade UX worse than fallthrough). Pre-flight payload guard rejects bodies over the recipe's `max_payload_bytes` cap so the caller can fail-open without an HTTP call. `_rerankTransport` test seam mirrors `_embedTransport`.
+- `gateway.embedQuery(text)` companion routes `inputType: 'query'` through `dimsProviderOptions()` (now a 4-arg signature; the 4th `inputType` param defaults to undefined for back-compat). `src/core/embedding.ts` re-exports it; `hybrid.ts` flips the two query-side embed call sites.
+- `src/core/search/rerank.ts` is the call-site abstraction. `applyReranker(query, results, opts)` slices the top `opts.topNIn` candidates, re-orders by reranker score, appends the un-reranked tail, and optionally truncates to `opts.topNOut`. `topNOut: null` is the explicit "don't truncate" signal — distinct from undefined which means "fall through to mode bundle" (per the CDX2-F16 null-vs-undefined contract).
+- `src/core/rerank-audit.ts` is the JSONL audit (failure-only — `logRerankSuccess` was deliberately dropped per CDX2-F22 to avoid hot-path I/O churn + query-volume leaks). Mirrors `src/core/audit-slug-fallback.ts` shape with ISO-week filename rotation.
+- `src/core/search/mode.ts` extends `ModeBundle`, `MODE_BUNDLES`, `SearchKeyOverrides`, `SearchPerCallOpts`, `loadOverridesFromConfig`, and `SEARCH_MODE_CONFIG_KEYS` with the five new reranker fields. `KNOBS_HASH_VERSION` bumps 1→2 (append-only convention per CDX2-F13). `loadOverridesFromConfig` parses `top_n_out` with the three-shape distinction (absent → undefined, `'null'`/`'none'`/`''` → null, positive integer → number).
+- `src/core/ai/types.ts` widens `TouchpointKind` with `'reranker'`, adds `RerankerTouchpoint` interface, and extends `Recipe.touchpoints` and `AIGatewayConfig` with the reranker fields. `src/core/ai/model-resolver.ts` widens `KnownTouchpointKey` and `getTouchpoint()` to thread reranker. `assertTouchpoint()` does NOT enforce allowlists for openai-compatible recipes (existing v0.31.12 behavior); `rerank()` and `probeRerankerConfig` do the allowlist check directly so a typo'd `search.reranker.model` surfaces at probe time, not first call.
+- `src/commands/models.ts` adds `probeRerankerConfig` (zero-network: model + touchpoint + allowlist) and `probeRerankerReachability` (1-token-equivalent: minimal rerank against real API). Both surface paste-ready `gbrain config set` fix hints. `ProbeResult.touchpoint` widens to include `'reranker_config'`.
+- `src/commands/doctor.ts` adds `checkRerankerHealth`. Reads `search.reranker.enabled` first; warns on any auth failure (singular signal) or >=5 transient failures (volume signal) in the last 7 days. Engine-agnostic (file-based + one config-key read).
+- New tests: `test/ai/zeroentropy-recipe.test.ts`, `test/ai/dims-zeroentropy.test.ts`, `test/search/rerank.test.ts`, `test/rerank-audit.test.ts` — 42 cases pinning recipe shape, dim allowlist, 4th-arg inputType plumbing, reranker fail-open across every error class, null-vs-undefined topNOut semantics, and the no-success-logging contract.
+- The plan that drove this release went through two Codex rounds (47 source-grounded findings across consult + adversarial challenge) before any code was written. Every must-fix landed; nine deferred bugs (the cache-wrapper double-embed, MiniMax embo-01 asymmetry, openai-compat allowlist gap, cache-hit limit/budget divergence) are documented in the plan file at `~/.claude/plans/system-instruction-you-are-working-linked-moonbeam.md`.
+
+## To take advantage of v0.35.0.0
+
+`gbrain upgrade` does NOT auto-switch your embedding or reranker model. ZeroEntropy is opt-in; you choose when to flip. To try it:
+
+1. **Get an API key:** `https://dashboard.zeroentropy.dev` → create key → `export ZEROENTROPY_API_KEY=...`
+2. **(Optional) Switch embedding to zembed-1.** Note: switching embedding models invalidates the vector index; you'll need to re-embed. Add to `~/.gbrain/config.json`:
+   ```json
+   {
+     "embedding_model": "zeroentropyai:zembed-1",
+     "embedding_dimensions": 2560
+   }
+   ```
+3. **(Optional) Enable reranker on a non-tokenmax mode:**
+   ```bash
+   gbrain config set search.reranker.enabled true
+   ```
+   Skip this step if you're already on `tokenmax` — reranker is on by default there.
+4. **Verify:**
+   ```bash
+   gbrain models doctor --json | jq '.probes[] | select(.touchpoint=="reranker_config" or .touchpoint=="embedding_config")'
+   ```
+   Both should report `status: "ok"`.
+5. **If anything fails,** please file an issue: https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain models doctor --json`
+   - contents of `~/.gbrain/audit/rerank-failures-*.jsonl` if present
+   - which step broke
+
+## [0.34.4.0] - 2026-05-14
+
+**`gbrain embed --stale` now actually works on large brains. `--source` flag stops silently dropping. The retry loop stops storming itself.**
+
+The v0.33.3 cherry-pick gave `embed --stale` cursor pagination so it would stop dying on Supabase's 2-minute pooler timeout. This release hardens the hot path so it survives real production load: a 30-minute wall-clock budget threads `AbortSignal` into the retry sleep, the worker claim loop, AND the gateway HTTP call (so a worker stuck mid-fetch on a 30-second OpenAI timeout cancels within seconds instead of running past budget). The retry-after delay now jitters ±30% so 20 concurrent workers don't relock on the next 429 wave. The 429 detector unwraps the gateway's `AITransientError` cause chain (the prior bare `e.status === 429` check silently never fired against normalized errors). The wrapper passes `maxRetries: 0` through to the AI SDK so its default 2-retry stack stops multiplying this wrapper's 5 attempts into 15 cycles per call.
+
+The `gbrain embed --stale --source X` flag was silently broken on multi-source brains — `embedAll(sourceId)` dropped the `sourceId` argument when calling `embedAllStale`, so operators got a full-brain scan even when they asked for one source. Threading `sourceId?` through `countStaleChunks` + `listStaleChunks` + the engine interfaces (Postgres + PGLite) fixes that.
+
+Migration v66 (the partial index `idx_chunks_embedding_null`) now uses `CREATE INDEX CONCURRENTLY` on Postgres with a handler-based engine branch and pre-drop of any invalid remnant (mirrors the v14 pattern). Plain `CREATE INDEX IF NOT EXISTS` would have taken a ShareLock on the 373K-row `content_chunks` table for the entire build, blocking every concurrent sync/embed/autopilot write. PGLite stays on plain `CREATE INDEX` since it has no concurrent writers.
+
+Twenty-six new test cases pin every new code path: 8 unit cases for `embedBatchWithBackoff` (parse ms/s retry-after, fallback, non-rate-limit rethrow, jitter range, budget-abort-mid-fetch, cause-chain unwrap, maxRetries:0 passthrough), 3 CLI flag-wiring tests, 1 end-to-end budget test, 6 Postgres E2E tests against a fresh database (static/failed-page/page-split/source-scope/dup-slug), 4 migration v66 source-shape tests, 4 PGLite engine parity tests, plus a fix to every pre-existing stale-row mock that was silently passing TypeScript's structural typing while violating `StaleChunkRow`'s newly-required `source_id` + `page_id` fields.
+
+### What changes for users
+
+| Behavior | Before | After v0.34.4.0 |
+|---|---|---|
+| `embed --stale` budget on millions-of-chunks brain | unbounded — could run hours past Minion timeout | bounded to `GBRAIN_EMBED_TIME_BUDGET_MS` (default 30m); AbortSignal cancels mid-fetch |
+| 20 concurrent workers hitting 429 | sleep in lockstep, slam API together on wake | ±30% jitter decorrelates the herd |
+| Gateway-wrapped 429 detection | `e.status === 429` silently false against `AITransientError` | unwraps cause chain (depth ≤5); message-match as fallback |
+| AI SDK retries per embed call | 3 SDK × 5 wrapper = up to 15 cycles per call | `maxRetries: 0` passthrough; wrapper is single source of truth |
+| `embed --stale --source X` | flag silently dropped; full-brain scan | actually scopes to that source |
+| Migration v66 on 373K-row table | plain `CREATE INDEX` takes ShareLock for the whole build | `CREATE INDEX CONCURRENTLY` on Postgres; invalid-remnant DROP first |
+| Cursor pagination test coverage | 4 mocks ignored opts, never exercised the cursor | 6 real-Postgres E2E + PGLite parity unit tests |
+
+### Itemized changes
+
+#### Added
+- `GBRAIN_EMBED_TIME_BUDGET_MS` env knob (default 30 min) bounds `embed --stale` wall-clock runtime; partial index makes "next run picks up" automatic.
+- `EmbedOpts` in `src/core/ai/gateway.ts` (and `EmbedBatchOptions` in `src/core/embedding.ts`) gain `abortSignal` + `maxRetries` passthrough so callers can cancel mid-fetch and disable the AI SDK's retry stack.
+- `detect429FromCause`, `parseRetryDelayMs`, `abortableSleep` exported as `@internal` from `src/commands/embed.ts` so tests can exercise the retry helpers directly.
+- `test/e2e/embed-stale-pagination.test.ts` — 6 Postgres E2E tests covering the cursor's static, failure-skip, page-split, source-scoped, and duplicate-slug-across-sources behaviors.
+
+#### Changed
+- Migration v66 (`embed_stale_partial_index`) rewritten to handler-based engine branching; Postgres uses `CREATE INDEX CONCURRENTLY` with a pre-drop of any invalid remnant via `pg_index.indisvalid`. Renumbered v58→v59→v60→v66 across four merge waves as master's v0.33.3, v0.34.0, v0.34.1, and v0.34.2 each claimed slots ahead of this branch.
+- `BrainEngine.countStaleChunks(opts?: {sourceId?})` and `listStaleChunks({sourceId?, ...})` now scope to a single source when requested. Both Postgres and PGLite engines updated.
+- `embedBatchWithBackoff` now: jitters parsed retry delays ±30%, detects 429 via cause-chain unwrap, passes `maxRetries: 0` through the gateway, and cancels mid-sleep when an `AbortSignal` fires.
+- `embedAllStale` accepts `sourceId` and creates a budget-bound `AbortController` threaded into the retry sleep, the per-key worker claim loop, and the gateway embed call.
+
+#### Fixed
+- `gbrain embed --stale --source X` silently dropped the `sourceId` argument and scanned the entire brain. Now correctly scoped end-to-end.
+- Existing test mocks omitted `source_id` and `page_id` on stale-row literals; TypeScript's structural typing accepted them but the runtime cursor needs both. Every mock fixed.
+- The wave-1 cherry-pick's `embedBatchWithBackoff` had three latent bugs (thundering herd, no wall-clock cap, SDK-retry stacking) and one silently-broken structural check (`e.status === 429` against wrapped errors). All addressed.
+
+### For contributors
+
+- 100% AI-assessed coverage of new code paths. Tests: 504 → 505 files (+1 new E2E file) and ~26 new test cases inside expanded files. `bun run test` passes 6385/0/0; full E2E suite passes 90 files / 603 tests against a fresh Postgres.
+- Plan reviewed via `/plan-eng-review` (9 decisions made interactively), `/codex` consult (12 findings folded in), and a re-review pass (D8 AbortSignal threading into gateway). Plan file: `~/.claude/plans/system-instruction-you-are-working-iterative-torvalds.md`.
+- The cherry-pick lineage: PR #987 (garrytan-agents) → cherry-picked as `ecae761a` onto this branch → opened as PR #991 → all 9 plan decisions + 12 codex findings + 1 re-review finding implemented + tested.
+
+## To take advantage of v0.34.4.0
+
+`gbrain upgrade` does it automatically. The migration v66 runs via `gbrain apply-migrations` and uses `CREATE INDEX CONCURRENTLY` on Postgres so it does not block concurrent writes.
+
+1. **Run the orchestrator (only if `gbrain doctor` warns about a partial migration):**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the outcome:**
+   ```bash
+   gbrain doctor --json | grep -o 'Version [0-9]*'  # expect Version 66
+   ```
+3. **Operator knob** for the new wall-clock budget — only set if 30 min is wrong for your brain:
+   ```bash
+   export GBRAIN_EMBED_TIME_BUDGET_MS=1800000  # 30 min default
+   ```
+4. **If `gbrain embed --stale --source X` was returning unexpected counts pre-upgrade,** the bug was that `--source` was being silently dropped. After upgrade it scopes correctly — re-run with the same flags and you should see the actual per-source NULL count.
+
+5. **If any step fails or `gbrain embed --stale` still hangs,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with `gbrain doctor` output and `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+## [0.34.3.0] - 2026-05-14
+
+**Supervisor stops crashing every 24h on large brains. Watchdog stops false-firing on git mmap.**
+**One shared spawn-loop replaces two duplicate copies that drifted into the same bug class.**
+
+The Minions supervisor was committing suicide every 24h on a 96K-page brain. Every autopilot cycle, `process.memoryUsage().rss` reported ~7GB because VmRSS counts file-backed mmap pages and git holds packfiles open. The 2GB RSS watchdog fired, the worker drained cleanly, exited code=0, and the supervisor counted that clean exit as a crash. 10 clean drains in 24h tripped `max_crashes_exceeded` and the supervisor process gave up. External cron restarted it. Loop repeated.
+
+This release fixes the chain at every layer. The worker now reads RssAnon + RssShmem from `/proc/self/status` on Linux (the actual heap, ~100MB during sync on the same brain) and falls back to VmRSS only on macOS / restricted containers / kernels older than 4.5. The supervisor's exit classifier no longer collapses watchdog drains and real crashes into the same `code=0 vs code≠0` distinction. Clean exits leave `crashCount` untouched (so a worker alternating real-crash + watchdog still trips max_crashes), but they restart immediately with no backoff. A new `cleanRestartBudget` (default 10 restarts per 60s) catches the macOS fallback case where the watchdog still false-fires every cycle.
+
+Underneath that, the supervisor and `gbrain autopilot` no longer maintain two parallel spawn-and-respawn loops with different bug classes. Both now compose a shared `ChildWorkerSupervisor` core. Fix the spawn loop once, both consumers benefit.
+
+### What ships in v0.34.3.0
+
+- **Worker RSS now reads RssAnon + RssShmem on Linux.** `process.memoryUsage().rss` returns VmRSS which includes file-backed mmap pages, so git packfiles inflated the reading to 7GB on large brains. The new helper reads `/proc/self/status` for the non-file-backed pages — the metric a leak watchdog actually wants. Fallback to VmRSS on macOS / kernel <4.5 / missing `/proc`.
+- **Supervisor preserves flap detection across mixed exits.** code=0 exits no longer reset `crashCount` to 0. A worker that alternates real crashes with watchdog drains still trips `max_crashes_exceeded`; a worker that only ever drains cleanly runs forever.
+- **Clean-restart budget caps the macOS-fallback tight-loop.** If 10 code=0 exits happen inside a 60s window, the supervisor emits `health_warn` with reason `clean_restart_budget_exceeded` and applies backoff. Operators get observability instead of a silent restart loop.
+- **`ChildWorkerSupervisor` consolidates the spawn loop.** New module at `src/core/minions/child-worker-supervisor.ts` is the single source of truth for child-process supervision. `MinionSupervisor` and `gbrain autopilot` both compose it. No more parallel-implementation drift.
+- **Parser field-presence fix.** `RssAnon: 0` with `RssShmem: 512` (shmem-only workers) now parses correctly. Pre-fix it fell through to VmRSS.
+- **`awaitChildExit` short-circuit.** Fast SIGTERM responders no longer cause a 35-second hang on clean shutdown — the method now probes `child.exitCode` before registering an exit listener.
+
+### Itemized changes
+
+- `src/core/minions/worker.ts` — `getAccurateRss()` exported with injectable status reader; `parseRssFromProcStatus()` exported for unit tests. Docstring softened to call out the cgroup-OOM caveat.
+- `src/core/minions/child-worker-supervisor.ts` — new file. Pure spawn-and-respawn core. No PID file, no signal handlers, no `process.exit`, no health check. Emits lifecycle events via injected callback.
+- `src/core/minions/supervisor.ts` — refactored to compose `ChildWorkerSupervisor`. The pre-shipped reset-to-0 hunk is gone; D1 lastExitCode tracking + D2 budget live in the shared core. PID lock, signal handlers, health check, and `process.exit` on max-crashes stay.
+- `src/commands/autopilot.ts` — replaced inline spawn-and-respawn loop (lines 165-197) with `ChildWorkerSupervisor` composition. `onMaxCrashesExceeded` routes through `shutdown('max_crashes')` so the autopilot lockfile gets cleaned up (pre-refactor it called `process.exit(1)` directly and bypassed cleanup).
+- Tests: `test/child-worker-supervisor.test.ts` (NEW, 7 cases) covers D1 classifier + D2 budget + the awaitChildExit short-circuit regression. `test/worker-rss.test.ts` (NEW, 11 cases) covers the M1 parser fix and fallback paths. `test/autopilot-supervisor-wiring.test.ts` (NEW, 6 cases) static-shape regression guards. `test/supervisor.test.ts` updated to exit-1 in tests that previously relied on clean-exit-as-crash semantics.
+
+### For contributors
+
+- The `ChildWorkerSupervisor` class is the seam to compose against when adding a new long-running child-process supervisor surface. Don't roll a third spawn-and-respawn loop — compose this one.
+- The `_now` injection point on `ChildWorkerSupervisor` lets tests fake the clock without `mock.module`. The stable-run reset behavior is pinned by a deterministic test that fakes a 6-minute clean exit between two real crashes.
+
+## To take advantage of v0.34.3.0
+
+`gbrain upgrade` carries the whole wave automatically. No migrations. No config flips. If your supervisor was crashing every 24h, watch the logs for 24h after the upgrade and confirm:
+
+- `worker_exited` events have `likely_cause: 'clean_exit'` (not `unknown` or `runtime_error`)
+- `backoff` events have `reason: 'clean_exit'` and `ms: 0`
+- Zero `max_crashes_exceeded` events
+
+If `health_warn` with `reason: 'clean_restart_budget_exceeded'` starts firing on your deployment, that's the new D2 budget telling you the watchdog is firing too often. On Linux that means the worker really is leaking; investigate. On macOS that's the VmRSS-fallback fire pattern — set a higher `--max-rss` threshold to suppress.
+## [0.34.2.0] - 2026-05-14
+
+**Path-based import checkpoint. The newest files in a partial import no longer disappear.**
+**`gbrain import` resumes by completed-path set instead of positional index, so failed and slow files retry instead of silently dropping.**
+
+Three bug classes died in this release. If you ever ran `gbrain import` against a large brain, hit Ctrl-C, and ran it again — or if you've ever run parallel import on Postgres — there were paths where files silently failed to import and never retried until you manually cleared the checkpoint. The old model tracked progress as a positional index into a sorted file list. Under parallel workers, a slow file at index 0 plus three fast completions wrote `processedIndex=3` to the checkpoint, and a crash dropped the slow file on resume. Failed files bumped the same counter, so the checkpoint advanced past them and the next run skipped them. And the v0.33.x sort-newest-first change made cross-version resume drop the newest N files.
+
+v0.34.2.0 replaces all of it with a path-set checkpoint. A file is only "done" when its import succeeds. The checkpoint stores the set of completed relative paths, not a counter. Sort order is irrelevant to checkpoint correctness. Failed files automatically retry on the next run with no manual intervention.
+
+### What changes for users
+
+- `gbrain import` resumes correctly under any execution model: serial, parallel, slow-file-first, or failure-mixed. No more "the new files I just added didn't import."
+- Failed files retry on the next `gbrain import` run automatically. Pre-v0.34.2 you had to delete `~/.gbrain/import-checkpoint.json` by hand to retry a file that errored during a prior run.
+- Newest pages get embedded first across both `gbrain sync` and `gbrain import` — the v0.33 sort-newest-first behavior now lives in a single helper so the policy never drifts between the two commands.
+- Pre-v0.34.2 checkpoints get discarded on first resume with a stderr log line so you know why the run is re-walking. Re-walking is cheap because `content_hash` short-circuits unchanged files.
+
+### Itemized changes
+
+#### Added
+
+- `src/core/import-checkpoint.ts` — `loadCheckpoint`, `saveCheckpoint`, `resumeFilter`, `clearCheckpoint`, and the `ImportCheckpoint` type. Atomic write via `.tmp` + rename so a mid-write crash never leaves a partial JSON. Old positional-format checkpoints get detected and logged before being discarded.
+- `src/core/sort-newest-first.ts` — single source of truth for the descending lex sort that `gbrain import` and `gbrain sync` both apply. Future ordering changes flip one line.
+
+#### Changed
+
+- `src/commands/import.ts` — checkpoint resume now driven by `loadCheckpoint` + `resumeFilter`. Successful imports (and unchanged-via-content-hash) call `completed.add(relativePath)`. Failed files never enter the set. Checkpoint write fires every 100 successful adds (not every 100 processed). Cleanup on clean exit uses `clearCheckpoint`.
+- `src/commands/sync.ts` — inline `.sort()` replaced with `sortNewestFirst(addsAndMods)`.
+
+#### Tests
+
+- `test/sort-newest-first.test.ts` — 5 hermetic cases pinning descending order, mixed prefixes, empty/single input, and in-place mutation contract.
+- `test/import-checkpoint.test.ts` — 18 unit cases over the helpers: missing/malformed/dir-mismatch/old-positional/valid for `loadCheckpoint`, round-trip + atomic-rename + non-fatal-on-error for `saveCheckpoint`, full filter semantics for `resumeFilter`, no-op-on-missing for `clearCheckpoint`.
+- `test/import-resume.test.ts` — fully refactored. Now isolates via `GBRAIN_HOME` env override through `withEnv` (was writing to real `~/.gbrain` pre-v0.34.2). Drives `runImport` against PGLite for true integration coverage. 5 cases including the SLUG_MISMATCH retry regression that pins the pre-existing P1 bug codex caught during plan-eng-review.
+
+#### Includes from PR #964
+
+This release also incorporates @garrytan-agents's [PR #964](https://github.com/garrytan/gbrain/pull/964) (cherry-picked as commit `8dbcf6a5` and superseded by this PR's broader rewrite). The original sort-newest-first contribution is what surfaced the underlying checkpoint bugs during plan-eng-review.
+
+## To take advantage of v0.34.2.0
+
+`gbrain upgrade` handles this automatically. There is no manual step. The first `gbrain import` after upgrade with a pre-existing checkpoint will:
+
+1. Detect the old positional format and log to stderr: `Older checkpoint format detected — re-walking (cheap via content_hash)`.
+2. Re-walk every file in the brain dir. Unchanged files short-circuit via `content_hash` (no embed cost, no DB write).
+3. Write the new path-based checkpoint format going forward.
+
+If you want to verify the new behavior:
+
+```bash
+gbrain doctor
+```
+
+If anything looks wrong, file an issue at https://github.com/garrytan/gbrain/issues with:
+- output of `gbrain doctor`
+- contents of `~/.gbrain/import-checkpoint.json` (if present)
+
+## [0.34.1.0] - 2026-05-14
+
+**MCP hardening wave: stricter source isolation on the read path, PKCE
+DCR works, loopback-by-default, and federated read scopes for shared
+brains. Six community PRs land as one release.**
+
+The v0.34.1 wave consolidates six community PRs into a single ship.
+Source-isolation tightening is the centerpiece — an authenticated OAuth
+client scoped to one source no longer sees rows from neighboring sources
+through the read path. The wave also seals smaller papercuts that have
+been costing real users: gateway-managed stdio MCP servers no longer
+exit on the post-handshake EOF, PKCE-only DCR clients can register
+without inheriting a phantom secret, and `gbrain serve --http` defaults
+to loopback so a personal-laptop brain isn't one accidental config away
+from publishing itself to the LAN. Federated_read adds the read-scope
+axis that shared-brain deployments need: a department client can write
+to one source and read across a curated set without becoming a
+super-reader.
+
+### What you can now do
+
+**Scope OAuth clients to a single source.** `gbrain auth register-client
+my-agent --source dept-x` registers a client whose write authority is
+`dept-x`. Read paths only return rows whose `source_id` matches. The
+auth-layer thread is on `verifyAccessToken` so every per-request
+dispatch starts with the scope in `AuthInfo.sourceId`; ops consume it
+through the canonical `ctx.sourceId` pattern that v0.31.8 established.
+Pre-v0.34 clients without an explicit source default to `default` on
+upgrade — the v0.33 effective behavior is preserved verbatim.
+
+**Federate read scope independently.** `gbrain auth register-client
+my-l3-dept --source dept-x --federated-read dept-x,wecare,shared`
+registers a client that writes to `dept-x` but reads from the union of
+`dept-x`, `wecare` parent canon, and `shared` org canon. The two scope
+axes are orthogonal — `source_id` is the write authority, `federated_read`
+is the read authority. Engine read paths apply
+`WHERE source_id = ANY($1::text[])` at SQL when the array is set; scalar
+single-source clients keep the v0.31.12 fast path.
+
+**Run gateway-piped stdio MCP without race-killing your server.** Set
+`MCP_STDIO=1` in the env and the server skips the stdin EOF shutdown
+hooks. Signal handlers (SIGTERM / SIGINT / SIGHUP) and parent-process
+watchdog still cover legitimate disconnects. OpenClaw's bundle-mcp
+gateway and similar wrappers pipe the handshake then close their stdin
+half; pre-fix this killed the server before the first tool call landed.
+
+**Register PKCE-only public clients.** `POST /register` with
+`token_endpoint_auth_method: "none"` (Claude Code, Cursor, every other
+PKCE-first MCP client) now returns RFC 7591-compliant response shape:
+no `client_secret` field on public clients, secret-bearing on default
+`client_secret_post` clients. The `/token` exchange accepts the public
+client through the SDK's clientAuth path because `getClient` correctly
+normalizes a NULL `client_secret_hash` to JS undefined.
+
+**Bind the HTTP MCP server to loopback by default.** `gbrain serve
+--http` now listens on `127.0.0.1` unless you pass `--bind 0.0.0.0` (or
+a specific interface IP). Personal-laptop installs are no longer one
+default-config away from publishing the brain to a LAN. Self-hosted
+server operators who actually want remote access pass `--bind 0.0.0.0`
+once; a stderr WARN fires when `--public-url` is set without `--bind` so
+the operator doesn't silently bind loopback at startup.
+
+**Embed images through LiteLLM / openai-compatible multimodal models.**
+The gateway's `embedMultimodal` no longer hardcodes Voyage; recipes with
+`implementation: 'openai-compatible'` route through the standard
+`/embeddings` endpoint with content arrays carrying `image_url` entries.
+Runtime dimension validation throws a clear error pre-storage if the
+provider returns a vector that doesn't match the brain's embedding
+column width — no more cryptic `vector dimension mismatch` at INSERT
+time.
+
+### The migration block
+
+`gbrain upgrade` applies migrations v60-v65 automatically. The migration
+chain adds two columns to `oauth_clients` and an index, plus a FK flip
+once federated_read is in place.
+
+### To take advantage of v0.34.1
+
+`gbrain upgrade` should do this automatically. If it didn't, or if
+`gbrain doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the schema landed:**
+   ```bash
+   gbrain doctor --json | jq '.checks.schema_version'
+   # version should be >= 60
+   ```
+3. **Existing OAuth clients keep working.** Pre-v0.34 clients without an
+   explicit source scope are backfilled to `source_id='default'` so
+   their effective scope matches v0.33. To narrow a specific client's
+   scope, re-register it with `--source <id>`:
+   ```bash
+   gbrain auth revoke-client <client_id>
+   gbrain auth register-client <name> --source <source_id> --scopes read,write
+   ```
+4. **`gbrain serve --http` default changed.** Existing self-hosted
+   server deployments must add `--bind 0.0.0.0` to keep accepting remote
+   connections. Personal-laptop users see no behavior change (loopback
+   is now the default).
+5. **If `gbrain apply-migrations` refuses with an `oauth_clients` stale
+   source_id error** (possible only if an operator hand-poked the column
+   before upgrading): the error message names the offending client IDs.
+   Either revoke + re-register them with a valid source, or re-run with
+   `GBRAIN_ACCEPT_SILENT_WIDEN=1` to NULL the stale values (widens those
+   clients to super-reader; re-scope via `gbrain auth register-client`
+   after).
+6. **If any step fails or the numbers look wrong,** file an issue:
+   https://github.com/garrytan/gbrain/issues with `gbrain doctor --json`
+   output and the failing step.
+
+### Itemized changes
+
+**Source-isolation hardening:**
+- `OperationContext.auth` now carries `AuthInfo.sourceId` (write scope)
+  and `AuthInfo.allowedSources` (federated read scope), threaded from
+  `oauth_clients` rows at token-verification time.
+- New helper `sourceScopeOpts(ctx)` in `src/core/operations.ts` encodes
+  the precedence ladder: federated array wins over scalar over nothing.
+  Every read-side op handler routes through it so future ops can't
+  silently drift from the canonical thread.
+- `src/core/search/hybrid.ts` inner `SearchOpts` rebuild now includes
+  `sourceId` + `sourceIds` fields — the structural fix that prevents
+  the explicit-pick footgun that motivated the wave.
+- `src/core/types.ts` adds `sourceIds?: string[]` to `SearchOpts` and
+  `PageFilters` for the federated read axis. Both Postgres and PGLite
+  engines apply `WHERE source_id = ANY($N::text[])` when the array is
+  set; scalar fast path preserved when unset.
+- Engine method signatures `traverseGraph(slug, depth, opts?)` and
+  `traversePaths(slug, opts?)` accept `opts.sourceId` /
+  `opts.sourceIds` so graph walks respect the caller's scope.
+- `src/core/oauth-provider.ts:verifyAccessToken` JOINs
+  `oauth_clients.source_id` + `federated_read` and surfaces both on the
+  returned `AuthInfo`. Pre-v60 / pre-v61 brains degrade gracefully via
+  `isUndefinedColumnError` fallback.
+- `src/commands/serve-http.ts` drops the `(authInfo as AuthInfo &
+  {sourceId?: string}).sourceId ?? env ?? 'default'` cast chain. The
+  typed field is the source of truth now.
+- Legacy `src/mcp/http-transport.ts` (v0.22.7-style access_tokens path)
+  threads `sourceId: 'default'` through DispatchOpts so legacy tokens
+  stay source-scoped.
+
+**Migration chain v60-v65 (six new migrations on top of v54):**
+- v60 (`oauth_clients_source_id_fk`) — ALTER TABLE ... ADD COLUMN
+  source_id TEXT, backfill NULL→'default', install FK with
+  ON DELETE SET NULL.
+- v61 (`oauth_clients_federated_read_column`) — ALTER TABLE ... ADD
+  COLUMN federated_read TEXT[] NOT NULL DEFAULT '{}'.
+- v62 (`oauth_clients_federated_read_backfill`) — explicit CASE backfill
+  so `source_id IS NULL` produces `'{}'` not an array-containing-NULL.
+- v63 (`oauth_clients_federated_read_validate`) — fail-loud check that
+  every row's source_id is in its federated_read array post-backfill.
+- v64 (`oauth_clients_source_id_fk_restrict`) — flip FK to
+  ON DELETE RESTRICT now that federated_read provides the alternative
+  scope-loss path. Source delete is refused if any client references it.
+- v65 (`oauth_clients_federated_read_gin_index`) — GIN index for the
+  array-containment queries the read paths run.
+
+**OAuth + auth surface:**
+- `auth.ts` CLI adds `--source <id>` and `--federated-read <SRC1,SRC2,...>`
+  flags to `register-client`. The output now prints the resolved
+  `Write source` and `Federated reads` for the registered client.
+- DCR `/register` endpoint now writes `source_id='default'` and
+  `federated_read=['default']` on the inserted row so new public clients
+  start in a sane scope.
+- `registerClient` honors `token_endpoint_auth_method: "none"` (RFC 7591
+  §3.2.1): public clients store `client_secret_hash = NULL` and the
+  response payload omits `client_secret` entirely. Confidential clients
+  (default `client_secret_post` and explicit `client_secret_basic`) keep
+  their one-time-reveal shape.
+
+**MCP transports:**
+- `src/mcp/server.ts` + `src/commands/serve.ts` skip stdin
+  `'end'`/`'close'` shutdown hooks when `process.env.MCP_STDIO === '1'`.
+  `ServeOptions` gains a `mcpStdio?: boolean` test seam so the runtime
+  guard is exercisable without process.env mutation.
+- `src/commands/serve-http.ts` adds `--bind HOST` (default `127.0.0.1`).
+  Stderr WARN fires when `--public-url` is set without `--bind`.
+  Startup banner prints the resolved `Bind:` line.
+
+**Multimodal embedding:**
+- `gateway.ts` adds `embedMultimodalOpenAICompat()` that POSTs to the
+  standard `/embeddings` endpoint with content arrays. Routes by
+  `recipe.implementation === 'openai-compatible'` so LiteLLM-fronted
+  providers (Anyscale, vLLM, Gemini multimodal via proxy) work alongside
+  Voyage's existing `/multimodalembeddings` path.
+- `recipes/litellm-proxy.ts` declares `supports_multimodal: true` so the
+  recipe accepts multimodal calls without a model allow-list (LiteLLM is
+  a passthrough; user-owned model id selection).
+- Runtime dimension validation: the returned vector length is checked
+  against the recipe's declared `default_dims` or the brain's
+  `embedding_dimensions` config. Mismatch throws `AIConfigError` with
+  model id + observed + expected before the vector reaches storage.
+
+**Tests:**
+- `test/e2e/source-isolation-pglite.test.ts` — 14 cases pinning the
+  scope filter at the engine layer plus op-handler threading for both
+  `ctx.sourceId` and `ctx.auth.allowedSources` paths.
+- `test/openai-compat-multimodal.test.ts` — 11 cases covering the
+  openai-compatible multimodal path: happy-path single + multi-input,
+  unauthenticated proxy, D12 dim mismatch + default-dim fallback,
+  401 / 400 / malformed-JSON / non-array error paths, and a Voyage
+  regression test.
+- `test/oauth.test.ts` — 5 new cases for PKCE DCR public-client gate
+  (no secret for public; secret unchanged for default; getClient
+  NULL→undefined normalization; full PKCE `/authorize` → `/token`
+  round-trip).
+- `test/serve-stdio-lifecycle.test.ts` — 3 new cases for the
+  `MCP_STDIO=1` guard (stdin EOF does NOT trigger shutdown; SIGTERM
+  still does; unset env preserves CLI behavior).
+- `test/book-mirror.test.ts` — `runCli` helper now uses a fresh
+  `GBRAIN_HOME` tempdir so the test isn't sensitive to the developer's
+  local `~/.gbrain/config.json`. Pre-fix this could silently inherit a
+  real Postgres connection and hang past the default 5s test timeout.
+
+**Test results: 6045 unit tests pass / 0 fail. typecheck clean. PGLite
+initSchema runs the v60-v65 chain in ~786ms total.**
+
+### For contributors
+
+- The wave bundled six community PRs (#870, #909, #864, #861, #875,
+  #876) with cross-model plan review (codex outside-voice) before
+  cherry-pick. Codex caught three structural bugs the original PRs
+  missed: a 6th source-isolation leak surface (the `query` image path
+  in `operations.ts:1071-1082`), a 5th read-side op missing from #861's
+  thread (`find_experts`), and migration-numbering collisions on
+  v47-v53 that would have wedged on cherry-pick (the branch had grown
+  to v57 by ship time after master shipped its own v55-v57 search-lite
+  migrations). The wave's migration chain renumbers to v60-v65.
+- The single PR carries `Co-Authored-By:` for the six external
+  contributors. PRs originated against earlier base branches and the
+  diffs were re-implemented on the collector branch rather than merged
+  directly (per CLAUDE.md's PR wave process).
+
+Contributed by @Hansen1018 (#870), @ding-modding (#909), @DukeDawg
+(#864), @toilalesondev (#861 + #876), @yoelgal (#875).
+
+## [0.34.0.0] - 2026-05-14
+
+**Recursive code intelligence ships. Plan-mode subagents get one-call blast and flow.**
+**`code_blast` and `code_flow` walk callers and callees with depth grouping, cycle detection, and sink tagging.**
+
+The v0.34 wave builds on v0.33.3's foundation (MCP-exposed code-callers/callees/def/refs) to deliver the actual plan-mode payoff: recursive walks that replace 10-grep chains with one structured response. An agent editing a function can now ask "what calls this?" and get every transitive caller grouped by depth, with truncation flags and cycle detection. An agent tracing a request can ask "what does this lead to?" and get the chain to its terminal sinks (HTTP call, DB write, file I/O, process exec).
+
+This release also densifies the call graph beneath the new ops. Pre-v0.34 the extractor emitted bare callee tokens (`render`, `find`, `m`) and the call graph aliased same-named methods across classes. v0.34 ships receiver-type resolution for the 3 MUST patterns (`import { x }`, `this/self.m`, `new C().m`) in JS/TS/TSX + Python, plus new `imports` and `references` edge types that turn the calls-only graph into a real dependency map.
+
+### What ships in v0.34.0.0
+
+- `code_blast(symbol, depth=5, max_nodes=200)` MCP op — recursive callers grouped by depth, with `confidence`, `cycles_detected`, `truncation`, `freshness`, `did_you_mean`, `candidates`, and `supported` fields per the response envelope.
+- `code_flow(entry_point, depth=8, max_nodes=200)` MCP op — recursive callees from an entry point, with `terminal_nodes: [{symbol, sink_kind}]` where `sink_kind ∈ db_call | http_call | file_io | process_exec | unknown`.
+- `code_traversal_cache_clear(source_id?, all_sources=false)` admin op with the v0.26.5 destructive-guard pattern.
+- W1: receiver-type resolution at extraction time (3 MUST patterns; JS/TS/TSX + Python). Depth-32 walker cap.
+- W2: new `imports` and `references` edge types. JS/TS/TSX + Python get imports; TS gets type-position references. Ruby/Go/Rust/Java stay at calls-only — honest coverage in the response shape.
+- W3b: `code_traversal_cache` table (schema migration v56) with D3 generation-counter invalidation.
+- W6: `gbrain edges-backfill` CLI — operator escape hatch for the symbol-resolution backfill. Resumable via `edges_backfilled_at` watermark.
+- W7: `src/core/eval-capture-graph.ts` — pure-function metrics (node-set Jaccard, depth-group stability, truncation-match, Adjusted Rand Index) for replay-driven regression checks on code-intel ops.
+- STEP 0: `OperationContext.sourceId` promoted to TypeScript-REQUIRED. Mirrors v0.26.9 `remote` REQUIRED pattern.
+
+### Slip handling — deferred to v0.34.1
+
+The plan's explicit slip-handling clause for clusters fired at ship time. v0.34.0.0 ships the foundation + structural payoff (recursive walks) without the W4–5 Leiden cluster pipeline. Reason: the cluster ship gate requires validating ≤0.03 clusters/node on real brain data, and the eval gate requires a baseline-vs-with-code-intel comparison on a populated brain. Neither was available at ship time.
+
+Deferred to v0.34.1:
+- W4–5: Leiden clusters (schema v57, leiden module, cluster naming, recompute_code_clusters cycle phase, `code_clusters_list` + `code_cluster_get` MCP ops, `gbrain clusters` CLI, ship-gate ratio check).
+- W6: `gbrain wiki` zero-LLM aggregator (depends on clusters).
+- W7 wiring: `eval-capture.ts` `tool` field + `result_shape` payload, `eval-replay.ts` dispatch on tool.
+- W1 `.scm` pattern-file rewrite of the receiver-type walker.
+- W3 stdio rate limiter at `src/mcp/dispatch.ts` (D10).
+- W3 CLI thin-shims (`gbrain blast`, `gbrain flow`).
+- D2 autopilot 60s sub-loop for `resolve_symbol_edges`.
+
+## To take advantage of v0.34.0.0
+
+`gbrain upgrade` runs `gbrain apply-migrations` automatically. v0.34.0.0 ships migration v56 (`code_traversal_cache_v0_34`). Most users won't need to do anything else.
+
+To exercise the new W1/W2 edge shapes on an existing brain:
+
+1. **Run the symbol-resolution backfill manually (one-time on first run after upgrade):**
+   ```bash
+   gbrain edges-backfill --all-sources
+   ```
+   Resumable. Ctrl-C is safe. Re-runs are idempotent.
+
+2. **Verify code-intelligence coverage:**
+   ```bash
+   gbrain doctor --json | jq '.checks.code_intel_coverage'
+   ```
+
+3. **Try the new recursive ops:**
+   ```bash
+   gbrain call code_blast --symbol performSync
+   gbrain call code_flow --entry_point runCycle
+   ```
+
+4. **Run the v0.34.0.0 eval gate (optional — measures retrieval-quality delta):**
+   ```bash
+   # Pre-v0.34 baseline (3 runs for noise floor)
+   for i in 1 2 3; do gbrain eval code-retrieval --baseline --save /tmp/v034-baseline-$i.json; done
+   # With code-intel
+   gbrain eval code-retrieval --with-code-intel --save /tmp/v034.json
+   gbrain eval code-retrieval --compare /tmp/v034-baseline-1.json /tmp/v034.json
+   ```
+   Pass criterion: precision@5 +10pp OR top-1 stability +15pp on ≥15/30 questions above the 3-run noise floor.
+
+5. **If anything fails or surprises you**, file an issue: https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+## [0.33.3.0] - 2026-05-12
+
+**Code intelligence ships to agents. Plan-mode subagents stop falling through to grep.**
+**`code_callers`, `code_callees`, `code_def`, `code_refs` are MCP-exposed with resolver-grade descriptions.**
+
+Pre-v0.33.3 the four code-intelligence commands from v0.20+ Cathedral II lived in `CLI_ONLY` at `cli.ts:30`. An agent running through MCP saw `query`/`search` but no structural retrieval, so it grepped, missed callers in string literals, shipped plans with broken call chains, and got caught in review. v0.33.3 closes that gap and lays the foundation work that v0.34 Cathedral III (recursive blast/flow + Leiden clusters + wiki) will build on top of.
+
+This release was scoped after Codex's outside-voice review caught two load-bearing premise gaps in the original v0.34 plan: the call graph stored bare callee tokens (not qualified names), and source routing was already broken in `query` and `two-pass.ts`. Both are fixed here before any user-facing recursive op ships.
+## [0.33.2.1] - 2026-05-14
+
+**Doc-only: name the fork-PR escape hatch so AI-authored PRs don't drop their CI secrets.**
+
+PRs from `garrytan-agents` (the AI-authored PR account) live in a fork. GitHub's `pull_request` event doesn't ship base-repo secrets to forks by default, so any CI job that needs `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` quietly fails with empty-env auth errors regardless of what's set on the base repo. CLAUDE.md now documents the move-branch-to-base-repo workflow as the narrow-scope alternative to adding the account as a collaborator (which would broaden secret distribution to every PR from that account) or flipping the repo-wide fork-secret toggle (which would broaden it to every fork PR).
+
+### Itemized changes
+
+- `CLAUDE.md` gets a new `## Checking out PRs from garrytan-agents` section between "Community PR wave process" and "Skill routing". Four-step recipe: `gh pr checkout <N>` → `git push origin HEAD:<branch>` → `gh pr close <N>` → `gh pr create --base master --head <branch>`, preserving the original title and body verbatim. Closes the friction Garry hit landing #962 / Voyage 2048-dim fixup PRs from the agent account.
+- `llms-full.txt` regenerated by `bun run build:llms` so the committed doc bundle matches the live CLAUDE.md. Pinned by `test/build-llms.test.ts` in CI shard 1.
+
+## [0.33.2.0] - 2026-05-12
+
+**Code intelligence ships to agents. Plan-mode subagents stop falling through to grep.**
+**`code_callers`, `code_callees`, `code_def`, `code_refs` are MCP-exposed with resolver-grade descriptions.**
+
+Pre-v0.33.2 the four code-intelligence commands from v0.20+ Cathedral II lived in `CLI_ONLY` at `cli.ts:30`. An agent running through MCP saw `query`/`search` but no structural retrieval, so it grepped, missed callers in string literals, shipped plans with broken call chains, and got caught in review. v0.33.2 closes that gap and lays the foundation work that v0.34 Cathedral III (recursive blast/flow + Leiden clusters + wiki) will build on top of.
+
+This release was scoped after Codex's outside-voice review caught two load-bearing premise gaps in the original v0.34 plan: the call graph stored bare callee tokens (not qualified names), and source routing was already broken in `query` and `two-pass.ts`. Both are fixed here before any user-facing recursive op ships.
+
+## [0.33.1.1] - 2026-05-13
+
+**Voyage 2048-dim brains finally produce 2048-dim vectors. Fail-loud on every Voyage misconfiguration.**
+
+Voyage-backed brains configured for high-dimensional embeddings (2048 wide for richer recall on long-form content) were silently producing 1024-dim vectors on every embed call. The dimension instruction was being routed through a wire-key that the AI SDK's openai-compatible adapter doesn't recognize, so it got dropped before the HTTP request was built. Voyage returned its default 1024-dim, the gateway dimension check threw, and brains failed to ingest. This release lands the upstream fix from @100yenadmin and stacks three Voyage-adjacent correctness follow-ups that adversarial Codex review caught during PR review.
+
+### What you can now do
+
+**Run Voyage brains at 2048 dims and actually get 2048 dims.** `embedding_model: voyage:voyage-4-large` + `embedding_dimensions: 2048` now routes through the SDK-supported `dimensions` field, which the existing `voyageCompatFetch` shim rewrites to Voyage's `output_dimension` on the wire. New wire-level test asserts the actual outbound HTTP body contains `output_dimension: 2048`. Same fix covers voyage-3-large, voyage-3.5, voyage-3.5-lite, voyage-4, voyage-4-lite, voyage-code-3.
+
+**Get caught at config time, not first-embed.** `gbrain models doctor` now runs an `embedding_config` probe before any token-spending chat/expansion probes. If your brain is set to a Voyage flexible-dim model with `embedding_dimensions` outside `{256, 512, 1024, 2048}` (the most common trip: leaving `embedding_dimensions` unset, which falls back to the OpenAI default of 1536), doctor surfaces it with a paste-ready `gbrain config set` fix. The runtime `dimsProviderOptions` validator throws an `AIConfigError` at the embed boundary with the same fix hint, so even if you skipped doctor you get a clear message naming the valid values instead of an opaque Voyage HTTP 400.
+
+**voyage-4-nano stays in its lane.** Voyage's `voyage-4-nano` is an open-weight variant listed separately by Voyage as fixed 1024-dim — it doesn't accept `output_dimension`. Dropped from the flexible-dim allowlist; recipe docstring tightened to name the seven hosted flexible-dim models explicitly so the "all v4 variants are flexible" claim doesn't lead the next contributor to re-add nano. A negative regression test pins the contract.
+
+**Voyage OOM cap is now actually effective.** `voyageCompatFetch`'s 256 MB per-response cap (the defense-in-depth check that fires when Content-Length is missing on chunked encoding) was being silently swallowed by the surrounding parse-error try/catch — a malicious or misbehaving Voyage endpoint returning a multi-gigabyte response could have OOMed the worker. Now wrapped in a tagged `VoyageResponseTooLargeError` class that the catch rethrows on `instanceof`, so the cap fails loud instead of returning the oversized response into the AI SDK's JSON parser.
+
+### Why this matters
+
+Voyage is the gbrain-recommended embedding provider for users who want pgvector-native, high-quality embeddings without depending on OpenAI. The 2048-dim bug was a structural footgun: every first-time Voyage user hitting it without obvious cause. Eva (@100yenadmin) caught and fixed the root cause; the follow-up wave plugs the three adjacent correctness gaps that pre-empted future Voyage users hitting similar opaque failures.
+
+## To take advantage of v0.33.1.1
+
+`gbrain upgrade` should do this automatically. If you're already on Voyage:
+
+1. **Verify your dim config is valid:**
+   ```bash
+   gbrain models doctor
+   ```
+   You should see a new `embedding_config` line; if it reports `config` status, follow the paste-ready fix.
+2. **No reindex required** if you were already on a Voyage flexible-dim model with the correct `embedding_dimensions` (the bug surfaced as fail-loud at embed time, so existing brains didn't silently get wrong-width vectors — they failed to embed).
+3. **If `gbrain doctor` warns about anything,** file an issue at https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - your `embedding_model` + `embedding_dimensions` config values
+
+### Itemized changes
+
+#### Fixed
+
+- **Voyage 2048-dim embeddings (closes #866).** `src/core/ai/dims.ts` `dimsProviderOptions` now returns `{ openaiCompatible: { dimensions: N } }` (SDK-supported) instead of `{ openaiCompatible: { output_dimension: N } }` (Voyage wire-key the SDK silently dropped). Existing `voyageCompatFetch` in `src/core/ai/gateway.ts:541` translates `dimensions → output_dimension` before the HTTP body is sent. Contributed by @100yenadmin (PR #866, re-landed in #962 due to `maintainerCanModify` cross-fork push limitation — authorship preserved on the original commit).
+
+- **Voyage OOM-cap rethrow.** `src/core/ai/gateway.ts:619` Layer 2 base64 cap was throwing a generic `Error` that the surrounding `catch {}` swallowed, then returning the original (oversized) response to the AI SDK. New `VoyageResponseTooLargeError` tagged class is now thrown at both cap sites (Content-Length Layer 1 at `:595` and per-embedding Layer 2 at `:619`) and rethrown from the inbound try/catch via `instanceof` check. Parse-error fall-back behavior preserved for non-OOM errors. Codex P3 follow-up.
+
+- **Voyage flexible-dim runtime validation.** `dimsProviderOptions` now throws `AIConfigError` with a paste-ready fix hint when a Voyage flexible-dim model is configured with anything outside `{256, 512, 1024, 2048}`. Most common trigger: `embedding_model: voyage:voyage-4-large` without `embedding_dimensions` (falls back to default 1536 — not Voyage-accepted). Codex P3 follow-up.
+
+#### Changed
+
+- **voyage-4-nano dropped from `VOYAGE_OUTPUT_DIMENSION_MODELS`.** Open-weight model, fixed-dim 1024 per Voyage docs; doesn't accept `output_dimension`. Recipe docstring at `src/core/ai/recipes/voyage.ts:7-16` tightened so the "all v4 variants" claim doesn't lead future contributors to re-add it. Negative regression test in `test/ai/gateway.test.ts` pins the contract.
+
+- **`gbrain models doctor` runs an `embedding_config` probe first** (zero tokens, local-only). Surfaces Voyage flexible-dim mismatches before any chat/expansion probes spend money. New `config` probe status + `fix` hint rendered in both human and JSON output. New `embedding_config` touchpoint label appears alongside `chat` / `expansion`.
+
+#### Tests
+
+- New wire-level test (`test/ai/gateway.test.ts`): stubs `globalThis.fetch` and asserts the outbound Voyage request body contains `output_dimension: 2048` + `encoding_format: base64`. Catches the exact regression class that motivated #866.
+- Two new behavioral tests for the OOM-cap rethrow (Content-Length over cap + oversized base64 string both propagate).
+- Six new tests for the flexible-dim runtime validator (1536 + 3072 rejected, all valid sizes accepted, `voyage-3-lite` / `voyage-4-nano` bypass validator, fix-hint contents).
+- Source-shape regression assertion in `test/voyage-response-cap.test.ts` pins the `instanceof VoyageResponseTooLargeError ⇒ throw err` line.
+
+#### For contributors
+
+- New tagged error class `VoyageResponseTooLargeError` is exported from `src/core/ai/gateway.ts` (test-only seam; not part of the public AI SDK surface).
+- New exports from `src/core/ai/dims.ts`: `VOYAGE_VALID_OUTPUT_DIMS` (`[256, 512, 1024, 2048] as const`) and `isValidVoyageOutputDim(dims: number)`. Reuse these if you add a Voyage-adjacent probe or doctor check; do NOT inline the magic numbers.
+
+## [0.33.1.0] - 2026-05-10
+
+**Ask gbrain who in your network knows about a topic, and get a ranked answer with the reasoning shown.**
+
+The new `gbrain whoknows <topic>` command (CLI + `find_experts` MCP op) routes expertise + relationship-proximity queries against person and company pages in your brain. Returns top-5 by default. `--explain` dumps the per-result factor breakdown so you can see why the ranking landed where it did. The release ships the wedge query without committing to a new substrate; community detection and a formal relationship_score table are deferred until the eval set proves they're earned, not because they sound good in a CHANGELOG.
+
+### What you can now do
+
+**Ask the question you actually ask.** `gbrain whoknows "lab automation"` returns the top-5 people or companies in your brain that know about lab automation, ranked by expertise depth (sub-linear chunk-match), relationship recency (6-month half-life), and salience. Filters at SQL to person/company pages only — note pages and articles drop out without you asking. Mirrors the v0.29 `salience` / `anomalies` shape: CLI + MCP op + thin-client routing all on day one.
+
+**See the math.** `gbrain whoknows "fintech compliance" --explain` adds a one-line factor breakdown per result. You see `expertise=0.405 (raw=0.500) recency=0.846 (60d) salience=0.300 → factor=0.650`. Trust through transparency, not opacity. The MCP op accepts the same flag; agents can return the breakdown to the user verbatim.
+
+**Get a SQL-level type filter for free.** The new `SearchOpts.types: PageType[]` parameter on `searchHybrid` (and underlying `searchKeyword` + `searchVector` in both engines) pushes the page-type filter into SQL via `AND p.type = ANY($N::text[])`. The limit budget goes to candidate-typed pages instead of being eaten by transcripts and articles. Future entity-only search reuses the parameter without touching this code.
+
+**Grade the headline against a two-layer eval gate.** `gbrain eval whoknows test/fixtures/whoknows-eval.jsonl` runs the locked ENG-D2 two-layer gate: Layer 1 hand-labeled fixture passes at ≥ 80% top-3 hit rate (the primary gate); Layer 2 `eval_candidates` replay passes at ≥ 0.4 mean set-Jaccard@3 (the regression gate). Layer 2 auto-skips with a stderr warning if `eval_candidates` has fewer than 20 replay-eligible captured rows — sparseness fallback lets users without `GBRAIN_CONTRIBUTOR_MODE=1` history still ship.
+
+**See if you did the assignment.** `gbrain doctor` adds a `whoknows_health` check that warns when `test/fixtures/whoknows-eval.jsonl` is missing, empty, or undersized (< 5 rows). The check is intentionally narrow: it does NOT measure hit-rate regression (that's the eval command's job). It surfaces "you haven't written your fixture yet" — the single highest-leverage signal in the doctor sweep.
+
+### The locked ranking spec (ENG-D1)
+
+```
+score = log(1 + raw_match)            // expertise (sub-linear)
+      × max(0.1, exp(-days/180))      // recency (6mo half-life, floored at 0.1)
+      × (0.5 + 0.5 × clamp(salience)) // salience (centered at 0.5)
+```
+
+Floors prevent multiplicative-zero edge cases (cold-start people without an `effective_date` get `recency_factor = 0.1` — visible, not zeroed). NaN inputs (negative recency, missing salience, undefined match score) all return `Number.isFinite(score) === true`. Same-score ties break alphabetically by slug for determinism. 16 unit tests in `test/whoknows.test.ts` pin the math.
+
+### Eval-gated trajectory
+
+| Outcome at end of week 1 | What ships in v0.33 |
+|---|---|
+| Naive whoknows ≥ 80% on hand-labeled + ≥ 0.4 Jaccard on replay | Clean release: command family + eval gate + doctor check. Substrate (community detection, formal `relationships` table) queues to v0.34 contingent on demand. |
+| Naive whoknows fails the eval | v0.34 picks up substrate work (composite-keyed `relationships` table + person-person projection from `attended` links + Jaccard-stable community alignment via graphology Louvain + Haiku-named clusters). The eval told us substrate was earned. |
+
+### What this means for your workflow
+
+If you've been muscle-memorying the search bar to find "who in my network knows about X" — that workflow becomes `gbrain whoknows`. The `--explain` flag means you stop wondering why result #2 landed at #2; you can see the recency or salience that put it there. The MCP op makes the same query agent-composable: an agent asks `find_experts` for routing candidates and brings them to the conversation.
+
+The release is eval-gated by design (per /office-hours, /plan-ceo-review, and Codex outside-voice). If the naive ranking passes your real-brain eval, you didn't need the cathedral substrate after all. If it fails, v0.34 builds it — measured, not speculated.
+
+## To take advantage of v0.33.1
+
+`gbrain upgrade` should do this automatically. Then run the eval gate against your real brain:
+
+1. **Write your eval fixture** at `test/fixtures/whoknows-eval.jsonl`:
+   ```bash
+   # 10 queries you'd actually ask, with hand-labeled expected slugs:
+   # {"query":"lab automation","expected_top_3_slugs":["wiki/people/your-expert"],"notes":"..."}
+   ```
+   The shipped placeholder uses obviously-example slugs (`wiki/people/example-alice`) so you won't mistake it for real grading.
+
+2. **Run the gate:**
+   ```bash
+   gbrain eval whoknows test/fixtures/whoknows-eval.jsonl
+   ```
+   Pass = ≥ 80% top-3 hit rate. Layer 2 (eval_candidates replay) auto-engages if you have ≥ 20 captured queries from `GBRAIN_CONTRIBUTOR_MODE=1` history; otherwise skips with a warning.
+
+3. **Ask the brain:**
+   ```bash
+   gbrain whoknows "lab automation"
+   gbrain whoknows "fintech compliance" --explain
+   gbrain whoknows "ai agents" --limit 10 --json
+   ```
+
+4. **From an agent (MCP):**
+   ```json
+   {"tool": "find_experts", "params": {"topic": "lab automation", "limit": 5, "explain": true}}
+   ```
+   The op is `scope: 'read'`, accessible to any client with the read OAuth scope.
+
+5. **If `gbrain doctor` warns about `whoknows_health`,** it means your fixture is missing or undersized. The fix hint points at the exact path.
+
+6. **If any step fails,** please file an issue: https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor --json` and `gbrain eval whoknows test/fixtures/whoknows-eval.jsonl --json`.
+
+### Itemized changes
+
+**New CLI commands:**
+- `gbrain whoknows <topic> [--explain] [--limit N] [--json]` — routes expertise queries to top-K person/company pages.
+- `gbrain eval whoknows <fixture.jsonl> [--json] [--skip-replay]` — two-layer eval gate (quality fixture + regression replay).
+
+**New MCP op:**
+- `find_experts` (`scope: 'read'`, `localOnly: false`) — backs the same `findExperts()` core that the CLI calls. Mirrors the v0.29 `find_anomalies` naming convention. Accessible to read-scoped OAuth clients on HTTP MCP installs.
+
+**New core files:**
+- `src/commands/whoknows.ts` — pure `rankCandidates()` ranking function (ENG-D1 locked spec), `findExperts()` orchestrator (hybrid search + batch salience/recency fetch + rank), `runWhoknows()` CLI dispatch.
+- `src/commands/eval-whoknows.ts` — two-layer gate orchestrator. `jaccardAtK()` / `topKHit()` / `readFixture()` exported for tests.
+- `test/fixtures/whoknows-eval.jsonl` — 10-row synthetic placeholder.
+
+**searchHybrid extension:**
+- `SearchOpts.types?: PageType[]` — multi-type SQL-level filter, threaded through `searchKeyword` + `searchVector` + `searchKeywordChunks` on both engines. AND-applies alongside the existing single-value `type` filter. No retrieval waste: limit budget goes to typed candidates.
+
+**Doctor:**
+- `whoknows_health` check warns when the fixture is missing / empty / undersized.
+
+**Tests:**
+- `test/whoknows.test.ts` — 16 cases covering the 10 locked ENG-D3 shadow paths, ranking sanity (higher-match / more-recent / higher-salience outrank), source-id composite-key safety (Codex F1), factor-decomposition numerical pin.
+- `test/eval-whoknows.test.ts` — 23 cases on `jaccardAtK`, `topKHit`, fixture parsing, locked thresholds.
+- `test/whoknows-doctor.test.ts` — 5 cases on the fixture-presence states.
+- `test/e2e/whoknows.test.ts` — 5 E2E cases against a seeded PGLite brain, asserting the >= 80% gate against the synthetic fixture, type-filter exclusion, empty-result safety, `--explain` shape, limit honoring.
+
+**What we deferred (v0.34+ candidates):**
+- Formal `relationships` table (composite-keyed `(from_slug, from_source_id, to_slug, to_source_id)` per Codex F1) — eval-gated.
+- `page_communities` table + Jaccard-stable community alignment (Codex F4) — eval-gated.
+- Louvain via graphology-communities-louvain (CEO-D6 walked back from native igraph per Codex F5) — eval-gated.
+- `gbrain prep <person-slug>` and `gbrain stale` — moved to OpenClaw skills layer per Codex F8 (thin-harness ethos).
+- Proactive nudges, intro suggestions, conversation continuity — v0.34+ as the substrate proves itself.
+
+### Process notes
+
+The plan went through `/office-hours` → `/plan-ceo-review` → Codex outside-voice → `/plan-eng-review`. Each pass changed the shape. Office-hours locked the headline + eval-first principle. CEO review proposed 8 deliverables in SCOPE EXPANSION mode. Codex pushed back on 5 fronts (sequencing, eval methodology, library choice, layer separation, schema design) and was accepted on all 5 + 3 substrate defects. Eng review locked the ranking formula, the two-layer eval gate, the 10-case test list, and the SQL-level typeFilter. Net result: scope reduced ~75% from the cathedral version while shipping the actual wedge users ask for.
 ## [0.33.0] - 2026-05-11
 
 **`gbrain recall` now answers "what changed since last time?" in one command, and thin-client installs stop silently lying about empty results.**
@@ -194,6 +1015,42 @@ If you run gbrain with more than one source (say a `media-corpus` alongside `def
 ### The numbers that matter
 
 ```
+Agent MCP code-intel surface   →   v0.32.0: 0 ops    →   v0.33.0: 4 ops + resolver-grade descriptions
+Source-routing leak surface    →   v0.32.0: 4 sites  →   v0.33.0: 0 sites (Codex finding #2 fix)
+Cycle phases                   →   v0.32.0: 11       →   v0.33.0: 12 (new `resolve_symbol_edges`)
+```
+
+What ships:
+
+| Surface | What it does |
+|---|---|
+| `code_callers` (MCP op) | "Who calls this function?" Reverse view of the call graph. Resolver-grade description: "BEFORE editing any function, run code_callers..." |
+| `code_callees` (MCP op) | "What does this function call?" Forward view; surfaces DB calls, HTTP calls, file I/O downstream of an entry point. |
+| `code_def` (MCP op) | Where a symbol is defined. Returns file, line, snippet directly. Agents stop reading 8 files to find one definition. |
+| `code_refs` (MCP op) | Every reference (call sites, comments, imports, type annotations). Use before any rename. |
+| Within-file symbol resolver | New cycle phase. Walks unresolved edges in 200-row batches, writes resolution to `code_edges_symbol.edge_metadata` (`{resolved_chunk_id: N}` or `{ambiguous: true, candidates: [...]}`). Idempotent + resumable via `edges_backfilled_at` watermark. |
+| Source-routing fix | `query` op now passes `ctx.sourceId` to `hybridSearch`. Two-pass retrieval honors `sourceId` at both lookup sites. Multi-source brains stop cross-contaminating structural retrieval. |
+| CLI source-scoping default flipped | `gbrain code-callers <symbol>` without `--source` resolves to your brain's default source. Pass `--all-sources` for the pre-v0.33 cross-source default. |
+
+### What this means for agents
+
+Plan-mode subagents in Claude Code, OpenClaw, and Cursor now have a clean structural retrieval path. The MCP tool descriptions are resolvers, they tell the agent's tool-selection prompt WHEN to reach for `code_callers` ("BEFORE editing any function") and `code_callees` ("when tracing how a request flows to side effects"). Agents stop guessing about callers by reading 8 files; one `code_callers` call returns the full list with file and line.
+
+For agents already wired to gbrain via stdio MCP, `code_def` replaces the read-8-files-to-find-1-definition pattern with one structured call. `code_refs` is the safe-rename path. `code_callees` is the debugging path.
+
+### What this DOES NOT ship (deferred to v0.34)
+
+Per the design doc's slip-handling clause, v0.33.0 ships the foundation; v0.34 ships the rest. Deferred:
+
+- Recursive `code_blast` / `code_flow` (depth-grouped traversal with confidence decay + truncation enum)
+- Leiden community detection: `code_clusters_list` + `code_cluster_get` with inline mermaid
+- `gbrain wiki` zero-LLM aggregator CLI
+- `code_traversal_cache` (REPEATABLE READ + xmin_max snapshot isolation)
+- Per-op graph-traversal eval metrics extending v0.25.0 eval-capture
+- `imports` and `references` edge types for JS/TS/TSX + Python
+- Receiver-type scope walkers (`obj.method()` to `Class.method`)
+
+### To take advantage of v0.33.0
 Pages on non-default source (production multi-source brain)  →  5,042
 Chunks left unembedded pre-fix                               →  ~22,000
 Chunks recovered on first re-run                             →  97 across 35 pages
@@ -357,6 +1214,56 @@ If you imported a Chinese / Japanese / Korean brain pre-v0.32.7 and saw silently
    ```bash
    gbrain apply-migrations --yes
    ```
+2. **Your agent reads `skills/migrations/v0.33.0.md` the next time you interact with it.** The four new MCP ops show up automatically in the tool catalog.
+3. **Verify the outcome:**
+   ```bash
+   gbrain --version    # 0.33.0
+   gbrain --tools-json | jq '.[] | select(.name | startswith("code_")) | .name'
+   # Should show: code_callers, code_callees, code_def, code_refs
+   gbrain doctor       # Should be ok; will pick up the new edges_backfilled_at watermark
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue at
+   https://github.com/garrytan/gbrain/issues with `gbrain doctor` output and
+   `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+### Itemized changes
+
+**MCP exposure (W3):**
+- New ops: `code_callers`, `code_callees`, `code_def`, `code_refs`. All `scope: 'read'`, source-scoped via `ctx.sourceId`. Source override params (`source_id`, `all_sources`) on every op.
+- New constants in `src/core/operations-descriptions.ts`: `CODE_CALLERS_DESCRIPTION`, `CODE_CALLEES_DESCRIPTION`, `CODE_DEF_DESCRIPTION`, `CODE_REFS_DESCRIPTION`. Each carries an inline example response per eng-review D10.
+- `SEARCH_DESCRIPTION` gains a cross-link clause pointing at the four new ops so agents stop falling through to text search for code-symbol questions.
+- 11 E2E tests in `test/e2e/code-intel-mcp-ops-pglite.test.ts`.
+
+**Foundation: source routing (W0a, Codex finding #2):**
+- `query` op handler (`src/core/operations.ts`) threads `ctx.sourceId` to `hybridSearch`. New `source_id` param with `'__all__'` escape hatch.
+- `src/core/search/two-pass.ts:81` (nearSymbol lookup) and `:131` (unresolved-edge resolution) now apply `opts.sourceId` via a `pages.source_id` join when set.
+- 4 E2E tests in `test/e2e/source-routing.test.ts` pin: source-a only, source-b only, no-sourceId crosses sources, walk_depth=1 stays in source-a.
+
+**Foundation: CLI source-scoping default flipped (W0b, Codex finding #7):**
+- New canonical helper `resolveDefaultSource(engine)` in `src/core/sources-ops.ts`. Returns the only registered source's id; throws `SourceResolutionError` with the list on multi-source brains.
+- `src/commands/code-callers.ts` and `src/commands/code-callees.ts` call `resolveDefaultSource()` when neither `--source` nor `--all-sources` is set. Pre-v0.33 the default was inverted.
+- 3 E2E tests in `test/e2e/cli-source-scoping-pglite.test.ts`.
+
+**Foundation: within-file symbol resolver (W0c):**
+- New module `src/core/chunkers/symbol-resolver.ts`. Exports `resolveSymbolEdgesIncremental`, `readEdgeResolution`, `EDGE_EXTRACTOR_VERSION_TS`.
+- Schema migration v51 (`edges_backfilled_at_v0_34`): adds `content_chunks.edges_backfilled_at TIMESTAMPTZ` + composite + partial indexes (`idx_code_edges_symbol_resolver`, `idx_content_chunks_symbol_lookup`, `idx_content_chunks_edges_backfill`).
+- New cycle phase `resolve_symbol_edges` between `extract` and `patterns`. Walks at most BATCH_SIZE * 10 = 2000 chunks per tick; resumable via the watermark.
+- 5 E2E tests in `test/e2e/symbol-resolver-pglite.test.ts`.
+
+**Pre-W0: code-retrieval eval harness:**
+- New module `src/eval/code-retrieval/` (harness + strategies + 30-question fixture).
+- New CLI subcommand `gbrain eval code-retrieval [--baseline | --with-code-intel | --compare]`. Captures pre-v0.34 retrieval quality on the gbrain self-corpus so the v0.34 ship gate measures real improvement, not a retroactively-tuned baseline.
+- 26 unit tests in `test/code-retrieval-harness.test.ts`.
+
+**Tests + verification:**
+- `bun run test` passes 5464/5465 (one pre-existing flaky LongMemEval perf gate under parallel-shard contention; runs clean in isolation at p50=29ms).
+- `bun run verify` clean.
+- 50 new test cases across 6 new test files. All v0.33-specific tests pass.
+
+### For contributors
+
+- `EDGE_EXTRACTOR_VERSION_TS` constant in `symbol-resolver.ts`: bump when the resolver or extractor shape changes; the next autopilot cycle re-walks all chunks.
+- `OperationContext.sourceId` is still optional; the v0.34 plan calls for making it `REQUIRED` at the type level (mirroring v0.26.9 `ctx.remote` REQUIRED pattern). Not done in v0.33; deferred to v0.34 to keep this release additive.
 2. **Run the markdown reindex sweep:**
    ```bash
    gbrain reindex --markdown

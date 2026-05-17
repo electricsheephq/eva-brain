@@ -90,4 +90,33 @@ describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => 
     await engine.initSchema();
     expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
   });
+
+  test('PostgresEngine.initSchema migrates v54 OAuth clients before federated columns existed', async () => {
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      TRUNCATE oauth_access_tokens, oauth_clients RESTART IDENTITY CASCADE;
+      DROP INDEX IF EXISTS idx_oauth_clients_source_id;
+      DROP INDEX IF EXISTS idx_oauth_clients_federated_read;
+      ALTER TABLE oauth_clients DROP CONSTRAINT IF EXISTS oauth_clients_source_id_fkey;
+      ALTER TABLE oauth_clients DROP COLUMN IF EXISTS source_id;
+      ALTER TABLE oauth_clients DROP COLUMN IF EXISTS federated_read;
+    `);
+    await engine.setConfig('version', '54');
+
+    await engine.initSchema();
+
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    const columns = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'oauth_clients'
+        AND column_name IN ('source_id', 'federated_read')
+      ORDER BY column_name
+    `;
+    expect(columns.map((r: { column_name: string }) => r.column_name)).toEqual([
+      'federated_read',
+      'source_id',
+    ]);
+  });
 });

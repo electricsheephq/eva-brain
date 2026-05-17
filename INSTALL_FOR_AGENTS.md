@@ -108,6 +108,63 @@ gbrain init --pglite --embedding-model voyage:voyage-4-large --embedding-dimensi
 gbrain doctor --json                  # verify all checks pass
 ```
 
+## Step 3.1: Confirm search mode with the user (DO NOT SKIP)
+
+`gbrain init` auto-applied a default search mode (`tokenmax` unless your subagent
+tier is Haiku-class or no OpenAI key is configured). The init output included the
+cost matrix below preceded by `[AGENT]` markers. You must NOT silently accept the
+default. Stop and ask the operator.
+
+**Present this matrix verbatim:**
+
+```
+Per-query cost @ 10K queries/mo (typical single-user volume):
+
+                  Haiku 4.5     Sonnet 4.6    Opus 4.7
+                  ($1/M)        ($3/M)        ($5/M)
+  conservative    $40/mo        $120/mo       $200/mo
+  balanced        $100/mo       $300/mo       $500/mo
+  tokenmax        $200/mo       $600/mo       $1,000/mo
+
+(scales linearly: ×10 for 100K/mo, ÷10 for 1K. 25x corner-to-corner spread.
+ Natural diagonal pairings — cheap/cheap → frontier/frontier — span ~4x.)
+```
+
+**Ask the operator (paraphrase if needed):**
+
+> Your gbrain just installed with search mode `<auto-applied default>`. This is
+> a one-time setup decision that controls retrieval payload size. Which mode
+> do you want?
+>
+>   1) conservative — tight 4K budget, no LLM expansion, 10 chunks max.
+>      Best for Haiku subagents, cost-sensitive setups, high-volume loops.
+>
+>   2) balanced — 12K budget, no expansion, 25 chunks. Sonnet-tier sweet spot.
+>
+>   3) tokenmax (recommended default — preserves v0.31.x retrieval shape) —
+>      no budget, LLM expansion ON, 50 chunks. Best for Opus/frontier models.
+>
+> Cost depends on BOTH the mode AND the downstream model you run. See the
+> matrix above for the 9-cell breakdown.
+
+If the operator picks a non-default mode, run:
+```bash
+gbrain config set search.mode <mode>
+```
+
+If they pick tokenmax AND want to preserve the literal v0.31.x default
+(limit=20 instead of tokenmax's 50), also run:
+```bash
+gbrain config set search.searchLimit 20
+```
+
+Verify the choice with `gbrain search modes` before continuing.
+
+**Why this matters:** the cost spread between corners of the matrix is 25x.
+An agent that silently accepts the default and starts running queries against
+a user who didn't expect tokenmax-class context loads can rack up surprise
+spend. Confirm before continuing.
+
 ## Step 3.5: Install The OpenClaw Plugin
 
 If OpenClaw is installed on this machine, install the native plugin from the
@@ -117,6 +174,10 @@ same Eva Brain checkout:
 cd ~/eva-brain
 openclaw plugins install --dangerously-force-unsafe-install ./plugins/openclaw-gbrain
 openclaw plugins enable gbrain
+# Restart with exactly one host-appropriate command:
+# Customer/systemd hosts:
+sudo systemctl restart openclaw-gateway
+# Local developer hosts:
 openclaw gateway restart
 openclaw plugins inspect gbrain --runtime --json
 openclaw gbrain status
@@ -276,7 +337,7 @@ interactive shell-approval prompts.
   only when `~/brain` has a configured git remote and upstream tracking branch.
   If `git -C ~/brain remote -v` is empty, use the local-only import command above.
 - **Support KB refresh** (after `openclaw-support-kb` updates): run
-  `node scripts/update-client.mjs && gbrain embed --stale --source openclaw-support-kb`
+  `node scripts/update-client.mjs && gbrain sync --repo "$OPENCLAW_SUPPORT_KB_DIR" --source openclaw-support-kb --no-embed && gbrain embed --stale --source openclaw-support-kb`
   from `$OPENCLAW_SUPPORT_KB_DIR`, so KB changes do not trigger a full-brain
   stale embed sweep.
 - **Auto-update** (daily): `gbrain check-update --json` (tell user, never auto-install)
@@ -310,6 +371,15 @@ gbrain post-upgrade                   # show migration notes for the version ran
 Then read `~/eva-brain/skills/migrations/v<NEW_VERSION>.md` (and any intermediate
 versions you skipped) and run any backfill or verification steps it lists. Skipping
 this is how features ship in the binary but stay dormant in the user's brain.
+
+**v0.32.3 search modes (one-time upgrade prompt):** if the user's brain was
+created before v0.32.3, `gbrain post-upgrade` prints a banner including the
+9-cell cost matrix (mode × downstream model) preceded by `[AGENT]` markers.
+**Do NOT silently move past the banner.** Present the matrix to the operator
+verbatim, ask which mode they want (recommended default: `tokenmax` to preserve
+v0.31.x retrieval shape), then run `gbrain config set search.mode <mode>`. See
+Step 3.1 above for the full ask-the-user protocol — the upgrade path uses the
+same matrix and same default.
 
 For v0.12.0+ specifically: if your brain was created before v0.12.0, run
 `gbrain extract links --source db && gbrain extract timeline --source db` to

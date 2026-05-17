@@ -10,10 +10,29 @@
 
 import { describe, test, expect } from 'bun:test';
 import { operations } from '../src/core/operations.ts';
-import { buildToolDefs } from '../src/mcp/tool-defs.ts';
+import { buildToolDefs, paramDefToSchema } from '../src/mcp/tool-defs.ts';
+import type { ParamDef } from '../src/core/operations.ts';
 
 // Pre-extraction inline shape — lifted verbatim from the original
 // src/mcp/server.ts block so any future drift fails this test loudly.
+type ParamDefLike = {
+  type: 'string' | 'number' | 'boolean' | 'object' | 'array';
+  description?: string;
+  enum?: string[];
+  default?: unknown;
+  items?: ParamDefLike;
+};
+
+function referenceParamDefToSchema(p: ParamDefLike): Record<string, unknown> {
+  return {
+    type: p.type === 'array' ? 'array' : p.type,
+    ...(p.description ? { description: p.description } : {}),
+    ...(p.enum ? { enum: p.enum } : {}),
+    ...(p.default !== undefined ? { default: p.default } : {}),
+    ...(p.items ? { items: referenceParamDefToSchema(p.items) } : {}),
+  };
+}
+
 function legacyInlineMap(ops: typeof operations) {
   return ops.map(op => ({
     name: op.name,
@@ -21,12 +40,7 @@ function legacyInlineMap(ops: typeof operations) {
     inputSchema: {
       type: 'object' as const,
       properties: Object.fromEntries(
-        Object.entries(op.params).map(([k, v]) => [k, {
-          type: v.type === 'array' ? 'array' : v.type,
-          ...(v.description ? { description: v.description } : {}),
-          ...(v.enum ? { enum: v.enum } : {}),
-          ...(v.items ? { items: { type: v.items.type } } : {}),
-        }]),
+        Object.entries(op.params).map(([k, v]) => [k, referenceParamDefToSchema(v)]),
       ),
       required: Object.entries(op.params)
         .filter(([, v]) => v.required)
@@ -63,5 +77,68 @@ describe('buildToolDefs', () => {
       expect(typeof def.inputSchema.properties).toBe('object');
       expect(Array.isArray(def.inputSchema.required)).toBe(true);
     }
+  });
+});
+
+interface SchemaNode {
+  type?: unknown;
+  properties?: Record<string, SchemaNode>;
+  items?: SchemaNode;
+  [k: string]: unknown;
+}
+
+function findArrayWithoutItems(node: SchemaNode, path: string[]): string[] {
+  const violations: string[] = [];
+  if (node && typeof node === 'object') {
+    if (node.type === 'array') {
+      if (!node.items || typeof node.items !== 'object') {
+        violations.push(`${path.join('.') || '<root>'} (array missing items)`);
+      } else if (!('type' in node.items)) {
+        violations.push(`${path.join('.') || '<root>'}.items (items missing type)`);
+      } else {
+        violations.push(...findArrayWithoutItems(node.items, [...path, 'items']));
+      }
+    }
+    if (node.properties && typeof node.properties === 'object') {
+      for (const [k, child] of Object.entries(node.properties)) {
+        violations.push(...findArrayWithoutItems(child as SchemaNode, [...path, k]));
+      }
+    }
+    if (node.items && typeof node.items === 'object' && node.type !== 'array') {
+      violations.push(...findArrayWithoutItems(node.items, [...path, 'items']));
+    }
+  }
+  return violations;
+}
+
+describe('paramDefToSchema structural guard', () => {
+  test('every operation inputSchema array has items.type set', () => {
+    const allViolations: string[] = [];
+    for (const def of buildToolDefs(operations)) {
+      allViolations.push(...findArrayWithoutItems(def.inputSchema as SchemaNode, [def.name]));
+    }
+    expect(allViolations).toEqual([]);
+  });
+
+  test('extract_facts.entity_hints declares string items', () => {
+    const def = buildToolDefs(operations).find(d => d.name === 'extract_facts');
+    expect(def).toBeDefined();
+    const eh = (def!.inputSchema.properties as Record<string, SchemaNode>).entity_hints;
+    expect(eh.type).toBe('array');
+    expect((eh.items as SchemaNode).type).toBe('string');
+  });
+
+  test('paramDefToSchema recursively preserves nested items', () => {
+    const nested: ParamDef = {
+      type: 'array',
+      items: {
+        type: 'array',
+        items: { type: 'string' },
+      },
+    };
+    const schema = paramDefToSchema(nested) as SchemaNode;
+    expect(schema.type).toBe('array');
+    expect((schema.items as SchemaNode).type).toBe('array');
+    expect(((schema.items as SchemaNode).items as SchemaNode).type).toBe('string');
   });
 });

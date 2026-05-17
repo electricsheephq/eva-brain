@@ -129,6 +129,37 @@ describe('public local updater and Codex plugin packaging', () => {
     expect(existsSync(join(home, '.agents/plugins/marketplace.json'))).toBe(false);
   });
 
+  test('local updater dry-run works for a missing first-install directory', () => {
+    const home = tempHome();
+    const installDir = join(home, 'eva-brain');
+    const result = Bun.spawnSync({
+      cmd: [
+        'bash',
+        'scripts/update-local-install.sh',
+        '--dry-run',
+        '--dir',
+        installDir,
+        '--without-openclaw',
+        '--without-codex-plugin',
+        '--skip-provider-test',
+        '--skip-doctor',
+      ],
+      cwd: root,
+      env: { ...process.env, HOME: home, GBRAIN_HOME: home },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+
+    expect(result.exitCode).toBe(0);
+    const stdout = new TextDecoder().decode(result.stdout);
+    const stderr = new TextDecoder().decode(result.stderr);
+    expect(stdout).toContain(`git clone --branch master https://github.com/electricsheephq/eva-brain.git ${installDir}`);
+    expect(stdout).toContain('bun install');
+    expect(stdout).toContain('gbrain init --pglite --embedding-model voyage:voyage-4-large --embedding-dimensions 2048');
+    expect(stderr).toContain('Dry-run: install dir does not exist yet');
+    expect(existsSync(installDir)).toBe(false);
+  });
+
   test('Codex installer rejects missing option values instead of falling back to cwd', () => {
     for (const flag of ['--home', '--repo-dir']) {
       const result = Bun.spawnSync({

@@ -115,6 +115,11 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // created_at DESC)`. Old brains have ingest_log without source_id; bootstrap
   // adds the column before SCHEMA_SQL replay creates the index.
   { kind: 'column', table: 'ingest_log', column: 'source_id' },
+  // v0.34.1 (v60-v65) — forward-referenced by OAuth source/federation indexes.
+  // Old v54 brains can already have oauth_clients without these columns, so
+  // CREATE TABLE IF NOT EXISTS skips and the following CREATE INDEX would wedge.
+  { kind: 'column', table: 'oauth_clients', column: 'source_id' },
+  { kind: 'column', table: 'oauth_clients', column: 'federated_read' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -173,6 +178,12 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
 
       DROP INDEX IF EXISTS idx_subagent_messages_provider;
       ALTER TABLE subagent_messages DROP COLUMN IF EXISTS provider_id;
+
+      DROP INDEX IF EXISTS idx_oauth_clients_source_id;
+      DROP INDEX IF EXISTS idx_oauth_clients_federated_read;
+      ALTER TABLE oauth_clients DROP CONSTRAINT IF EXISTS oauth_clients_source_id_fkey;
+      ALTER TABLE oauth_clients DROP COLUMN IF EXISTS source_id;
+      ALTER TABLE oauth_clients DROP COLUMN IF EXISTS federated_read;
 
       DROP INDEX IF EXISTS pages_coalesce_date_idx;
       ALTER TABLE pages DROP COLUMN IF EXISTS effective_date;
@@ -242,6 +253,12 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       ALTER TABLE pages DROP COLUMN IF EXISTS salience_touched_at;
       DROP INDEX IF EXISTS idx_subagent_messages_provider;
       ALTER TABLE subagent_messages DROP COLUMN IF EXISTS provider_id;
+
+      DROP INDEX IF EXISTS idx_oauth_clients_source_id;
+      DROP INDEX IF EXISTS idx_oauth_clients_federated_read;
+      ALTER TABLE oauth_clients DROP CONSTRAINT IF EXISTS oauth_clients_source_id_fkey;
+      ALTER TABLE oauth_clients DROP COLUMN IF EXISTS source_id;
+      ALTER TABLE oauth_clients DROP COLUMN IF EXISTS federated_read;
 
       DROP INDEX IF EXISTS idx_chunks_embedding_image;
       ALTER TABLE content_chunks DROP COLUMN IF EXISTS embedding_image;
@@ -507,6 +524,39 @@ test('parseBaseTableColumns + parseIndexColumnReferences extract structural refe
   expect(refs).toContainEqual({ table: 'pages', column: 'effective_date' });
   expect(refs).toContainEqual({ table: 'pages', column: 'updated_at' });
 });
+
+test('initSchema migrates a v54 brain before oauth_clients source/federation columns existed', async () => {
+  const engine = new PGLiteEngine();
+  await engine.connect({});
+  try {
+    await engine.initSchema();
+    const db = (engine as any).db;
+
+    await db.exec(`
+      DROP INDEX IF EXISTS idx_oauth_clients_source_id;
+      DROP INDEX IF EXISTS idx_oauth_clients_federated_read;
+      ALTER TABLE oauth_clients DROP CONSTRAINT IF EXISTS oauth_clients_source_id_fkey;
+      ALTER TABLE oauth_clients DROP COLUMN IF EXISTS source_id;
+      ALTER TABLE oauth_clients DROP COLUMN IF EXISTS federated_read;
+      INSERT INTO config (key, value) VALUES ('version', '54')
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+    `);
+
+    await engine.initSchema();
+
+    for (const column of ['source_id', 'federated_read']) {
+      const { rows } = await db.query(
+        `SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'oauth_clients' AND column_name = $1`,
+        [column],
+      );
+      expect(rows.length).toBeGreaterThan(0);
+    }
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+  } finally {
+    await engine.disconnect();
+  }
+}, 30000);
 
 test('parseIndexColumnReferences catches v0.27 composite second-column case', () => {
   // The exact codex regression: `idx_subagent_messages_provider ON

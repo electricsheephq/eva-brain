@@ -288,7 +288,13 @@ export class PGLiteEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema='public' AND table_name='ingest_log') AS ingest_log_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='ingest_log' AND column_name='source_id') AS ingest_log_source_id_exists
+                WHERE table_schema='public' AND table_name='ingest_log' AND column_name='source_id') AS ingest_log_source_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='oauth_clients') AS oauth_clients_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='source_id') AS oauth_clients_source_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='federated_read') AS oauth_clients_federated_read_exists
     `);
     const probe = rows[0] as {
       pages_exists: boolean;
@@ -309,6 +315,9 @@ export class PGLiteEngine implements BrainEngine {
       subagent_provider_id_exists: boolean;
       ingest_log_exists: boolean;
       ingest_log_source_id_exists: boolean;
+      oauth_clients_exists: boolean;
+      oauth_clients_source_id_exists: boolean;
+      oauth_clients_federated_read_exists: boolean;
     };
 
     const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
@@ -332,12 +341,19 @@ export class PGLiteEngine implements BrainEngine {
     // references source_id. Old brains have ingest_log without source_id;
     // bootstrap adds the column before SCHEMA_SQL replay creates the index.
     const needsIngestLogSourceId = probe.ingest_log_exists && !probe.ingest_log_source_id_exists;
+    // v0.34.1 (v60-v65): schema replay creates OAuth source/federation indexes
+    // before numbered migrations run. Old brains can already have oauth_clients
+    // without these columns, so add only the forward-referenced columns here and
+    // let v60-v65 keep final FK/backfill/validation ownership.
+    const needsOAuthClientsBootstrap = probe.oauth_clients_exists
+      && (!probe.oauth_clients_source_id_exists || !probe.oauth_clients_federated_read_exists);
 
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsChunksEmbeddingImage
         && !needsMcpLogBootstrap && !needsSubagentProviderId
-        && !needsPagesRecency && !needsIngestLogSourceId) return;
+        && !needsPagesRecency && !needsIngestLogSourceId
+        && !needsOAuthClientsBootstrap) return;
 
     console.log('  Pre-v0.21 brain detected, applying forward-reference bootstrap');
 
@@ -463,6 +479,13 @@ export class PGLiteEngine implements BrainEngine {
       // DEFAULT 'default' so the index can build cleanly.
       await this.db.exec(`
         ALTER TABLE ingest_log ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT 'default';
+      `);
+    }
+
+    if (needsOAuthClientsBootstrap) {
+      await this.db.exec(`
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS source_id TEXT;
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS federated_read TEXT[] NOT NULL DEFAULT '{}';
       `);
     }
   }
@@ -630,8 +653,12 @@ export class PGLiteEngine implements BrainEngine {
       params.push(escaped);
       where.push(`p.slug LIKE $${params.length} ESCAPE '\\'`);
     }
-    // v0.31.12: scope to a single source when requested.
-    if (filters?.sourceId) {
+    // v0.31.12 + v0.34.1 (#876, D9): scope to a single source OR an array
+    // of sources. Array form wins (federated subsumes scalar).
+    if (filters?.sourceIds && filters.sourceIds.length > 0) {
+      params.push(filters.sourceIds);
+      where.push(`p.source_id = ANY($${params.length}::text[])`);
+    } else if (filters?.sourceId) {
       params.push(filters.sourceId);
       where.push(`p.source_id = $${params.length}`);
     }
@@ -761,6 +788,11 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.symbolKind);
       extraFilter += ` AND cc.symbol_type = $${params.length}`;
     }
+    // v0.33: multi-type filter for whoknows.
+    if (opts?.types && opts.types.length > 0) {
+      params.push(opts.types);
+      extraFilter += ` AND p.type = ANY($${params.length}::text[])`;
+    }
     // v0.29.1 — since/until date filter (Postgres parity, codex pass-1 #10).
     // Reads against COALESCE(effective_date, updated_at) so date filtering
     // matches user intent (a meeting was on its event_date, not when it
@@ -772,6 +804,14 @@ export class PGLiteEngine implements BrainEngine {
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
       extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+    }
+    // v0.34.1 (#861 — P0 leak seal): source-isolation. Array wins over scalar.
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      extraFilter += ` AND p.source_id = $${params.length}`;
     }
 
     const { rows } = await this.db.query(
@@ -793,7 +833,7 @@ export class PGLiteEngine implements BrainEngine {
            AND cc.modality = 'text'
          ORDER BY score DESC
          LIMIT $2
-      ),
+       ),
        best_per_page AS (
          SELECT DISTINCT ON (source_id, slug) *
          FROM ranked
@@ -871,6 +911,14 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.beforeDate);
       extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // v0.34.1 (#861 — P0 leak seal): source-isolation on the CJK fallback path.
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      extraFilter += ` AND p.source_id = $${params.length}`;
+    }
 
     // Bigram-frequency count: count occurrences of $qRaw in chunk_text via
     // (length(chunk) - length(replace(chunk, q, ''))) / length(q). Acts as
@@ -901,9 +949,9 @@ export class PGLiteEngine implements BrainEngine {
            LIMIT $3
          ),
          best_per_page AS (
-           SELECT DISTINCT ON (slug) *
+           SELECT DISTINCT ON (source_id, slug) *
            FROM ranked
-           ORDER BY slug, score DESC
+           ORDER BY source_id, slug, score DESC
          )
          SELECT * FROM best_per_page
          ORDER BY score DESC
@@ -991,6 +1039,16 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.beforeDate);
       extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
     }
+    // v0.34.1 (#861 — P0 leak seal): source-isolation for the chunk-grain
+    // anchor primitive. Layer 7 two-pass walks from these anchors so a
+    // foreign-source anchor would let the walk leak into foreign neighbors.
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      extraFilter += ` AND p.source_id = $${params.length}`;
+    }
 
     // visibilityClause already declared above (v0.32.7: hoisted so CJK branch can reuse).
 
@@ -1050,6 +1108,13 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.symbolKind);
       extraFilter += ` AND cc.symbol_type = $${params.length}`;
     }
+    // v0.33: multi-type filter for whoknows. Applied inside HNSW candidate
+    // CTE so the candidate pool consists only of typed pages — limit budget
+    // goes to person/company pages instead of being eaten by other types.
+    if (opts?.types && opts.types.length > 0) {
+      params.push(opts.types);
+      extraFilter += ` AND p.type = ANY($${params.length}::text[])`;
+    }
     // v0.29.1 since/until parity (codex pass-1 #10). Filter applied INSIDE
     // the inner CTE so HNSW's candidate pool already excludes out-of-range
     // pages — preserves pagination contract.
@@ -1060,6 +1125,16 @@ export class PGLiteEngine implements BrainEngine {
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
       extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+    }
+    // v0.34.1 (#861, F2 — P0 leak seal): source-isolation in the INNER CTE
+    // so HNSW candidate pool narrows before re-rank. Mirrors postgres-engine
+    // placement decision (codex flagged this during plan review).
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      extraFilter += ` AND p.source_id = ANY($${params.length}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      extraFilter += ` AND p.source_id = $${params.length}`;
     }
 
     // v0.26.5: visibility filter applied in the inner CTE so HNSW sees the
@@ -1248,38 +1323,68 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async countStaleChunks(opts?: { sourceId?: string }): Promise<number> {
-    const params: unknown[] = [];
-    const sourceJoin = opts?.sourceId ? 'JOIN pages p ON p.id = cc.page_id' : '';
-    const sourceWhere = opts?.sourceId ? 'AND p.source_id = $1' : '';
-    if (opts?.sourceId) params.push(opts.sourceId);
+    // D7: source-scoped count for `gbrain embed --stale --source X`.
+    if (opts?.sourceId === undefined) {
+      const { rows } = await this.db.query(
+        `SELECT count(*)::int AS count
+           FROM content_chunks
+          WHERE embedding IS NULL
+            AND COALESCE(modality, 'text') <> 'image'`,
+      );
+      const count = (rows[0] as { count: number } | undefined)?.count ?? 0;
+      return Number(count);
+    }
     const { rows } = await this.db.query(
       `SELECT count(*)::int AS count
-         FROM content_chunks cc
-         ${sourceJoin}
+        FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
         WHERE cc.embedding IS NULL
           AND COALESCE(cc.modality, 'text') <> 'image'
-          ${sourceWhere}`,
-      params,
+          AND p.source_id = $1`,
+      [opts.sourceId],
     );
     const count = (rows[0] as { count: number } | undefined)?.count ?? 0;
     return Number(count);
   }
 
-  async listStaleChunks(opts?: { sourceId?: string }): Promise<StaleChunkRow[]> {
-    const params: unknown[] = [];
-    const sourceWhere = opts?.sourceId ? 'AND p.source_id = $1' : '';
-    if (opts?.sourceId) params.push(opts.sourceId);
+  async listStaleChunks(opts?: {
+    batchSize?: number;
+    afterPageId?: number;
+    afterChunkIndex?: number;
+    sourceId?: string;
+  }): Promise<StaleChunkRow[]> {
+    const limit = opts?.batchSize ?? 2000;
+    const afterPid = opts?.afterPageId ?? 0;
+    const afterIdx = opts?.afterChunkIndex ?? -1;
+    // D7: optional source-scoped cursor scan. PGLite mirrors postgres-engine
+    // so the engine-parity E2E catches drift.
+    if (opts?.sourceId === undefined) {
+      const { rows } = await this.db.query(
+        `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+                cc.model, cc.token_count, p.source_id, cc.page_id
+          FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+          WHERE cc.embedding IS NULL
+            AND COALESCE(cc.modality, 'text') <> 'image'
+            AND (cc.page_id, cc.chunk_index) > ($1, $2)
+          ORDER BY cc.page_id, cc.chunk_index
+          LIMIT $3`,
+        [afterPid, afterIdx, limit],
+      );
+      return rows as unknown as StaleChunkRow[];
+    }
     const { rows } = await this.db.query(
-      `SELECT p.slug, p.source_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-              cc.model, cc.token_count
+      `SELECT p.slug, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+              cc.model, cc.token_count, p.source_id, cc.page_id
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
         WHERE cc.embedding IS NULL
           AND COALESCE(cc.modality, 'text') <> 'image'
-          ${sourceWhere}
-        ORDER BY p.id, cc.chunk_index
-        LIMIT 100000`,
-      params,
+          AND p.source_id = $1
+          AND (cc.page_id, cc.chunk_index) > ($2, $3)
+        ORDER BY cc.page_id, cc.chunk_index
+        LIMIT $4`,
+      [opts.sourceId, afterPid, afterIdx, limit],
     );
     return rows as unknown as StaleChunkRow[];
   }
@@ -1508,13 +1613,38 @@ export class PGLiteEngine implements BrainEngine {
     return { slug: row.slug, similarity: row.sim };
   }
 
-  async traverseGraph(slug: string, depth: number = 5): Promise<GraphNode[]> {
+  async traverseGraph(
+    slug: string,
+    depth: number = 5,
+    opts?: { sourceId?: string; sourceIds?: string[] },
+  ): Promise<GraphNode[]> {
+    // v0.34.1 (#861 — P0 leak seal): source-scope filters at seed, step, and
+    // aggregation subquery. Mirrors postgres-engine.traverseGraph placement.
+    const params: unknown[] = [slug, depth];
+    const useSourceIds = opts?.sourceIds && opts.sourceIds.length > 0;
+    let seedScope = '';
+    let stepScope = '';
+    let aggScope = '';
+    if (useSourceIds) {
+      params.push(opts!.sourceIds);
+      const idx = params.length;
+      seedScope = `AND p.source_id = ANY($${idx}::text[])`;
+      stepScope = `AND p2.source_id = ANY($${idx}::text[])`;
+      aggScope = `AND p3.source_id = ANY($${idx}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      const idx = params.length;
+      seedScope = `AND p.source_id = $${idx}`;
+      stepScope = `AND p2.source_id = $${idx}`;
+      aggScope = `AND p3.source_id = $${idx}`;
+    }
+
     // Cycle prevention: visited array tracks page IDs already in the path.
     // Prevents exponential blowup on cyclic subgraphs (e.g., A->B->A).
     const { rows } = await this.db.query(
       `WITH RECURSIVE graph AS (
         SELECT p.id, p.slug, p.title, p.type, 0 as depth, ARRAY[p.id] as visited
-        FROM pages p WHERE p.slug = $1
+        FROM pages p WHERE p.slug = $1 ${seedScope}
 
         UNION ALL
 
@@ -1524,6 +1654,7 @@ export class PGLiteEngine implements BrainEngine {
         JOIN pages p2 ON p2.id = l.to_page_id
         WHERE g.depth < $2
           AND NOT (p2.id = ANY(g.visited))
+          ${stepScope}
       )
       SELECT DISTINCT g.slug, g.title, g.type, g.depth,
         coalesce(
@@ -1535,12 +1666,12 @@ export class PGLiteEngine implements BrainEngine {
           (SELECT jsonb_agg(DISTINCT jsonb_build_object('to_slug', p3.slug, 'link_type', l2.link_type))
            FROM links l2
            JOIN pages p3 ON p3.id = l2.to_page_id
-           WHERE l2.from_page_id = g.id),
+           WHERE l2.from_page_id = g.id ${aggScope}),
           '[]'::jsonb
         ) as links
       FROM graph g
       ORDER BY g.depth, g.slug`,
-      [slug, depth]
+      params
     );
 
     return (rows as Record<string, unknown>[]).map(r => ({
@@ -1554,7 +1685,7 @@ export class PGLiteEngine implements BrainEngine {
 
   async traversePaths(
     slug: string,
-    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
+    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
   ): Promise<GraphPath[]> {
     const depth = opts?.depth ?? 5;
     const direction = opts?.direction ?? 'out';
@@ -1563,12 +1694,36 @@ export class PGLiteEngine implements BrainEngine {
     const params: unknown[] = [slug, depth];
     if (linkType !== null) params.push(linkType);
 
+    // v0.34.1 (#861 — P0 leak seal): source-scope filters at seed + step +
+    // final SELECT joins (for the 'both' branch's pf + pt). Mirrors
+    // postgres-engine.traversePaths placement.
+    const useSourceIds = opts?.sourceIds && opts.sourceIds.length > 0;
+    let seedScope = '';
+    let stepScope = '';
+    let pfScope = '';
+    let ptScope = '';
+    if (useSourceIds) {
+      params.push(opts!.sourceIds);
+      const idx = params.length;
+      seedScope = `AND p.source_id = ANY($${idx}::text[])`;
+      stepScope = `AND p2.source_id = ANY($${idx}::text[])`;
+      pfScope = `AND pf.source_id = ANY($${idx}::text[])`;
+      ptScope = `AND pt.source_id = ANY($${idx}::text[])`;
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      const idx = params.length;
+      seedScope = `AND p.source_id = $${idx}`;
+      stepScope = `AND p2.source_id = $${idx}`;
+      pfScope = `AND pf.source_id = $${idx}`;
+      ptScope = `AND pt.source_id = $${idx}`;
+    }
+
     let sql: string;
     if (direction === 'out') {
       sql = `
         WITH RECURSIVE walk AS (
           SELECT p.id, p.slug, 0::int AS depth, ARRAY[p.id] AS visited
-          FROM pages p WHERE p.slug = $1
+          FROM pages p WHERE p.slug = $1 ${seedScope}
           UNION ALL
           SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -1577,6 +1732,7 @@ export class PGLiteEngine implements BrainEngine {
           WHERE w.depth < $2
             AND NOT (p2.id = ANY(w.visited))
             ${linkTypeWhere}
+            ${stepScope}
         )
         SELECT w.slug AS from_slug, p2.slug AS to_slug,
                l.link_type, l.context, w.depth + 1 AS depth
@@ -1585,13 +1741,14 @@ export class PGLiteEngine implements BrainEngine {
         JOIN pages p2 ON p2.id = l.to_page_id
         WHERE w.depth < $2
           ${linkTypeWhere}
+          ${stepScope}
         ORDER BY depth, from_slug, to_slug
       `;
     } else if (direction === 'in') {
       sql = `
         WITH RECURSIVE walk AS (
           SELECT p.id, p.slug, 0::int AS depth, ARRAY[p.id] AS visited
-          FROM pages p WHERE p.slug = $1
+          FROM pages p WHERE p.slug = $1 ${seedScope}
           UNION ALL
           SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -1600,6 +1757,7 @@ export class PGLiteEngine implements BrainEngine {
           WHERE w.depth < $2
             AND NOT (p2.id = ANY(w.visited))
             ${linkTypeWhere}
+            ${stepScope}
         )
         SELECT p2.slug AS from_slug, w.slug AS to_slug,
                l.link_type, l.context, w.depth + 1 AS depth
@@ -1608,6 +1766,7 @@ export class PGLiteEngine implements BrainEngine {
         JOIN pages p2 ON p2.id = l.from_page_id
         WHERE w.depth < $2
           ${linkTypeWhere}
+          ${stepScope}
         ORDER BY depth, from_slug, to_slug
       `;
     } else {
@@ -1616,7 +1775,7 @@ export class PGLiteEngine implements BrainEngine {
       sql = `
         WITH RECURSIVE walk AS (
           SELECT p.id, 0::int AS depth, ARRAY[p.id] AS visited
-          FROM pages p WHERE p.slug = $1
+          FROM pages p WHERE p.slug = $1 ${seedScope}
           UNION ALL
           SELECT p2.id, w.depth + 1, w.visited || p2.id
           FROM walk w
@@ -1625,6 +1784,7 @@ export class PGLiteEngine implements BrainEngine {
           WHERE w.depth < $2
             AND NOT (p2.id = ANY(w.visited))
             ${linkTypeWhere}
+            ${stepScope}
         )
         SELECT pf.slug AS from_slug, pt.slug AS to_slug,
                l.link_type, l.context, w.depth + 1 AS depth
@@ -1634,6 +1794,8 @@ export class PGLiteEngine implements BrainEngine {
         JOIN pages pt ON pt.id = l.to_page_id
         WHERE w.depth < $2
           ${linkTypeWhere}
+          ${pfScope}
+          ${ptScope}
         ORDER BY depth, from_slug, to_slug
       `;
     }
@@ -1872,36 +2034,20 @@ export class PGLiteEngine implements BrainEngine {
     data: object,
     opts?: { sourceId?: string },
   ): Promise<void> {
-    // v0.31.8 (D21): source-scoped INSERT-SELECT. Omitting sourceId targets
-    // the default source only; it must never fan out across same-slug pages.
-    // With opts.sourceId, the lookup is source-scoped to the requested row.
-    if (opts?.sourceId) {
-      const result = await this.db.query(
-        `INSERT INTO raw_data (page_id, source, data)
-         SELECT id, $2, $3::jsonb
-         FROM pages WHERE slug = $1 AND source_id = $4
-         ON CONFLICT (page_id, source) DO UPDATE SET
-           data = EXCLUDED.data,
-           fetched_at = now()
-         RETURNING id`,
-        [slug, source, JSON.stringify(data), opts.sourceId]
-      );
-      if (result.rows.length === 0) {
-        throw new Error(`putRawData failed: page "${slug}" (source=${opts.sourceId}) not found`);
-      }
-      return;
-    }
-    const result = await this.db.query(
+    const sourceId = opts?.sourceId ?? 'default';
+    const { rows } = await this.db.query(
       `INSERT INTO raw_data (page_id, source, data)
        SELECT id, $2, $3::jsonb
-       FROM pages WHERE slug = $1 AND source_id = 'default'
+       FROM pages WHERE slug = $1 AND source_id = $4
        ON CONFLICT (page_id, source) DO UPDATE SET
          data = EXCLUDED.data,
          fetched_at = now()
        RETURNING id`,
-      [slug, source, JSON.stringify(data)]
+      [slug, source, JSON.stringify(data), sourceId]
     );
-    if (result.rows.length === 0) throw new Error(`putRawData failed: page "${slug}" not found`);
+    if (rows.length === 0) {
+      throw new Error(`putRawData failed: page "${slug}" not found (source=${sourceId})`);
+    }
   }
 
   async getRawData(
@@ -2142,10 +2288,10 @@ export class PGLiteEngine implements BrainEngine {
     return { inserted: ids.length, ids };
   }
 
-  async deleteFactsForPage(slug: string, sourceId: string): Promise<{ deleted: number }> {
+  async deleteFactsForPage(slug: string, source_id: string): Promise<{ deleted: number }> {
     const result = await this.db.query(
       `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug = $2`,
-      [sourceId, slug],
+      [source_id, slug],
     );
     return { deleted: result.affectedRows ?? 0 };
   }
@@ -2587,12 +2733,12 @@ export class PGLiteEngine implements BrainEngine {
            OR ($6::boolean = false AND t.resolved_at IS NULL)
          )
          AND ($7::text[] IS NULL OR t.holder = ANY($7::text[]))
-         AND ($11::text IS NULL OR p.source_id = $11::text)
+         AND ($8::text IS NULL OR p.source_id = $8::text)
        ORDER BY
-         CASE WHEN $8 = 'weight'      THEN t.weight     END DESC NULLS LAST,
-         CASE WHEN $8 = 'since_date'  THEN t.since_date END DESC NULLS LAST,
-         CASE WHEN $8 = 'created_at'  THEN t.created_at END DESC NULLS LAST
-       LIMIT $9 OFFSET $10`,
+         CASE WHEN $9 = 'weight'      THEN t.weight     END DESC NULLS LAST,
+         CASE WHEN $9 = 'since_date'  THEN t.since_date END DESC NULLS LAST,
+         CASE WHEN $9 = 'created_at'  THEN t.created_at END DESC NULLS LAST
+       LIMIT $10 OFFSET $11`,
       [
         opts.page_id ?? null,
         opts.page_slug ?? null,
@@ -2601,10 +2747,10 @@ export class PGLiteEngine implements BrainEngine {
         active,
         opts.resolved === undefined ? null : opts.resolved,
         opts.takesHoldersAllowList ?? null,
+        opts.sourceId ?? null,
         sortBy,
         limit,
         offset,
-        opts.sourceId ?? null,
       ]
     );
     return rows.map((r) => takeRowToTake(r as Record<string, unknown>));
@@ -2612,7 +2758,7 @@ export class PGLiteEngine implements BrainEngine {
 
   async searchTakes(
     query: string,
-    opts: { limit?: number; sourceId?: string; takesHoldersAllowList?: string[] } = {},
+    opts: SearchOpts & { takesHoldersAllowList?: string[] } = {},
   ): Promise<TakeHit[]> {
     const limit = clampSearchLimit(opts.limit, 30, 100);
     const { rows } = await this.db.query(
@@ -2624,17 +2770,17 @@ export class PGLiteEngine implements BrainEngine {
        WHERE t.active
          AND t.claim % $1
          AND ($2::text[] IS NULL OR t.holder = ANY($2::text[]))
-         AND ($4::text IS NULL OR p.source_id = $4::text)
+         AND ($3::text IS NULL OR p.source_id = $3::text)
        ORDER BY score DESC, t.weight DESC
-       LIMIT $3`,
-      [query, opts.takesHoldersAllowList ?? null, limit, opts.sourceId ?? null]
+       LIMIT $4`,
+      [query, opts.takesHoldersAllowList ?? null, opts.sourceId ?? null, limit]
     );
     return rows as unknown as TakeHit[];
   }
 
   async searchTakesVector(
     embedding: Float32Array,
-    opts: { limit?: number; sourceId?: string; takesHoldersAllowList?: string[] } = {},
+    opts: SearchOpts & { takesHoldersAllowList?: string[] } = {},
   ): Promise<TakeHit[]> {
     const limit = clampSearchLimit(opts.limit, 30, 100);
     const vec = `[${Array.from(embedding).join(',')}]`;
@@ -2647,10 +2793,10 @@ export class PGLiteEngine implements BrainEngine {
        WHERE t.active
          AND t.embedding IS NOT NULL
          AND ($2::text[] IS NULL OR t.holder = ANY($2::text[]))
-         AND ($4::text IS NULL OR p.source_id = $4::text)
+         AND ($3::text IS NULL OR p.source_id = $3::text)
        ORDER BY t.embedding <=> $1::vector
-       LIMIT $3`,
-      [vec, opts.takesHoldersAllowList ?? null, limit, opts.sourceId ?? null]
+       LIMIT $4`,
+      [vec, opts.takesHoldersAllowList ?? null, opts.sourceId ?? null, limit]
     );
     return rows as unknown as TakeHit[];
   }
@@ -3018,7 +3164,9 @@ export class PGLiteEngine implements BrainEngine {
       SELECT
         (SELECT count(*) FROM pages) as page_count,
         (SELECT count(*) FROM content_chunks
-          WHERE CASE WHEN modality = 'image' THEN embedding_image IS NOT NULL ELSE embedding IS NOT NULL END)::float /
+         WHERE (COALESCE(modality, 'text') = 'image' AND embedding_image IS NOT NULL)
+            OR (COALESCE(modality, 'text') <> 'image' AND embedding IS NOT NULL)
+        )::float /
           GREATEST((SELECT count(*) FROM content_chunks), 1)::float as embed_coverage,
         (SELECT count(*) FROM pages p
          WHERE p.updated_at < (SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id)
@@ -3033,7 +3181,8 @@ export class PGLiteEngine implements BrainEngine {
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
         ) as dead_links,
         (SELECT count(*) FROM content_chunks
-          WHERE NOT (CASE WHEN modality = 'image' THEN embedding_image IS NOT NULL ELSE embedding IS NOT NULL END)
+         WHERE (COALESCE(modality, 'text') = 'image' AND embedding_image IS NULL)
+            OR (COALESCE(modality, 'text') <> 'image' AND embedding IS NULL)
         ) as missing_embeddings,
         (SELECT count(*) FROM links) as link_count,
         (SELECT count(DISTINCT page_id) FROM timeline_entries) as pages_with_timeline,
@@ -3152,6 +3301,24 @@ export class PGLiteEngine implements BrainEngine {
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [key, value]
     );
+  }
+
+  async unsetConfig(key: string): Promise<number> {
+    const { affectedRows } = await this.db.query(
+      'DELETE FROM config WHERE key = $1',
+      [key],
+    ) as { affectedRows?: number };
+    return affectedRows ?? 0;
+  }
+
+  async listConfigKeys(prefix: string): Promise<string[]> {
+    // LIKE-escape the prefix so a user-supplied % or _ doesn't act as a wildcard.
+    const escaped = prefix.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const { rows } = await this.db.query(
+      `SELECT key FROM config WHERE key LIKE $1 || '%' ESCAPE '\\' ORDER BY key`,
+      [escaped],
+    );
+    return (rows as { key: string }[]).map(r => r.key);
   }
 
   // Migration support
@@ -3415,8 +3582,7 @@ export class PGLiteEngine implements BrainEngine {
       `SELECT count(*)::int AS count FROM eval_candidates WHERE created_at < $1`,
       [date]
     );
-    const count = (rows[0] as { count?: number } | undefined)?.count ?? 0;
-    return Number(count);
+    return Number((rows[0] as { count?: number } | undefined)?.count ?? 0);
   }
 
   async logEvalCaptureFailure(reason: EvalCaptureFailureReason): Promise<void> {

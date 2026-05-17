@@ -5,6 +5,9 @@
 // (n=0, n=1, n=32, n=33, n=64) flagged by Eng-3A.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { configureGateway, embedMultimodal, resetGateway } from '../src/core/ai/gateway.ts';
 import { getRecipe } from '../src/core/ai/recipes/index.ts';
 import { AIConfigError, AITransientError } from '../src/core/ai/errors.ts';
@@ -14,6 +17,7 @@ import { AIConfigError, AITransientError } from '../src/core/ai/errors.ts';
 type FetchHandler = (url: string, init: RequestInit) => Promise<Response>;
 let fetchHandler: FetchHandler | null = null;
 const origFetch = globalThis.fetch;
+let tempDirs: string[] = [];
 
 beforeEach(() => {
   fetchHandler = null;
@@ -28,6 +32,8 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = origFetch;
   resetGateway();
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+  tempDirs = [];
 });
 
 function configureVoyageMultimodal(env: Record<string, string | undefined> = {}) {
@@ -103,6 +109,30 @@ describe('gateway.embedMultimodal — happy path', () => {
     await embedMultimodal([makeImage()]);
     expect(captured.Authorization).toBe('Bearer test-key');
     expect(captured['Content-Type']).toBe('application/json');
+  });
+
+  test('provider_auth OpenClaw profile can supply Voyage multimodal credentials', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-voyage-mm-'));
+    tempDirs.push(dir);
+    const authPath = join(dir, 'auth.json');
+    writeFileSync(authPath, JSON.stringify({
+      profiles: {
+        'openclaw-openai': { VOYAGE_API_KEY: 'profile-voyage-key' },
+      },
+    }));
+    configureGateway({
+      embedding_model: 'voyage:voyage-multimodal-3',
+      embedding_dimensions: 1024,
+      provider_auth: { voyage: { prefer: 'openclaw-openai', openclawAuthPath: authPath } },
+      env: { VOYAGE_API_KEY: 'stray-env-key' },
+    });
+    let captured: Record<string, string> = {};
+    fetchHandler = async (_url, init) => {
+      captured = init.headers as Record<string, string>;
+      return fakeVoyageResponse(1);
+    };
+    await embedMultimodal([makeImage()]);
+    expect(captured.Authorization).toBe('Bearer profile-voyage-key');
   });
 });
 

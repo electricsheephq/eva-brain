@@ -5,14 +5,15 @@
  * cost-estimate prompt so users with large brains see a dollar figure
  * before the chunker-version sweep re-embeds.
  *
- * Prices in USD per 1M tokens. Numbers as of 2026-05-12. Verify alongside
+ * Prices in USD per 1M tokens. Numbers as of 2026-05-11. Verify alongside
  * the Anthropic-pricing refresh cycle; drift here produces estimates
  * that mislead operators.
  *
- * Codex outside-voice C3 fold: providers without verified current pricing
- * return UNKNOWN_PROVIDER from `lookupPrice` so the cost-estimate prompt can
- * fall back to a clear "estimate unavailable" message instead of fabricating
- * numbers.
+ * Codex outside-voice C3 fold: non-OpenAI embedding providers (Voyage,
+ * Hunyuan, Dashscope, etc.) return UNKNOWN_PROVIDER from `lookupPrice`
+ * so the cost-estimate prompt can fall back to a "estimate unavailable
+ * for <provider>; press Ctrl-C in 10s to abort" message rather than
+ * fabricate numbers.
  */
 
 export interface EmbeddingPricing {
@@ -30,13 +31,14 @@ export const EMBEDDING_PRICING: Record<string, EmbeddingPricing> = {
   'openai:text-embedding-3-small': { pricePerMTok: 0.02 },
   // Legacy OpenAI ada (still common in older brains)
   'openai:text-embedding-ada-002': { pricePerMTok: 0.10 },
-  // Voyage (https://docs.voyageai.com/docs/pricing, verified 2026-05-12)
+  // Voyage (https://www.voyageai.com/pricing)
+  'voyage:voyage-3-large':         { pricePerMTok: 0.18 },
+  'voyage:voyage-3':               { pricePerMTok: 0.06 },
   'voyage:voyage-4-large':         { pricePerMTok: 0.12 },
   'voyage:voyage-4':               { pricePerMTok: 0.06 },
   'voyage:voyage-4-lite':          { pricePerMTok: 0.02 },
-  // Older Voyage models.
-  'voyage:voyage-3-large':         { pricePerMTok: 0.18 },
-  'voyage:voyage-3':               { pricePerMTok: 0.06 },
+  // ZeroEntropy (https://zeroentropy.dev/pricing — zembed-1)
+  'zeroentropyai:zembed-1':        { pricePerMTok: 0.05 },
 };
 
 export type PriceLookupResult =

@@ -601,18 +601,22 @@ export const MIGRATIONS: Migration[] = [
     sql: '',
     handler: async (engine) => {
       if (engine.kind === 'postgres') {
-        await engine.runMigration(
-          14,
-          `DO $$ BEGIN
-             IF EXISTS (
-               SELECT 1 FROM pg_index i
-               JOIN pg_class c ON c.oid = i.indexrelid
-               WHERE c.relname = 'idx_pages_updated_at_desc' AND NOT i.indisvalid
-             ) THEN
-               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_pages_updated_at_desc';
-             END IF;
-           END $$;`
+        const invalidIndexRows = await engine.executeRaw<{ exists: boolean | string }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM pg_index i
+             JOIN pg_class c ON c.oid = i.indexrelid
+             WHERE c.relname = 'idx_pages_updated_at_desc' AND NOT i.indisvalid
+           ) AS exists;`
         );
+        const hasInvalidIndex = invalidIndexRows.some(
+          row => row.exists === true || String(row.exists).toLowerCase() === 'true',
+        );
+        if (hasInvalidIndex) {
+          await engine.runMigration(
+            14,
+            `DROP INDEX CONCURRENTLY IF EXISTS idx_pages_updated_at_desc;`
+          );
+        }
         await engine.runMigration(
           14,
           `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pages_updated_at_desc
@@ -2748,6 +2752,516 @@ export const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS pages_source_path_idx
         ON pages (source_path) WHERE source_path IS NOT NULL;
     `,
+  },
+  {
+    version: 59,
+    name: 'code_traversal_cache_v0_34',
+    // v0.34 W3b — memoization layer for code_blast / code_flow.
+    // (Originally claimed v56; renumbered to v59 on merge with master which
+    // landed query_cache_search_lite=v55, drift_watch=v56, search_telemetry=v57.)
+    //
+    // Recursive caller/callee walks on a dense (calls + imports + references)
+    // graph can fan out to 200+ nodes per call. During a plan-mode agent
+    // session that calls code_blast 5-15 times, we want hits to return
+    // <200ms instead of re-walking the same graph.
+    //
+    // The cache is correctness-safe under concurrent sync via REPEATABLE
+    // READ + xmin_max — the traversal-cache module wraps each walk in
+    // `BEGIN ISOLATION LEVEL REPEATABLE READ` and captures the snapshot's
+    // xmin_max alongside the response. On read, if the current snapshot
+    // doesn't dominate the cached snapshot, the cache misses.
+    //
+    // D3 — cluster_generation: monotonically incrementing counter bumped
+    // once per recompute_code_clusters phase. Cache rows carrying a stale
+    // generation naturally miss on next read, so cluster-renaming-mid-cycle
+    // doesn't return stale cluster names from cached blast/flow responses.
+    sql: `
+      CREATE TABLE IF NOT EXISTS code_traversal_cache (
+        id SERIAL PRIMARY KEY,
+        symbol_qualified TEXT NOT NULL,
+        depth INT NOT NULL,
+        source_id TEXT NOT NULL,
+        response_json JSONB NOT NULL,
+        max_chunk_updated_at TIMESTAMPTZ NOT NULL,
+        xmin_max BIGINT NOT NULL,
+        cluster_generation BIGINT NOT NULL DEFAULT 0,
+        computed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS code_traversal_cache_key_idx
+        ON code_traversal_cache (symbol_qualified, depth, source_id);
+      CREATE INDEX IF NOT EXISTS code_traversal_cache_source_idx
+        ON code_traversal_cache (source_id);
+    `,
+  },
+  {
+    version: 58,
+    name: 'edges_backfilled_at_v0_33_2',
+    // v0.33.2 W0c — resumable symbol-resolution backfill watermark.
+    // (Originally claimed v55; renumbered to v58 on merge with master which
+    // landed query_cache_search_lite=v55, drift_watch=v56, search_telemetry=v57.)
+    //
+    // The within-file two-pass resolver (src/core/chunkers/symbol-resolver.ts)
+    // walks every content_chunks row that has unresolved edges
+    // (rows in code_edges_symbol whose to_symbol_qualified has not been
+    // matched against same-file symbol_name_qualified yet) and writes the
+    // resolution outcome to code_edges_symbol.edge_metadata. On a 96K-chunk
+    // brain that is a 5-15 minute backfill the first time it runs.
+    //
+    // `edges_backfilled_at` is the resume watermark. Backfill runs in
+    // 200-chunk batches; on batch success the column is set to NOW() for
+    // every chunk in the batch. Resume picks up chunks where the watermark
+    // is NULL or older than EDGE_EXTRACTOR_VERSION_TS (a constant bumped
+    // when the extractor's shape changes). Crashes lose at most one batch.
+    //
+    // Composite + partial indexes for the lookup hot path (D11 from eng
+    // review):
+    //   - idx_code_edges_symbol_resolver (source_id, to_symbol_qualified)
+    //     — every code_edges_symbol row is unresolved by construction
+    //     (the table has no to_chunk_id column; that lives on code_edges_chunk).
+    //     This composite index supports the resolver's per-source lookups.
+    //   - idx_content_chunks_symbol_lookup (page_id, symbol_name_qualified)
+    //     WHERE symbol_name_qualified IS NOT NULL — file-batched lookup
+    //     used by both the resolver and the cluster recompute phase (W4-5).
+    //   - idx_content_chunks_edges_backfill (edges_backfilled_at)
+    //     WHERE edges_backfilled_at IS NULL — find unresumed rows quickly.
+    //
+    // Idempotent: IF NOT EXISTS on column + indexes. Backfill itself runs
+    // separately via the resolve_symbol_edges cycle phase.
+    sql: `
+      ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS edges_backfilled_at TIMESTAMPTZ;
+
+      CREATE INDEX IF NOT EXISTS idx_code_edges_symbol_resolver
+        ON code_edges_symbol (source_id, to_symbol_qualified);
+
+      CREATE INDEX IF NOT EXISTS idx_content_chunks_symbol_lookup
+        ON content_chunks (page_id, symbol_name_qualified)
+        WHERE symbol_name_qualified IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_content_chunks_edges_backfill
+        ON content_chunks (edges_backfilled_at)
+        WHERE edges_backfilled_at IS NULL;
+    `,
+  },
+  {
+    version: 55,
+    name: 'query_cache_search_lite',
+    // v0.32.x (search-lite, originally claimed v52 in PR #897; renumbered
+    // to v55 on merge with master to sit after eval_contradictions_cache (v52),
+    // eval_contradictions_runs (v53), cjk_wave (v54)).
+    //
+    // Semantic query cache. Cache search results keyed by query embedding
+    // similarity so a near-duplicate query reuses the previous result set
+    // instead of re-running keyword + vector + RRF + dedup. Cache lookup:
+    // `embedding <=> $1 < 0.08` (cosine distance, similarity >= 0.92) using HNSW.
+    //
+    // Schema:
+    //   id            — SHA-256(query_text + source_id) for diagnostics.
+    //   query_text    — the raw query for debug + cache-stats output.
+    //   source_id     — scope by source so multi-source brains don't bleed.
+    //   embedding     — the query embedding. Same dim as content_chunks.
+    //   results       — JSONB array of SearchResult rows.
+    //   meta          — JSONB; what hybridSearch actually did (intent,
+    //                   vector_enabled, etc.) so cached responses can
+    //                   surface the same debug info as fresh ones.
+    //   ttl_seconds   — per-row TTL. Default 3600. Stale rows are skipped
+    //                   at read time and pruned by `gbrain cache prune`.
+    //   created_at    — TTL anchor.
+    //   hit_count     — instrumentation; bumped on each lookup-hit.
+    //   last_hit_at   — instrumentation.
+    //
+    // Schema is engine-agnostic: HALFVEC when available (matches the facts
+    // table from v45 for consistency), otherwise VECTOR. Embedding dim is
+    // resolved from `config.embedding_dimensions` at migration time so
+    // non-OpenAI brains work — same approach as v45.
+    sql: '',
+    handler: async (engine: BrainEngine) => {
+      // Step 1: resolve embedding dim from config table (same pattern as v45).
+      let embeddingDim = 1536;
+      try {
+        const dimRows = await engine.executeRaw<{ value: string }>(
+          `SELECT value FROM config WHERE key = 'embedding_dimensions'`,
+        );
+        if (dimRows.length > 0) {
+          const parsed = parseInt(dimRows[0].value, 10);
+          if (Number.isFinite(parsed) && parsed > 0 && parsed <= 4096) {
+            embeddingDim = parsed;
+          }
+        }
+      } catch {
+        // No config row yet — fall back to default.
+      }
+
+      // Step 2: pgvector version probe for HALFVEC. Same logic as v45.
+      // We deliberately mirror v45's facts table approach for consistency.
+      let useHalfvec = false;
+      if (engine.kind === 'postgres') {
+        try {
+          const vrows = await engine.executeRaw<{ extversion: string }>(
+            `SELECT extversion FROM pg_extension WHERE extname = 'vector'`,
+          );
+          if (vrows.length > 0) {
+            const v = vrows[0].extversion;
+            const parts = v.split('.');
+            const major = parseInt(parts[0] ?? '0', 10);
+            const minor = parseInt(parts[1] ?? '0', 10);
+            if (major > 0 || (major === 0 && minor >= 7)) {
+              useHalfvec = true;
+            }
+          }
+        } catch {
+          // Probe failed — fall back to VECTOR.
+        }
+      } else {
+        useHalfvec = true;
+      }
+
+      const vecType = useHalfvec ? 'HALFVEC' : 'VECTOR';
+      const opclass = useHalfvec ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
+
+      const ddl = `
+        CREATE TABLE IF NOT EXISTS query_cache (
+          id            TEXT        PRIMARY KEY,
+          query_text    TEXT        NOT NULL,
+          source_id     TEXT        NOT NULL DEFAULT 'default',
+          embedding     ${vecType}(${embeddingDim}),
+          results       JSONB       NOT NULL DEFAULT '[]'::jsonb,
+          meta          JSONB       NOT NULL DEFAULT '{}'::jsonb,
+          ttl_seconds   INTEGER     NOT NULL DEFAULT 3600,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+          hit_count     INTEGER     NOT NULL DEFAULT 0,
+          last_hit_at   TIMESTAMPTZ
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_query_cache_source_created
+          ON query_cache(source_id, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_query_cache_embedding_hnsw
+          ON query_cache USING hnsw (embedding ${opclass})
+          WHERE embedding IS NOT NULL;
+      `;
+
+      await engine.runMigration(55, ddl);
+    },
+  },
+  {
+    version: 56,
+    name: 'query_cache_knobs_hash',
+    // v0.32.3 search-lite mode cache contamination hotfix [CDX-4].
+    //
+    // PR #897's query_cache keyed rows on (id, source_id, query_text) only.
+    // The `id` is sha256(source_id::query_text). A tokenmax search
+    // (expansion=on, limit=50) populates a row that a subsequent
+    // conservative call (no-expansion, limit=10) reads back, serving
+    // expanded-and-oversized results to a budget-tight context.
+    //
+    // Fix: extend the row key with a knobs_hash derived from the resolved
+    // search mode bundle. Lookup filters `WHERE knobs_hash = $1 AND
+    // embedding similarity < threshold`. Existing rows have NULL
+    // knobs_hash and are treated as misses (silently re-populated with
+    // the correct hash on first hit — no orphan data, no destructive
+    // migration).
+    //
+    // The PRIMARY KEY stays the existing `id` column (the SHA-256 of
+    // (source_id, query_text, knobs_hash) — the cache code re-derives
+    // it on every write, so a tokenmax write and a conservative write
+    // produce distinct `id` values and live as separate rows).
+    //
+    // Engine-agnostic; idempotent.
+    idempotent: true,
+    sql: `
+      ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS knobs_hash TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_query_cache_source_knobs_created
+        ON query_cache(source_id, knobs_hash, created_at DESC);
+    `,
+  },
+  {
+    version: 57,
+    name: 'search_telemetry_rollup',
+    // v0.32.3 search-lite: per-day rollup of search-call shape.
+    //
+    // Powers `gbrain search stats [--days N]` and `gbrain search tune` so an
+    // operator (or an agent calling tune) can reason about hit rate, intent
+    // mix, budget pressure, and result-volume averages WITHOUT pulling
+    // per-call rows.
+    //
+    // Schema math per [CDX-17]: sums + counts only, NOT averages. Read-time
+    // derives averages so concurrent ON CONFLICT writes from multiple gbrain
+    // processes accumulate correctly.
+    //
+    // Date-bucketed cache hit/miss per [CDX-18] — query_cache.hit_count is
+    // a LIFETIME counter and can't be sliced by --days. The telemetry table
+    // is the truth for windowed hit rate.
+    //
+    // PK is (date, mode, intent) so the rollup never grows past
+    // 365 days × 3 modes × 4 intents = ~4380 rows/year. Acceptable.
+    //
+    // Engine-agnostic; idempotent.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS search_telemetry (
+        date                TEXT         NOT NULL,
+        mode                TEXT         NOT NULL,
+        intent              TEXT         NOT NULL,
+        count               INTEGER      NOT NULL DEFAULT 0,
+        sum_results         INTEGER      NOT NULL DEFAULT 0,
+        sum_tokens          INTEGER      NOT NULL DEFAULT 0,
+        sum_budget_dropped  INTEGER      NOT NULL DEFAULT 0,
+        cache_hit           INTEGER      NOT NULL DEFAULT 0,
+        cache_miss          INTEGER      NOT NULL DEFAULT 0,
+        first_seen          TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        last_seen           TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        PRIMARY KEY (date, mode, intent)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_search_telemetry_date
+        ON search_telemetry (date DESC);
+    `,
+  },
+  {
+    version: 60,
+    name: 'oauth_clients_source_id_fk',
+    // v0.34.1 (#861 + D4 + D10 + D13 — P0 source-isolation leak seal).
+    //
+    // Adds oauth_clients.source_id, validates ALL existing rows can map to a
+    // real source row, backfills NULL → 'default', and installs the FK with
+    // ON DELETE SET NULL. PR #861's original migration claimed v47-v51; we
+    // re-number to v60 because the branch already shipped through v54.
+    //
+    // D10 (codex outside-voice push-back): fail loud when stale source_id
+    // rows exist instead of silently widening to NULL. Pre-fix this column
+    // didn't exist; the only way a row has source_id IS a manual SQL poke,
+    // so the stale-row branch fires only on operator-modified brains. The
+    // GBRAIN_ACCEPT_SILENT_WIDEN=1 env var is the explicit opt-in for
+    // operators who'd rather upgrade than psql-fix. Doctor surfaces orphan
+    // rows post-clean via the v0.34.x follow-up TODO.
+    //
+    // D13: backfill NULL → 'default' BEFORE the FK ADD preserves the v0.33
+    // effective behavior (legacy unscoped clients silently fell back to
+    // 'default' via serve-http.ts:929 cast). Verify 'default' exists in
+    // sources first — fresh brains have it from sources schema's default
+    // seed; brains that scripted it out would otherwise wedge here.
+    //
+    // PGLite parity via the same DO blocks. PGLite supports DO/EXCEPTION
+    // since 0.3; no engine branch needed.
+    idempotent: true,
+    sql: `
+      -- v0.34.1 (#861 + D2 + D13 — P0 source-isolation leak seal).
+      --
+      -- This migration is intentionally lean: oauth_clients.source_id did
+      -- NOT exist pre-v60, so the only state we inherit from upgrade is
+      -- "rows with NULL source_id." Backfill those to 'default' (D13:
+      -- preserves the pre-v0.34 effective fallback behavior verbatim) and
+      -- install the FK with ON DELETE SET NULL.
+      --
+      -- D10 pre-clean is NOT NEEDED here: codex flagged the silent-widen
+      -- footgun assuming source_id was an existing column with possibly-stale
+      -- values. Since the column is brand new in this migration, the only
+      -- post-backfill values are 'default' (which we just verified exists
+      -- via the FK contract) plus any NULL the backfill left untouched
+      -- because of WHERE-clause filtering — none possible. The
+      -- GBRAIN_ACCEPT_SILENT_WIDEN env-flag stays in the runner for future
+      -- migrations that need it; this one doesn't.
+
+      -- 1. Add the column. NULL for every existing row.
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS source_id TEXT;
+
+      -- 2. Backfill NULL → 'default'. Pre-v0.34 legacy clients then map
+      --    to the same source the serve-http fallback chain used to put
+      --    them in implicitly. No-op on fresh installs (no rows yet).
+      UPDATE oauth_clients SET source_id = 'default' WHERE source_id IS NULL;
+
+      -- 3. Install FK if not already present. The PGLite + Postgres fresh-
+      --    install schemas (src/core/pglite-schema.ts, src/schema.sql) now
+      --    include the FK inline on the CREATE TABLE, so this DO block
+      --    skips on fresh installs and only fires on upgrade brains where
+      --    oauth_clients was created pre-v60 without the FK. ON DELETE SET
+      --    NULL matches the original PR #861 posture; #876 later flips to
+      --    RESTRICT once federated_read provides the alternative
+      --    scope-recovery path.
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'oauth_clients_source_id_fkey'
+        ) THEN
+          ALTER TABLE oauth_clients
+            ADD CONSTRAINT oauth_clients_source_id_fkey
+            FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+
+      -- 4. Index for token-verification lookups (verifyAccessToken's JOIN
+      --    on oauth_clients.client_id → c.source_id). oauth_clients stays
+      --    small so plain CREATE INDEX (no CONCURRENTLY) is fine.
+      CREATE INDEX IF NOT EXISTS idx_oauth_clients_source_id
+        ON oauth_clients(source_id) WHERE source_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 61,
+    name: 'oauth_clients_federated_read_column',
+    // v0.34.1 (#876): add federated_read TEXT[] for the read-side
+    // federation feature. source_id (v60) is the WRITE-authority axis;
+    // federated_read is the READ-scope axis. A client can write to ONE
+    // source while reading from N (a "WeCare L3 dept" client writes to
+    // dept-x and reads dept-x + parent canon + shared canon).
+    //
+    // Default '{}' (empty array) on column add — pre-existing rows get
+    // backfilled in v62 with an explicit CASE so the array reflects the
+    // client's current scope rather than the column default.
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS federated_read TEXT[] NOT NULL DEFAULT '{}';
+    `,
+  },
+  {
+    version: 62,
+    name: 'oauth_clients_federated_read_backfill',
+    // v0.34.1 (#876, F5 — codex outside-voice fix). Backfill federated_read
+    // with explicit CASE so source_id IS NULL doesn't produce an ambiguous
+    // array containing NULL. Three cases:
+    //   - source_id IS NULL → '{}' (empty read scope; legacy unscoped
+    //     clients lost their implicit fallback in v60 backfill to 'default',
+    //     so this branch fires only when an operator explicitly NULL'd
+    //     source_id after migration).
+    //   - source_id IS NOT NULL → ARRAY[source_id] (read scope matches
+    //     write scope, the pre-federation default).
+    // Only fires on rows where federated_read is still the column default
+    // ({}). Operators who hand-set federated_read keep their config.
+    idempotent: true,
+    sql: `
+      UPDATE oauth_clients
+      SET federated_read = CASE
+        WHEN source_id IS NULL THEN '{}'::text[]
+        ELSE ARRAY[source_id]
+      END
+      WHERE federated_read = '{}'::text[];
+    `,
+  },
+  {
+    version: 63,
+    name: 'oauth_clients_federated_read_validate',
+    // v0.34.1 (#876): post-backfill validation. Every client with a
+    // non-NULL source_id should now have its source_id reflected in
+    // federated_read. Fail loud if backfill missed a row — points at a
+    // logic bug in v62's WHERE clause.
+    idempotent: true,
+    sql: `
+      DO $$
+      DECLARE
+        bad_count INT;
+      BEGIN
+        SELECT count(*) INTO bad_count FROM oauth_clients
+          WHERE source_id IS NOT NULL
+            AND NOT (source_id = ANY(federated_read));
+        IF bad_count > 0 THEN
+          RAISE EXCEPTION 'oauth_clients has % rows where source_id is not in federated_read after v62 backfill. This is a bug in v62 — re-run gbrain apply-migrations --force-retry 62.', bad_count;
+        END IF;
+      END $$;
+    `,
+  },
+  {
+    version: 64,
+    name: 'oauth_clients_source_id_fk_restrict',
+    // v0.34.1 (#876): flip the source_id FK from ON DELETE SET NULL (v60
+    // posture) to ON DELETE RESTRICT now that federated_read provides
+    // the alternative scope-loss path. Pre-fix, deleting a source could
+    // silently widen any oauth_client to super-reader (source_id → NULL).
+    // Post-flip, source delete is refused if any client references it;
+    // the operator's path is "revoke or re-scope the clients first."
+    idempotent: true,
+    sql: `
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'oauth_clients_source_id_fkey'
+        ) THEN
+          ALTER TABLE oauth_clients DROP CONSTRAINT oauth_clients_source_id_fkey;
+        END IF;
+        ALTER TABLE oauth_clients
+          ADD CONSTRAINT oauth_clients_source_id_fkey
+          FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE RESTRICT;
+      END $$;
+    `,
+  },
+  {
+    version: 65,
+    name: 'oauth_clients_federated_read_gin_index',
+    // v0.34.1 (#876): GIN index for array-containment lookups
+    // (`WHERE p.source_id = ANY(federated_read)` and similar). The five
+    // read-side ops fall back to scalar sourceId when no auth is set, so
+    // this index only matters under load on federated-scoped clients.
+    idempotent: true,
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_read
+        ON oauth_clients USING GIN (federated_read);
+    `,
+  },
+  {
+    version: 66,
+    name: 'embed_stale_partial_index',
+    // Renumbered v58→v59→v60→v66 across merge waves:
+    //   - v58 was taken by master's v0.33.3 edges_backfilled_at.
+    //   - v59 was taken by master's v0.34.0 code_traversal_cache.
+    //   - v60-v65 were taken by master's v0.34.1 oauth_clients source-isolation cluster.
+    // All landed before this branch could ship.
+    //
+    // Partial index for `embedding IS NULL` on content_chunks.
+    //
+    // The `embed --stale` command scans for chunks missing embeddings.
+    // Without this index, the query does a full table scan of 300K+ rows
+    // to find the ~48K NULLs, taking >2 min and hitting Supabase's
+    // statement_timeout. With the partial index, the scan is instant.
+    //
+    // Also used by countStaleChunks() for the pre-flight check.
+    //
+    // Engine-aware via handler (mirrors v14): Postgres uses
+    // CREATE INDEX CONCURRENTLY to avoid the ShareLock on `content_chunks`
+    // that a plain CREATE INDEX takes for the duration of the build.
+    // On a 373K-row table this lock blocks every concurrent write (sync,
+    // embed, autopilot). CONCURRENTLY refuses to run inside a transaction
+    // AND postgres.js's multi-statement `.unsafe()` wraps in an implicit
+    // transaction, so each statement runs as a separate call. A failed
+    // CONCURRENTLY leaves an invalid index with the target name; the
+    // handler pre-drops any invalid remnant via pg_index.indisvalid.
+    // PGLite has no concurrent writers, so plain CREATE is safe.
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind === 'postgres') {
+        const invalidIndexRows = await engine.executeRaw<{ exists: boolean | string }>(
+          `SELECT EXISTS (
+             SELECT 1 FROM pg_index i
+             JOIN pg_class c ON c.oid = i.indexrelid
+             WHERE c.relname = 'idx_chunks_embedding_null' AND NOT i.indisvalid
+           ) AS exists;`
+        );
+        const hasInvalidIndex = invalidIndexRows.some(
+          row => row.exists === true || String(row.exists).toLowerCase() === 'true',
+        );
+        if (hasInvalidIndex) {
+          await engine.runMigration(
+            66,
+            `DROP INDEX CONCURRENTLY IF EXISTS idx_chunks_embedding_null;`
+          );
+        }
+        await engine.runMigration(
+          66,
+          `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_embedding_null
+             ON content_chunks (page_id, chunk_index)
+             WHERE embedding IS NULL;`
+        );
+      } else {
+        await engine.runMigration(
+          66,
+          `CREATE INDEX IF NOT EXISTS idx_chunks_embedding_null
+             ON content_chunks (page_id, chunk_index)
+             WHERE embedding IS NULL;`
+        );
+      }
+    },
   },
 ];
 

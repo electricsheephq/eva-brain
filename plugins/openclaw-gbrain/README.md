@@ -27,6 +27,9 @@ Or install the plugin manually from an existing checkout:
 ```bash
 openclaw plugins install --dangerously-force-unsafe-install ./plugins/openclaw-gbrain
 openclaw plugins enable gbrain
+# Restart with exactly one host-appropriate command:
+# Customer/systemd hosts: sudo systemctl restart openclaw-gateway
+# Local developer hosts:
 openclaw gateway restart
 openclaw plugins inspect gbrain --runtime --json
 ```
@@ -101,7 +104,7 @@ default; the hard plugin cap is 20 MiB.
 ```bash
 gbrain --version
 gbrain health
-openclaw infer model run --local --model openai-codex/gpt-5.4-mini --prompt 'Return only JSON: {"ok":true}' --json
+openclaw infer model run --gateway --model openai-codex/gpt-5.4-mini --prompt 'Return only JSON: {"ok":true}' --json
 openclaw gbrain status
 ```
 

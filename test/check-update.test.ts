@@ -158,4 +158,16 @@ describe('check-update CLI', () => {
     expect(output).toHaveProperty('current_source', 'package-json');
     expect(typeof output.update_available).toBe('boolean');
   });
+
+  test('source points at Eva Brain update surfaces', async () => {
+    const source = await Bun.file(
+      new URL('../src/commands/check-update.ts', import.meta.url).pathname
+    ).text();
+
+    expect(source).toContain('electricsheephq/eva-brain');
+    expect(source).toContain('scripts/update-local-install.sh');
+    expect(source).not.toContain('garrytan/gbrain/releases');
+    expect(source).not.toContain('bun update gbrain');
+    expect(source).not.toContain('clawhub update gbrain');
+  });
 });

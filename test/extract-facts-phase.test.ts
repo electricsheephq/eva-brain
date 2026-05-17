@@ -173,6 +173,24 @@ describe('runExtractFacts — happy path', () => {
     expect(r.pagesScanned).toBe(2);
     expect(r.factsInserted).toBe(2);
   });
+
+  test('explicit empty slugs filter scans zero pages', async () => {
+    await putPage('people/alice', FACT_FENCE(
+      `| 1 | A1 | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+    ));
+    await putPage('companies/acme', FACT_FENCE(
+      `| 1 | C1 | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+    ));
+
+    const r = await runExtractFacts(engine, { slugs: [] });
+    expect(r.pagesScanned).toBe(0);
+    expect(r.factsInserted).toBe(0);
+    expect(r.guardTriggered).toBe(false);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query('SELECT COUNT(*) AS n FROM facts');
+    expect(Number(rows.rows[0].n)).toBe(0);
+  });
 });
 
 describe('runExtractFacts — malformed fence safety', () => {

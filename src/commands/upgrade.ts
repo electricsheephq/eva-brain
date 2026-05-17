@@ -5,6 +5,9 @@ import { VERSION } from '../version.ts';
 import type { GBrainConfig } from '../core/config.ts';
 
 const GBRAIN_GITHUB_REPO = 'electricsheephq/eva-brain';
+const GBRAIN_GITHUB_URL = `https://github.com/${GBRAIN_GITHUB_REPO}`;
+const GBRAIN_RELEASES_URL = 'https://github.com/electricsheephq/eva-brain/releases';
+const EVA_SOURCE_UPDATE_COMMAND = 'cd ~/eva-brain && scripts/update-local-install.sh';
 const DEFAULT_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
 
 export function resolvePostUpgradeEmbeddingModel(config: Pick<GBrainConfig, 'embedding_model'> | null | undefined): string {
@@ -14,7 +17,7 @@ export function resolvePostUpgradeEmbeddingModel(config: Pick<GBrainConfig, 'emb
 
 export async function runUpgrade(args: string[]) {
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: gbrain upgrade\n\nSelf-update the CLI.\n\nDetects install method (bun, binary, clawhub) and runs the appropriate update.\nAfter upgrading, shows what\'s new and offers to set up new features.');
+    console.log('Usage: gbrain upgrade\n\nSelf-update the Eva Brain CLI.\n\nSource-linked installs are fast-forwarded in place. Package, binary, and bundle installs are pointed at the public source updater so Eva-specific OpenClaw and support-KB setup stays intact.');
     return;
   }
 
@@ -46,37 +49,26 @@ export async function runUpgrade(args: string[]) {
     }
 
     case 'bun':
-      console.log('Upgrading via bun...');
-      try {
-        execSync('bun update gbrain', { stdio: 'inherit', timeout: 120_000 });
-        upgraded = true;
-      } catch {
-        console.error('Upgrade failed. Try running manually: bun update gbrain');
-      }
+      console.log('This looks like a package install. Eva Brain updates should use the source updater so plugin and support-KB setup stay aligned.');
+      printSourceUpdaterCommands();
       break;
 
     case 'binary':
       console.log('Binary self-update not yet implemented.');
       console.log('Download the latest binary from GitHub Releases:');
-      console.log('  https://github.com/garrytan/gbrain/releases');
+      console.log(`  ${GBRAIN_RELEASES_URL}`);
       break;
 
     case 'clawhub':
-      console.log('Upgrading via ClawHub...');
-      try {
-        execSync('clawhub update gbrain', { stdio: 'inherit', timeout: 120_000 });
-        upgraded = true;
-      } catch {
-        console.error('ClawHub upgrade failed. Try: clawhub update gbrain');
-      }
+      console.log('ClawHub bundle updates alone do not refresh the source checkout, OpenClaw plugin, Codex plugin, or support KB.');
+      printSourceUpdaterCommands();
       break;
 
     default:
       console.error('Could not detect installation method.');
       console.log('Try one of:');
-      console.log('  bun update gbrain');
-      console.log('  clawhub update gbrain');
-      console.log('  Download from https://github.com/garrytan/gbrain/releases');
+      printSourceUpdaterCommands();
+      console.log(`  Download from ${GBRAIN_RELEASES_URL}`);
   }
 
   if (upgraded) {
@@ -114,6 +106,13 @@ export async function runUpgrade(args: string[]) {
       // features scan is best-effort
     }
   }
+}
+
+function printSourceUpdaterCommands(): void {
+  console.log('  # If the source checkout is missing:');
+  console.log(`  git clone ${GBRAIN_GITHUB_URL}.git ~/eva-brain`);
+  console.log('  # Then run the public updater:');
+  console.log(`  ${EVA_SOURCE_UPDATE_COMMAND}`);
 }
 
 function verifyUpgrade(): string {
@@ -267,6 +266,53 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
         await engine.initSchema();
         console.log('  Schema up to date.');
 
+        // v0.32.3 search-lite mode banner. One-shot: fires at most once per
+        // install (state persisted via `search.mode_upgrade_notice_shown`).
+        // Reframes from "behavior is regressing" to "named modes available"
+        // per [CDX-1+2+3]: the production query op still defaults expand=true
+        // and limit=20 — Garry's behavior is NOT regressing.
+        try {
+          const shown = await engine.getConfig('search.mode_upgrade_notice_shown');
+          const existingMode = await engine.getConfig('search.mode');
+          if (shown !== 'true' && !existingMode) {
+            console.log('');
+            console.log('═══════════════════════════════════════════════════════════════');
+            console.log('[gbrain] v0.32.3 added named search modes (conservative/balanced/tokenmax).');
+            console.log('[gbrain] Your current behavior is unchanged — the `query` op still defaults');
+            console.log('[gbrain] expand=true and limit=20, same as v0.31.x.');
+            console.log('═══════════════════════════════════════════════════════════════');
+            console.log('');
+            console.log('[AGENT] Relay this matrix to your operator and ask which mode they want.');
+            console.log('[AGENT] Recommended default: tokenmax (preserves current retrieval shape).');
+            console.log('[AGENT] Run `gbrain config set search.mode <mode>` after they decide.');
+            console.log('');
+            console.log('Per-query cost @ 10K queries/mo (typical single-user volume):');
+            console.log('');
+            console.log('                  Haiku 4.5    Sonnet 4.6   Opus 4.7');
+            console.log('                  ($1/M)       ($3/M)       ($5/M)');
+            console.log('  conservative    $40/mo       $120/mo      $200/mo');
+            console.log('  balanced        $100/mo      $300/mo      $500/mo');
+            console.log('  tokenmax        $200/mo      $600/mo      $1,000/mo');
+            console.log('');
+            console.log('  (scales linearly — multiply by 10 for 100K/mo)');
+            console.log('  25x corner-to-corner spread. Natural diagonal pairings span ~4x.');
+            console.log('');
+            console.log('To pick:');
+            console.log('  gbrain search modes              # see what is running');
+            console.log('  gbrain config set search.mode <conservative|balanced|tokenmax>');
+            console.log('  gbrain search tune               # data-driven recommendations');
+            console.log('');
+            console.log('tokenmax bumps limit to 50 (current default is 20). To preserve');
+            console.log('your EXACT current shape:');
+            console.log('  gbrain config set search.mode tokenmax');
+            console.log('  gbrain config set search.searchLimit 20');
+            console.log('');
+            await engine.setConfig('search.mode_upgrade_notice_shown', 'true');
+          }
+        } catch {
+          // Banner is cosmetic; never block the upgrade.
+        }
+
         // v0.32.7 CJK wave: chunker-version bump → re-embed advisory.
         // Eva policy: upgrade must not automatically reindex or embed user
         // content. The advisory prints a cost/size estimate and manual command.
@@ -333,8 +379,8 @@ export function detectInstallMethod(): 'bun' | 'bun-link' | 'binary' | 'clawhub'
   const bunLinkResult = detectBunLink();
   if (bunLinkResult) return 'bun-link';
 
-  // Check if running from node_modules (bun/npm install). Could be canonical
-  // (we publish under garrytan/gbrain) OR the squatter (npm `gbrain@1.3.x`).
+  // Check if running from node_modules (bun/npm install). Could be the Eva
+  // source package metadata OR the squatter (npm `gbrain@1.3.x`).
   // Sub-classify and warn loudly on suspect installs (#658).
   if (execPath.includes('node_modules') || process.argv[1]?.includes('node_modules')) {
     const verdict = classifyBunInstall();
@@ -364,7 +410,7 @@ export function detectInstallMethod(): 'bun' | 'bun-link' | 'binary' | 'clawhub'
  * Detect bun-link source-clone installs (closes #656, fixes #368).
  *
  * Walk up from argv[1] looking for a `.git/config` whose remote url
- * contains `garrytan/gbrain` (case-insensitive substring).
+ * contains the Eva Brain repo slug (case-insensitive substring).
  *
  * v0.28.5 gated on lstatSync(argv1).isSymbolicLink(), but bun resolves
  * the entire symlink chain before setting process.argv[1], so the check
@@ -409,7 +455,7 @@ function detectBunLink(): { repoRoot: string } | null {
  * npm, the package is the squatter — an unrelated `gbrain@1.3.x` that
  * silently overwrites our binary. This function reads the install
  * directory's package.json and checks two non-spoofable signals:
- *   - `repository.url` contains `garrytan/gbrain` (case-insensitive)
+ *   - `repository.url` contains `electricsheephq/eva-brain` (case-insensitive)
  *   - the install dir contains a `src/cli.ts` file (squatter ships
  *     compiled binary, not source)
  *
@@ -417,7 +463,7 @@ function detectBunLink(): { repoRoot: string } | null {
  * recovery message. Codex's plan-review noted these signals are spoofable
  * by a determined squatter — accepted; this is best-effort warning, not
  * an assertion. The right structural fix is publishing under a scoped
- * name like `@garrytan/gbrain` (tracked v0.29 follow-up).
+ * name like `@electricsheephq/eva-brain` (tracked v0.29 follow-up).
  */
 function classifyBunInstall(): 'canonical' | 'suspect' {
   try {
@@ -459,7 +505,7 @@ function classifyBunInstall(): 'canonical' | 'suspect' {
 
 function printSquatterRecovery(): void {
   console.warn('');
-  console.warn('  WARNING: gbrain install does not appear to be from garrytan/gbrain.');
+  console.warn('  WARNING: gbrain install does not appear to be from electricsheephq/eva-brain.');
   console.warn('  This is likely the npm-name collision tracked in issue #658:');
   console.warn('    https://www.npmjs.com/package/gbrain (an unrelated package).');
   console.warn('');
@@ -470,7 +516,7 @@ function printSquatterRecovery(): void {
   console.warn('         cd ~/eva-brain && bun install && bun link');
   console.warn('');
   console.warn('    2. Download a release binary:');
-  console.warn('         https://github.com/garrytan/gbrain/releases');
+  console.warn(`         ${GBRAIN_RELEASES_URL}`);
   console.warn('');
   console.warn('  See docs/INSTALL_FOR_AGENTS.md for the canonical install paths.');
   console.warn('');

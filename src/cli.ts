@@ -27,7 +27,8 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'import-media', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'ingest-media', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'import-media', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'ingest-media', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache']);
+const SEARCH_CLI_SUBCOMMANDS = new Set(['modes', 'stats', 'tune']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
@@ -38,6 +39,7 @@ const CLI_ONLY_SELF_HELP = new Set([
   'integrations', 'friction',
   'frontmatter', 'check-resolvable',
   'models',
+  'cache',
 ]);
 
 async function main() {
@@ -67,6 +69,8 @@ async function main() {
   }
 
   const subArgs = args.slice(1);
+  const searchCliSubcommand =
+    command === 'search' && SEARCH_CLI_SUBCOMMANDS.has(subArgs[0] || '');
 
   // DX alias: `ask` is a natural-language alias for `query`
   if (command === 'ask') {
@@ -75,6 +79,11 @@ async function main() {
 
   // Per-command --help
   if (hasHelpFlag(subArgs)) {
+    if (searchCliSubcommand) {
+      const { printSearchHelp } = await import('./commands/search.ts');
+      printSearchHelp();
+      return;
+    }
     const op = cliOps.get(command);
     if (op) {
       printOpHelp(op);
@@ -86,8 +95,10 @@ async function main() {
     }
   }
 
-  // CLI-only commands
-  if (CLI_ONLY.has(command)) {
+  // CLI-only commands. `search` is normally a shared keyword-search op, but
+  // v0.32.3 added reserved CLI subcommands (`search modes/stats/tune`) that
+  // need the command handler below.
+  if (CLI_ONLY.has(command) || searchCliSubcommand) {
     await handleCliOnly(command, subArgs);
     return;
   }
@@ -513,7 +524,11 @@ async function makeContext(engine: BrainEngine, params: Record<string, unknown>)
     // confinement (e.g., cwd-locked file_upload).
     remote: false,
     cliOpts: getCliOptions(),
-    ...(sourceId ? { sourceId } : {}),
+    // v0.34 D4: sourceId is REQUIRED at the type level. Fall back to 'default'
+    // when resolveSourceId returned undefined (fresh pre-init brain, no sources
+    // table). Matches dispatch.ts's auto-fill so the contract holds across
+    // every transport.
+    sourceId: sourceId ?? 'default',
   };
 }
 
@@ -802,6 +817,14 @@ async function handleCliOnly(command: string, args: string[]) {
     await runMounts(args);
     return;
   }
+  if (command === 'cache') {
+    // v0.32.x search-lite: semantic query cache management. Dispatch the
+    // subcommand handler (stats / clear / prune); the handler opens its
+    // own engine connection.
+    const { runCache } = await import('./commands/cache.ts');
+    await runCache(args);
+    return;
+  }
   if (command === 'routing-eval') {
     const { runRoutingEvalCli } = await import('./commands/routing-eval.ts');
     await runRoutingEvalCli(args);
@@ -946,10 +969,36 @@ async function handleCliOnly(command: string, args: string[]) {
   // v0.28.8: longmemeval brings its own in-memory PGLite. Bypassing
   // connectEngine here keeps `gbrain eval longmemeval --help` and benchmark
   // runs working on machines that have no `~/.gbrain/config.json` configured.
+  //
+  // v0.35.1.1: still need to configureGateway() so the in-memory brain's
+  // import + hybridSearch can embed via the configured provider. Reads
+  // ~/.gbrain/config.json when present; falls back to env vars otherwise
+  // (GBRAIN_EMBEDDING_MODEL / GBRAIN_EMBEDDING_DIMENSIONS).
   if (command === 'eval' && args[0] === 'longmemeval') {
     const { runEvalLongMemEval } = await import('./commands/eval-longmemeval.ts');
+    if (!(args.length > 1 && (args[1] === '--help' || args[1] === '-h'))) {
+      const config = loadConfig() ?? ({
+        embedding_model: process.env.GBRAIN_EMBEDDING_MODEL,
+        embedding_dimensions: process.env.GBRAIN_EMBEDDING_DIMENSIONS
+          ? Number(process.env.GBRAIN_EMBEDDING_DIMENSIONS) : undefined,
+      } as GBrainConfig);
+      const { configureGateway } = await import('./core/ai/gateway.ts');
+      configureGateway(buildGatewayConfig(config));
+    }
     await runEvalLongMemEval(args.slice(1));
     return;
+  }
+
+  // v0.33.1.3: `gbrain eval whoknows` on thin-client installs bypasses
+  // connectEngine entirely — the eval routes per-query through the remote
+  // `find_experts` MCP op (the v0.31.1 routing seam). Local mode falls
+  // through to the engine-connected path below.
+  if (command === 'eval' && args[0] === 'whoknows') {
+    const cfgPre = loadConfig();
+    if (isThinClient(cfgPre)) {
+      const { runEvalWhoknows } = await import('./commands/eval-whoknows.ts');
+      process.exit(await runEvalWhoknows(null, args.slice(1)));
+    }
   }
 
   // All remaining CLI-only commands need a DB connection
@@ -1093,6 +1142,23 @@ async function handleCliOnly(command: string, args: string[]) {
         await runAnomalies(engine, args);
         break;
       }
+      case 'edges-backfill': {
+        // v0.34 W6 — operator escape hatch for the symbol-resolution backfill.
+        // Resumable via the edges_backfilled_at watermark; per-batch transactions
+        // commit so Ctrl-C leaves a clean resumable state.
+        const { runEdgesBackfill } = await import('./commands/edges-backfill.ts');
+        await runEdgesBackfill(engine, args);
+        break;
+      }
+      case 'whoknows': {
+        // v0.33 (Issue #?): expertise + relationship-proximity routing.
+        // MCP op `find_experts` (read-scoped) backs the same code path; CLI
+        // dispatch here is the user-facing surface. Thin-client routing
+        // happens inside runWhoknows via isThinClient(cfg) (v0.31.1 pattern).
+        const { runWhoknows } = await import('./commands/whoknows.ts');
+        await runWhoknows(engine, args);
+        break;
+      }
       case 'transcripts': {
         const { runTranscripts } = await import('./commands/transcripts.ts');
         await runTranscripts(engine, args);
@@ -1101,6 +1167,12 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'models': {
         const { runModels } = await import('./commands/models.ts');
         await runModels(engine, args);
+        break;
+      }
+      case 'search': {
+        // v0.32.3 search-lite — `gbrain search modes/stats/tune`.
+        const { runSearch } = await import('./commands/search.ts');
+        await runSearch(engine, args);
         break;
       }
       case 'takes': {

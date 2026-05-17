@@ -11,8 +11,17 @@ start here.
 3. Init the brain: `gbrain init --embedding-model voyage:voyage-4-large --embedding-dimensions 2048`
    when `VOYAGE_API_KEY` is available. For a text-only bootstrap, import with
    `gbrain import <dir> --no-embed` after init and run embeddings later.
-4. Read [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) for the full 9-step flow
-   (Voyage, OpenClaw plugin, support KB, recurring jobs, verification).
+4. For 1000+ files or multi-machine sync, init may suggest Postgres + pgvector via Supabase.
+5. **STOP — ask the user about search mode.** `gbrain init` auto-applied a
+   default but printed a 9-cell cost matrix (mode × downstream model)
+   preceded by `[AGENT]` markers. You MUST relay the matrix to the operator
+   and confirm their choice before continuing. Cost spread between corners
+   is 25x — silent acceptance is the wrong default. See
+   [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) Step 3.1 for the
+   exact ask-the-user protocol. Same banner fires on `gbrain post-upgrade`
+   for existing users (search modes were added in v0.32.3).
+6. Read [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) for the full 9-step flow
+   (Voyage, OpenClaw plugin, support KB, recurring jobs, search mode, verification).
 
 ## Read this order
 
