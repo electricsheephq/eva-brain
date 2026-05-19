@@ -20,13 +20,23 @@ import { join } from 'path';
 import { isInternalUrl } from './url-safety.ts';
 
 /**
- * Git CLI accepts global config flags before the subcommand and
- * subcommand-specific flags after it. Keep those positions split so real git
- * does not reject clone/pull with "unknown option".
+ * Git CLI accepts two flag positions:
+ *   git [global -c flags] <subcommand> [subcommand flags] [args]
+ *
+ * Global flags (the `-c key=value` config overrides) MUST come before the
+ * subcommand. Subcommand-specific flags (like `--no-recurse-submodules`)
+ * MUST come after the subcommand. Mixing the two positions makes git fail
+ * with `unknown option` (exit 129). Pre-v0.34 the single GIT_SSRF_FLAGS
+ * constant spliced both positions before the verb; real git rejected the
+ * subcommand flag but the test harness used a fake-git script that didn't
+ * validate, so every remote-source clone/pull broke silently in production.
+ *
+ * Split into two constants so the call-site spread is unambiguous and the
+ * type/name signal the position rule.
  */
 
 /**
- * SSRF-defensive global flag set. Spread before cloneRepo/pullRepo verbs.
+ * Global git config flags. Spread BEFORE the subcommand verb.
  * - http.followRedirects=false: closes DNS rebinding via redirect chains
  * - protocol.file.allow=never: no local-file URLs (defense in depth)
  * - protocol.ext.allow=never: no external helpers (`git-remote-foo`)
@@ -38,7 +48,7 @@ export const GIT_SSRF_FLAGS = [
 ] as const;
 
 /**
- * SSRF-defensive subcommand flag set. Spread after cloneRepo/pullRepo verbs.
+ * Subcommand-level flags. Spread AFTER the subcommand verb (clone/pull).
  * - --no-recurse-submodules: .gitmodules cannot become a second fetch surface
  */
 export const GIT_SSRF_SUBCOMMAND_FLAGS = [

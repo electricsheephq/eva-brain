@@ -41,6 +41,13 @@ import { GBrainError, PAGE_SORT_SQL } from './types.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql } from './search/sql-ranking.ts';
+import {
+  normalizeEngineColumn,
+  buildVectorCastFragment,
+  quoteIdentifier,
+  COLUMN_NAME_REGEX,
+  EmbeddingColumnNotRegisteredError,
+} from './search/embedding-column.ts';
 import { hasCJK, escapeLikePattern } from './cjk.ts';
 
 type PGLiteDB = PGlite;
@@ -290,11 +297,25 @@ export class PGLiteEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='ingest_log' AND column_name='source_id') AS ingest_log_source_id_exists,
         EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='files') AS files_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='files' AND column_name='source_id') AS files_source_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='files' AND column_name='page_id') AS files_page_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema='public' AND table_name='oauth_clients') AS oauth_clients_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='source_id') AS oauth_clients_source_id_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='federated_read') AS oauth_clients_federated_read_exists
+                WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='federated_read') AS oauth_clients_federated_read_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='sources') AS sources_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='sources' AND column_name='archived') AS sources_archived_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='sources' AND column_name='archived_at') AS sources_archived_at_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='sources' AND column_name='archive_expires_at') AS sources_archive_expires_at_exists
     `);
     const probe = rows[0] as {
       pages_exists: boolean;
@@ -315,9 +336,16 @@ export class PGLiteEngine implements BrainEngine {
       subagent_provider_id_exists: boolean;
       ingest_log_exists: boolean;
       ingest_log_source_id_exists: boolean;
+      files_exists: boolean;
+      files_source_id_exists: boolean;
+      files_page_id_exists: boolean;
       oauth_clients_exists: boolean;
       oauth_clients_source_id_exists: boolean;
       oauth_clients_federated_read_exists: boolean;
+      sources_exists: boolean;
+      sources_archived_exists: boolean;
+      sources_archived_at_exists: boolean;
+      sources_archive_expires_at_exists: boolean;
     };
 
     const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
@@ -341,34 +369,55 @@ export class PGLiteEngine implements BrainEngine {
     // references source_id. Old brains have ingest_log without source_id;
     // bootstrap adds the column before SCHEMA_SQL replay creates the index.
     const needsIngestLogSourceId = probe.ingest_log_exists && !probe.ingest_log_source_id_exists;
-    // v0.34.1 (v60-v65): schema replay creates OAuth source/federation indexes
-    // before numbered migrations run. Old brains can already have oauth_clients
-    // without these columns, so add only the forward-referenced columns here and
-    // let v60-v65 keep final FK/backfill/validation ownership.
-    const needsOAuthClientsBootstrap = probe.oauth_clients_exists
+    // v0.18 (v18): files.source_id + files.page_id added; idx_files_source_id
+    // and idx_files_page_id in PGLITE_SCHEMA_SQL crash without them.
+    const needsFilesBootstrap = probe.files_exists
+      && (!probe.files_source_id_exists || !probe.files_page_id_exists);
+    // v0.34.1 (v60+v61+v65): oauth_clients.source_id + federated_read added;
+    // FK to sources(id) + GIN index idx_oauth_clients_federated_read in
+    // PGLITE_SCHEMA_SQL crash without them.
+    const needsOauthClientsBootstrap = probe.oauth_clients_exists
       && (!probe.oauth_clients_source_id_exists || !probe.oauth_clients_federated_read_exists);
+    // v0.26.5 (v34): sources.archived + archived_at + archive_expires_at added
+    // for soft-delete lifecycle. Not directly referenced by indexes BUT
+    // PGLITE_SCHEMA_SQL's `CREATE TABLE IF NOT EXISTS sources` is a no-op on
+    // pre-existing sources tables (won't add columns), so visibility filters
+    // referencing these columns trip on old brains. The bootstrap closes the
+    // gap before any visibility-filter SQL runs.
+    const needsSourcesArchive = probe.sources_exists
+      && (!probe.sources_archived_exists
+          || !probe.sources_archived_at_exists
+          || !probe.sources_archive_expires_at_exists);
 
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsChunksEmbeddingImage
         && !needsMcpLogBootstrap && !needsSubagentProviderId
         && !needsPagesRecency && !needsIngestLogSourceId
-        && !needsOAuthClientsBootstrap) return;
+        && !needsFilesBootstrap && !needsOauthClientsBootstrap
+        && !needsSourcesArchive) return;
 
     console.log('  Pre-v0.21 brain detected, applying forward-reference bootstrap');
 
     if (needsPagesBootstrap) {
       // Mirror schema-embedded.ts shape for `sources` so the subsequent
       // PGLITE_SCHEMA_SQL CREATE TABLE IF NOT EXISTS is a true no-op.
+      // Archive columns (v34) are folded in here so a pre-v18 brain doesn't
+      // need needsSourcesArchive to also fire — bootstrap creates a complete
+      // v34-shape sources in one go. needsSourcesArchive then only fires on
+      // the pre-v34 case (sources exists, archive cols don't).
       await this.db.exec(`
         CREATE TABLE IF NOT EXISTS sources (
-          id            TEXT PRIMARY KEY,
-          name          TEXT NOT NULL UNIQUE,
-          local_path    TEXT,
-          last_commit   TEXT,
-          last_sync_at  TIMESTAMPTZ,
-          config        JSONB NOT NULL DEFAULT '{}'::jsonb,
-          created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+          id                 TEXT PRIMARY KEY,
+          name               TEXT NOT NULL UNIQUE,
+          local_path         TEXT,
+          last_commit        TEXT,
+          last_sync_at       TIMESTAMPTZ,
+          config             JSONB NOT NULL DEFAULT '{}'::jsonb,
+          archived           BOOLEAN NOT NULL DEFAULT FALSE,
+          archived_at        TIMESTAMPTZ,
+          archive_expires_at TIMESTAMPTZ,
+          created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         INSERT INTO sources (id, name, config)
           VALUES ('default', 'default', '{"federated": true}'::jsonb)
@@ -482,10 +531,47 @@ export class PGLiteEngine implements BrainEngine {
       `);
     }
 
-    if (needsOAuthClientsBootstrap) {
+    if (needsFilesBootstrap) {
+      // v18 (files_provenance_columns) adds source_id + page_id to files plus
+      // idx_files_source_id and idx_files_page_id in PGLITE_SCHEMA_SQL. Pre-v18
+      // brains crash on the CREATE INDEX. Bootstrap adds both columns; v18
+      // runs later via runMigrations and is idempotent.
       await this.db.exec(`
-        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS source_id TEXT;
-        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS federated_read TEXT[] NOT NULL DEFAULT '{}';
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS source_id TEXT
+          NOT NULL DEFAULT 'default' REFERENCES sources(id) ON DELETE CASCADE;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS page_id INTEGER
+          REFERENCES pages(id) ON DELETE SET NULL;
+      `);
+    }
+
+    if (needsOauthClientsBootstrap) {
+      // v60+v61+v65 (oauth_clients_source_id_fk, oauth_clients_federated_read_column,
+      // oauth_clients_federated_read_gin_index) add source_id + federated_read
+      // and the GIN index idx_oauth_clients_federated_read. PGLITE_SCHEMA_SQL's
+      // FK + index references crash on pre-v60 brains. Bootstrap mirrors the
+      // v60+v61 column shape; v60-v65 run later via runMigrations and are
+      // idempotent (and handle backfill + RESTRICT-flip).
+      await this.db.exec(`
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS source_id TEXT
+          DEFAULT 'default' REFERENCES sources(id) ON DELETE SET NULL;
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS federated_read TEXT[]
+          NOT NULL DEFAULT '{}';
+      `);
+    }
+
+    if (needsSourcesArchive) {
+      // v34 (destructive_guard_columns) promotes archive lifecycle from JSONB
+      // config to real columns on sources. PGLITE_SCHEMA_SQL's
+      // `CREATE TABLE IF NOT EXISTS sources` is a no-op against an existing
+      // pre-v34 sources table, so the column-add never lands until the v34
+      // migration runs. v34's UPDATE statements + downstream visibility filters
+      // (search/query/list_pages) need the columns to exist on the table
+      // schema. Bootstrap adds the three columns; v34 runs later via
+      // runMigrations and is idempotent (and handles JSONB → column backfill).
+      await this.db.exec(`
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS archive_expires_at TIMESTAMPTZ;
       `);
     }
   }
@@ -624,6 +710,51 @@ export class PGLiteEngine implements BrainEngine {
     );
     const slugs = (rows as { slug: string }[]).map((r) => r.slug);
     return { slugs, count: slugs.length };
+  }
+
+  async refreshPageBody(
+    slug: string,
+    sourceId: string,
+    compiledTruth: string,
+    timeline: string,
+    contentHash: string,
+  ): Promise<void> {
+    // Parity with PostgresEngine.refreshPageBody: narrow UPDATE only.
+    // The deleted_at filter prevents a redirect retry from reviving a
+    // canonical that was already purged.
+    await this.db.query(
+      `UPDATE pages
+         SET compiled_truth = $1,
+             timeline = $2,
+             content_hash = $3,
+             updated_at = now()
+       WHERE source_id = $4
+         AND slug = $5
+         AND deleted_at IS NULL`,
+      [compiledTruth, timeline, contentHash, sourceId, slug],
+    );
+  }
+
+  async migrateFactsToCanonical(
+    phantomSlug: string,
+    canonicalSlug: string,
+    sourceId: string,
+  ): Promise<{ migrated: number }> {
+    // Parity with PostgresEngine.migrateFactsToCanonical. UPDATE preserves
+    // every column except entity_slug + source_markdown_slug. Active rows
+    // only (expired_at IS NULL) so we don't disturb the supersession audit
+    // trail.
+    const { rows } = await this.db.query(
+      `UPDATE facts
+         SET entity_slug = $1,
+             source_markdown_slug = $1
+       WHERE source_id = $2
+         AND source_markdown_slug = $3
+         AND expired_at IS NULL
+       RETURNING id`,
+      [canonicalSlug, sourceId, phantomSlug],
+    );
+    return { migrated: rows.length };
   }
 
   async listPages(filters?: PageFilters): Promise<Page[]> {
@@ -818,6 +949,7 @@ export class PGLiteEngine implements BrainEngine {
       `WITH ranked AS (
          SELECT
            p.slug, p.id as page_id, p.title, p.type, p.source_id,
+           p.effective_date, p.effective_date_source,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
            ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
            CASE WHEN p.updated_at < (
@@ -935,6 +1067,7 @@ export class PGLiteEngine implements BrainEngine {
         `WITH ranked AS (
            SELECT
              p.slug, p.id as page_id, p.title, p.type, p.source_id,
+             p.effective_date, p.effective_date_source,
              cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
              ${scoreExpr} AS score,
              CASE WHEN p.updated_at < (
@@ -963,6 +1096,7 @@ export class PGLiteEngine implements BrainEngine {
       const { rows } = await this.db.query(
         `SELECT
            p.slug, p.id as page_id, p.title, p.type, p.source_id,
+           p.effective_date, p.effective_date_source,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
            ${scoreExpr} AS score,
            CASE WHEN p.updated_at < (
@@ -1055,6 +1189,7 @@ export class PGLiteEngine implements BrainEngine {
     const { rows } = await this.db.query(
       `SELECT
          p.slug, p.id as page_id, p.title, p.type, p.source_id,
+         p.effective_date, p.effective_date_source,
          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
          ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
          CASE WHEN p.updated_at < (
@@ -1141,31 +1276,36 @@ export class PGLiteEngine implements BrainEngine {
     // same candidate count it always did. See postgres-engine.ts for rationale.
     const visibilityClause = buildVisibilityClause('p', 's');
 
-    // v0.27.1: column routing. Default 'embedding' targets the brain's
-    // primary text-embedding column; 'embedding_image' targets the
-    // multimodal column populated by importImageFile. Image-similarity
-    // queries pass embeddingColumn='embedding_image' AND a 1024-dim vector
-    // produced by gateway.embedMultimodal — must match the column dim.
-    const col = opts?.embeddingColumn === 'embedding_image' ? 'embedding_image' : 'embedding';
+    // v0.36 (D11): column routing via resolved descriptor. Engine doesn't
+    // read config — caller resolved at hybrid/op boundary. The cast SQL
+    // ($1::vector vs $1::halfvec(N)) comes from buildVectorCastFragment.
+    const resolvedCol = normalizeEngineColumn(opts?.embeddingColumn);
+    const { col, castSql } = buildVectorCastFragment(resolvedCol);
     // Image rows live in modality='image'; text/code in 'text'. Restrict
-    // to the modality matching the column to avoid cross-mode dim leaks.
-    const modalityFilter = col === 'embedding_image' ? `AND cc.modality = 'image'` : `AND cc.modality = 'text'`;
+    // by modality so non-image columns can't accidentally pull image
+    // chunks (or vice versa). resolved.name has already passed regex
+    // validation; never compares against raw input.
+    const modalityFilter = resolvedCol.name === 'embedding_image'
+      ? `AND cc.modality = 'image'`
+      : `AND cc.modality = 'text'`;
 
     const { rows } = await this.db.query(
       `WITH hnsw_candidates AS (
          SELECT
            p.slug, p.id as page_id, p.title, p.type, p.source_id, p.updated_at,
+           p.effective_date, p.effective_date_source,
            cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-           1 - (cc.${col} <=> $1::vector) AS raw_score
+           1 - (cc.${col} <=> ${castSql}) AS raw_score
          FROM content_chunks cc
          JOIN pages p ON p.id = cc.page_id
          JOIN sources s ON s.id = p.source_id
          WHERE cc.${col} IS NOT NULL ${modalityFilter} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
-         ORDER BY cc.${col} <=> $1::vector
+         ORDER BY cc.${col} <=> ${castSql}
          LIMIT $2
        )
        SELECT
          hc.slug, hc.page_id, hc.title, hc.type, hc.source_id,
+         hc.effective_date, hc.effective_date_source,
          hc.chunk_id, hc.chunk_index, hc.chunk_text, hc.chunk_source,
          hc.raw_score * ${sourceFactorCaseOnSlug} AS score,
          CASE WHEN hc.updated_at < (
@@ -1181,10 +1321,21 @@ export class PGLiteEngine implements BrainEngine {
     return (rows as Record<string, unknown>[]).map(rowToSearchResult);
   }
 
-  async getEmbeddingsByChunkIds(ids: number[]): Promise<Map<number, Float32Array>> {
+  async getEmbeddingsByChunkIds(
+    ids: number[],
+    column: string = 'embedding',
+  ): Promise<Map<number, Float32Array>> {
     if (ids.length === 0) return new Map();
+    // v0.36 (D9): column parameter so hybrid.cosineReScore can rehydrate
+    // from the active embedding space (Voyage 1024d, ZE halfvec 2560d,
+    // etc.). Identifier-quoted (D12 layer 2) plus strict regex on the
+    // column name (D12 layer 1) before interpolation.
+    if (!COLUMN_NAME_REGEX.test(column)) {
+      throw new EmbeddingColumnNotRegisteredError(column, []);
+    }
+    const quotedCol = quoteIdentifier(column);
     const { rows } = await this.db.query(
-      `SELECT id, embedding FROM content_chunks WHERE id = ANY($1::int[]) AND embedding IS NOT NULL`,
+      `SELECT id, ${quotedCol} AS embedding FROM content_chunks WHERE id = ANY($1::int[]) AND ${quotedCol} IS NOT NULL`,
       [ids]
     );
     const result = new Map<number, Float32Array>();
@@ -1893,15 +2044,25 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async findOrphanPages(): Promise<Array<{ slug: string; title: string; domain: string | null }>> {
+    // Soft-delete filter on BOTH sides:
+    //   - candidate: p.deleted_at IS NULL — soft-deleted pages aren't orphan candidates
+    //   - link source: src.deleted_at IS NULL — links FROM soft-deleted pages don't count as inbound
+    // Without the link-source filter, a live page can hide from orphan results purely
+    // because a soft-deleted page links to it. v0.26.5 invariant; codex C11.
     const { rows } = await this.db.query(
       `SELECT
          p.slug,
          COALESCE(p.title, p.slug) AS title,
          p.frontmatter->>'domain' AS domain
        FROM pages p
-       WHERE NOT EXISTS (
-         SELECT 1 FROM links l WHERE l.to_page_id = p.id
-       )
+       WHERE p.deleted_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM links l
+           JOIN pages src ON src.id = l.from_page_id
+           WHERE l.to_page_id = p.id
+             AND src.deleted_at IS NULL
+         )
        ORDER BY p.slug`
     );
     return rows as Array<{ slug: string; title: string; domain: string | null }>;
@@ -2184,22 +2345,41 @@ export class PGLiteEngine implements BrainEngine {
     const embedding = input.embedding ?? null;
     const embeddedAt = embedding ? new Date() : null;
     const embedStr = embedding ? toPgVectorLiteral(embedding) : null;
+    // v0.35.4 (D-CDX-5) — typed-claim columns. All four nullable.
+    const claimMetric = input.claim_metric ?? null;
+    const claimValue  = input.claim_value  ?? null;
+    const claimUnit   = input.claim_unit   ?? null;
+    const claimPeriod = input.claim_period ?? null;
 
     if (ctx.supersedeId !== undefined) {
       // Supersede flow: insert new + expire old in one txn so observers never
       // see both rows active simultaneously.
       const result = await this.db.transaction(async (tx) => {
         const ins = await tx.query<{ id: number }>(
-          `INSERT INTO facts (
-             source_id, entity_slug, fact, kind, visibility, notability, context,
-             valid_from, valid_until, source, source_session, confidence,
-             embedding, embedded_at
-           ) VALUES (
-             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, ${embedStr === null ? 'NULL' : `$13::vector`}, ${embedStr === null ? 'NULL' : '$14'}
-           ) RETURNING id`,
           embedStr === null
-            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence]
-            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt],
+            ? `INSERT INTO facts (
+                 source_id, entity_slug, fact, kind, visibility, notability, context,
+                 valid_from, valid_until, source, source_session, confidence,
+                 embedding, embedded_at,
+                 claim_metric, claim_value, claim_unit, claim_period
+               ) VALUES (
+                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                 NULL, NULL,
+                 $13, $14, $15, $16
+               ) RETURNING id`
+            : `INSERT INTO facts (
+                 source_id, entity_slug, fact, kind, visibility, notability, context,
+                 valid_from, valid_until, source, source_session, confidence,
+                 embedding, embedded_at,
+                 claim_metric, claim_value, claim_unit, claim_period
+               ) VALUES (
+                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                 $13::vector, $14,
+                 $15, $16, $17, $18
+               ) RETURNING id`,
+          embedStr === null
+            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod]
+            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
         );
         const newId = ins.rows[0].id;
         await tx.query(
@@ -2213,16 +2393,30 @@ export class PGLiteEngine implements BrainEngine {
     }
 
     const ins = await this.db.query<{ id: number }>(
-      `INSERT INTO facts (
-         source_id, entity_slug, fact, kind, visibility, notability, context,
-         valid_from, valid_until, source, source_session, confidence,
-         embedding, embedded_at
-       ) VALUES (
-         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, ${embedStr === null ? 'NULL' : `$13::vector`}, ${embedStr === null ? 'NULL' : '$14'}
-       ) RETURNING id`,
       embedStr === null
-        ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence]
-        : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt],
+        ? `INSERT INTO facts (
+             source_id, entity_slug, fact, kind, visibility, notability, context,
+             valid_from, valid_until, source, source_session, confidence,
+             embedding, embedded_at,
+             claim_metric, claim_value, claim_unit, claim_period
+           ) VALUES (
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+             NULL, NULL,
+             $13, $14, $15, $16
+           ) RETURNING id`
+        : `INSERT INTO facts (
+             source_id, entity_slug, fact, kind, visibility, notability, context,
+             valid_from, valid_until, source, source_session, confidence,
+             embedding, embedded_at,
+             claim_metric, claim_value, claim_unit, claim_period
+           ) VALUES (
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+             $13::vector, $14,
+             $15, $16, $17, $18
+           ) RETURNING id`,
+      embedStr === null
+        ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod]
+        : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
     );
     return { id: ins.rows[0].id, status: 'inserted' };
   }
@@ -2263,23 +2457,45 @@ export class PGLiteEngine implements BrainEngine {
         const embedding = input.embedding ?? null;
         const embeddedAt = embedding ? new Date() : null;
         const embedStr = embedding ? toPgVectorLiteral(embedding) : null;
+        // v0.35.4 (D-CDX-5) — typed-claim columns. All four nullable.
+        const claimMetric = input.claim_metric ?? null;
+        const claimValue  = input.claim_value  ?? null;
+        const claimUnit   = input.claim_unit   ?? null;
+        const claimPeriod = input.claim_period ?? null;
 
+        // Param-positional dispatch: embedStr presence shifts the trailing
+        // slots by one. Order of named slots stays stable across both
+        // branches: embedded_at, row_num, source_markdown_slug,
+        // claim_metric, claim_value, claim_unit, claim_period.
         const ins = await tx.query<{ id: number }>(
-          `INSERT INTO facts (
-             source_id, entity_slug, fact, kind, visibility, notability, context,
-             valid_from, valid_until, source, source_session, confidence,
-             embedding, embedded_at,
-             row_num, source_markdown_slug
-           ) VALUES (
-             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-             ${embedStr === null ? 'NULL' : `$13::vector`},
-             ${embedStr === null ? '$13' : '$14'},
-             ${embedStr === null ? '$14' : '$15'},
-             ${embedStr === null ? '$15' : '$16'}
-           ) RETURNING id`,
           embedStr === null
-            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embeddedAt, input.row_num, input.source_markdown_slug]
-            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, input.row_num, input.source_markdown_slug],
+            ? `INSERT INTO facts (
+                 source_id, entity_slug, fact, kind, visibility, notability, context,
+                 valid_from, valid_until, source, source_session, confidence,
+                 embedding, embedded_at,
+                 row_num, source_markdown_slug,
+                 claim_metric, claim_value, claim_unit, claim_period
+               ) VALUES (
+                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                 NULL, $13,
+                 $14, $15,
+                 $16, $17, $18, $19
+               ) RETURNING id`
+            : `INSERT INTO facts (
+                 source_id, entity_slug, fact, kind, visibility, notability, context,
+                 valid_from, valid_until, source, source_session, confidence,
+                 embedding, embedded_at,
+                 row_num, source_markdown_slug,
+                 claim_metric, claim_value, claim_unit, claim_period
+               ) VALUES (
+                 $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                 $13::vector, $14,
+                 $15, $16,
+                 $17, $18, $19, $20
+               ) RETURNING id`,
+          embedStr === null
+            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod]
+            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod],
         );
         out.push(ins.rows[0].id);
       }
@@ -2402,6 +2618,98 @@ export class PGLiteEngine implements BrainEngine {
       [source_id, entitySlug, k],
     );
     return result.rows.map(rowToFact);
+  }
+
+  async findTrajectory(opts: import('./engine.ts').TrajectoryOpts): Promise<import('./engine.ts').TrajectoryPoint[]> {
+    const limit = clampSearchLimit(opts.limit, 100, 500);
+    const sinceDate = opts.since ? new Date(opts.since) : null;
+    const untilDate = opts.until ? new Date(opts.until) : null;
+    const metric = opts.metric ?? null;
+    const useArray = Array.isArray(opts.sourceIds) && opts.sourceIds.length > 0;
+    const sourceIds = useArray ? opts.sourceIds! : null;
+    const sourceId = opts.sourceId ?? 'default';
+    const remoteFilter = opts.remote === true;
+
+    // Build SQL dynamically. PGLite uses $N positional params; we
+    // assemble the WHERE clauses + params array in tandem to keep them
+    // aligned. Final shape is single SELECT, ORDER BY (valid_from, id) ASC.
+    const where: string[] = [
+      useArray ? `source_id = ANY($1::text[])` : `source_id = $1`,
+      `entity_slug = $2`,
+      `expired_at IS NULL`,
+    ];
+    const params: unknown[] = [useArray ? sourceIds : sourceId, opts.entitySlug];
+    let p = 3;
+    if (remoteFilter) {
+      where.push(`visibility = 'world'`);
+    }
+    if (metric !== null) {
+      where.push(`claim_metric = $${p}`);
+      params.push(metric);
+      p += 1;
+    }
+    if (sinceDate) {
+      where.push(`valid_from >= $${p}`);
+      params.push(sinceDate);
+      p += 1;
+    }
+    if (untilDate) {
+      where.push(`valid_from <= $${p}`);
+      params.push(untilDate);
+      p += 1;
+    }
+    params.push(limit);
+    const limitPlaceholder = p;
+
+    const sqlText = `
+      SELECT id, valid_from,
+             claim_metric, claim_value, claim_unit, claim_period,
+             fact, source_session, source_markdown_slug,
+             embedding
+      FROM facts
+      WHERE ${where.join(' AND ')}
+      ORDER BY valid_from ASC, id ASC
+      LIMIT $${limitPlaceholder}
+    `;
+    const result = await this.db.query<{
+      id: number;
+      valid_from: Date | string;
+      claim_metric: string | null;
+      claim_value: number | null;
+      claim_unit: string | null;
+      claim_period: string | null;
+      fact: string;
+      source_session: string | null;
+      source_markdown_slug: string | null;
+      embedding: string | number[] | Float32Array | null;
+    }>(sqlText, params);
+
+    return result.rows.map(r => {
+      // Inline embedding parser — mirrors rowToFact() at line 3911.
+      let embedding: Float32Array | null = null;
+      if (r.embedding != null) {
+        if (r.embedding instanceof Float32Array) embedding = r.embedding;
+        else if (Array.isArray(r.embedding)) embedding = new Float32Array(r.embedding);
+        else if (typeof r.embedding === 'string') {
+          const trimmed = r.embedding.trim();
+          const inner = trimmed.startsWith('[') ? trimmed.slice(1, -1) : trimmed;
+          const parts = inner.split(',').map(s => parseFloat(s.trim())).filter(Number.isFinite);
+          embedding = parts.length > 0 ? new Float32Array(parts) : null;
+        }
+      }
+      return {
+        fact_id: Number(r.id),
+        valid_from: r.valid_from instanceof Date ? r.valid_from : new Date(r.valid_from),
+        metric: r.claim_metric,
+        value: r.claim_value === null ? null : Number(r.claim_value),
+        unit: r.claim_unit,
+        period: r.claim_period,
+        text: r.fact,
+        source_session: r.source_session,
+        source_markdown_slug: r.source_markdown_slug,
+        embedding,
+      };
+    });
   }
 
   async consolidateFact(id: number, takeId: number): Promise<void> {
@@ -3522,8 +3830,8 @@ export class PGLiteEngine implements BrainEngine {
       `INSERT INTO eval_candidates (
          tool_name, query, retrieved_slugs, retrieved_chunk_ids, source_ids,
          expand_enabled, detail, detail_resolved, vector_enabled, expansion_applied,
-         latency_ms, remote, job_id, subagent_id
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         latency_ms, remote, job_id, subagent_id, embedding_column
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
        RETURNING id`,
       [
         input.tool_name,
@@ -3540,6 +3848,7 @@ export class PGLiteEngine implements BrainEngine {
         input.remote,
         input.job_id,
         input.subagent_id,
+        input.embedding_column ?? null,
       ]
     );
     return rows[0]!.id;

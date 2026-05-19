@@ -34,9 +34,8 @@ const VOYAGE_OUTPUT_DIMENSION_MODELS = new Set([
 // Per Voyage's API docs (2026-05). Out-of-range requests are rejected with
 // HTTP 400 by the upstream — catching it locally produces a clearer error
 // with the valid-values hint. The most common way to hit this in
-// production: `embedding_model: voyage:voyage-4-large` configured without
-// `embedding_dimensions`, where the gateway falls back to
-// DEFAULT_EMBEDDING_DIMENSIONS=1536 (an OpenAI default, not a Voyage one).
+// production: `embedding_model: voyage:voyage-4-large` configured with an
+// invalid `embedding_dimensions` value inherited from another provider.
 export const VOYAGE_VALID_OUTPUT_DIMS = [256, 512, 1024, 2048] as const;
 
 export function supportsVoyageOutputDimension(modelId: string): boolean {
@@ -51,9 +50,10 @@ export function isValidVoyageOutputDim(dims: number): boolean {
 // from zerank-2 (Matryoshka-style); smaller dims trade quality for storage.
 // ZE rejects any other value with HTTP 400; catching it locally produces a
 // clearer error with the valid-values hint. Same failure mode as the Voyage
-// case: `embedding_model: zeroentropyai:zembed-1` configured without
-// `embedding_dimensions` falls back to DEFAULT_EMBEDDING_DIMENSIONS=1536
-// (an OpenAI default), which ZE doesn't accept.
+// case: `embedding_model: zeroentropyai:zembed-1` configured without a
+// compatible `embedding_dimensions` falls back to the downstream default,
+// which ZE doesn't accept unless the brain has explicitly opted into a valid
+// ZE dimension.
 const ZEROENTROPY_DIM_MODELS = new Set(['zembed-1']);
 export const ZEROENTROPY_VALID_DIMS = [2560, 1280, 640, 320, 160, 80, 40] as const;
 
@@ -63,6 +63,31 @@ export function supportsZeroEntropyDimension(modelId: string): boolean {
 
 export function isValidZeroEntropyDim(dims: number): boolean {
   return (ZEROENTROPY_VALID_DIMS as readonly number[]).includes(dims);
+}
+
+// v0.36.0.0 (D13): OpenAI text-embedding-3-* accepts arbitrary truncation via
+// Matryoshka — any positive integer up to the model's native size. When a
+// brain is configured with `embedding_dimensions` OUTSIDE that range, OpenAI
+// returns HTTP 400 at first embed. We catch it locally with a paste-ready
+// fix so users don't see opaque "vector dimension mismatch" errors after
+// `gbrain ze-switch --undo` lands them on OpenAI at the wrong dim.
+const OPENAI_TEXT3_MAX_DIMS: Record<string, number> = {
+  'text-embedding-3-small': 1536,
+  'text-embedding-3-large': 3072,
+};
+
+export function isOpenAITextEmbedding3Model(modelId: string): boolean {
+  return modelId in OPENAI_TEXT3_MAX_DIMS;
+}
+
+export function maxOpenAITextEmbedding3Dim(modelId: string): number | undefined {
+  return OPENAI_TEXT3_MAX_DIMS[modelId];
+}
+
+export function isValidOpenAITextEmbedding3Dim(modelId: string, dims: number): boolean {
+  const max = OPENAI_TEXT3_MAX_DIMS[modelId];
+  if (max === undefined) return false;
+  return Number.isInteger(dims) && dims >= 1 && dims <= max;
 }
 
 /**
@@ -95,6 +120,17 @@ export function dimsProviderOptions(
       // text-embedding-3-* supports dimensions; text-embedding-ada-002 does not.
       // OpenAI embeddings are symmetric — inputType ignored.
       if (modelId.startsWith('text-embedding-3')) {
+        // v0.36.0.0 (D13): fail-loud when configured dim is outside the
+        // model's Matryoshka range. OpenAI returns HTTP 400 otherwise with
+        // a generic message that misroutes as a network blip.
+        if (isOpenAITextEmbedding3Model(modelId) && !isValidOpenAITextEmbedding3Dim(modelId, dims)) {
+          const max = maxOpenAITextEmbedding3Dim(modelId)!;
+          throw new AIConfigError(
+            `OpenAI model "${modelId}" supports embedding_dimensions in 1..${max}, got ${dims}.`,
+            `Set \`embedding_dimensions\` to a value between 1 and ${max} ` +
+            `(\`gbrain config set embedding_dimensions ${Math.min(1024, max)}\` is a common default).`,
+          );
+        }
         return { openai: { dimensions: dims } };
       }
       return undefined;
@@ -136,10 +172,7 @@ export function dimsProviderOptions(
       // When threaded explicitly by embedQuery()/embed(), it reaches Voyage.
       if (supportsVoyageOutputDimension(modelId)) {
         // Fail-loud at the embed boundary if the user configured a dim
-        // Voyage doesn't accept. The most common path here: a brain with
-        // `embedding_model: voyage:voyage-4-large` but no explicit
-        // `embedding_dimensions`, where the gateway falls back to the
-        // module default (1536). Without this guard, Voyage's HTTP 400 is
+        // Voyage doesn't accept. Without this guard, Voyage's HTTP 400 is
         // the only signal — usually mis-attributed as a transient network
         // error.
         if (!isValidVoyageOutputDim(dims)) {
@@ -164,7 +197,16 @@ export function dimsProviderOptions(
       // for `-large`, 1536 for `-small`); without `dimensions`, brains
       // configured for a smaller width (e.g. 1536) hard-fail at first embed.
       // Azure/OpenAI-compat embeddings are symmetric — inputType ignored.
+      // v0.36.0.0 (D13): same range validation as native-openai path.
       if (modelId.startsWith('text-embedding-3')) {
+        if (isOpenAITextEmbedding3Model(modelId) && !isValidOpenAITextEmbedding3Dim(modelId, dims)) {
+          const max = maxOpenAITextEmbedding3Dim(modelId)!;
+          throw new AIConfigError(
+            `OpenAI model "${modelId}" supports embedding_dimensions in 1..${max}, got ${dims}.`,
+            `Set \`embedding_dimensions\` to a value between 1 and ${max} ` +
+            `(\`gbrain config set embedding_dimensions ${Math.min(1024, max)}\` is a common default).`,
+          );
+        }
         return { openaiCompatible: { dimensions: dims } };
       }
       // DashScope text-embedding-v3 (Matryoshka 64-1024) and Zhipu

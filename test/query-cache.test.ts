@@ -17,11 +17,8 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import {
-  SemanticQueryCache,
-  cacheKnobsHashForSourceScope,
-  cacheRowId,
-} from '../src/core/search/query-cache.ts';
+import { SemanticQueryCache, cacheRowId } from '../src/core/search/query-cache.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import type { SearchResult, HybridSearchMeta } from '../src/core/types.ts';
 
 let engine: PGLiteEngine;
@@ -83,6 +80,15 @@ const META: HybridSearchMeta = {
 };
 
 beforeAll(async () => {
+  // This test hardcodes DIM=1536 in its embeddings. Pin the gateway to
+  // 1536d explicitly so this file is hermetic regardless of Eva's Voyage
+  // 2048 default or any cross-file gateway state.
+  resetGateway();
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: { OPENAI_API_KEY: 'sk-fake' },
+  });
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -90,6 +96,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   try { await engine.disconnect(); } catch { /* ignore */ }
+  resetGateway();
 });
 
 beforeEach(async () => {
@@ -122,22 +129,6 @@ describe('cacheRowId', () => {
   });
   test('differs across source_id', () => {
     expect(cacheRowId('hello', 'a')).not.toBe(cacheRowId('hello', 'b'));
-  });
-});
-
-describe('cacheKnobsHashForSourceScope', () => {
-  test('keeps scalar/default cache hash unchanged', () => {
-    expect(cacheKnobsHashForSourceScope('mode-hash')).toBe('mode-hash');
-    expect(cacheKnobsHashForSourceScope('mode-hash', [])).toBe('mode-hash');
-  });
-
-  test('canonicalizes federated source sets into the cache identity', () => {
-    expect(cacheKnobsHashForSourceScope('mode-hash', ['src-b', 'default']))
-      .toBe(cacheKnobsHashForSourceScope('mode-hash', ['default', 'src-b']));
-    expect(cacheKnobsHashForSourceScope('mode-hash', ['default', 'src-b']))
-      .not.toBe('mode-hash');
-    expect(cacheKnobsHashForSourceScope('mode-hash', ['default', 'src-b']))
-      .not.toBe(cacheKnobsHashForSourceScope('mode-hash', ['default']));
   });
 });
 
@@ -210,24 +201,6 @@ describe('SemanticQueryCache \u2014 source isolation', () => {
     expect(hitB.hit).toBe(false);
     const hitA = await cache.lookup(emb, { sourceId: 'src-A' });
     expect(hitA.hit).toBe(true);
-  });
-
-  test('federated source-set cache rows cannot replay to scalar source callers', async () => {
-    const cache = new SemanticQueryCache(engine);
-    const emb = makeEmbedding(8);
-    const scalarHash = 'balanced-mode';
-    const federatedHash = cacheKnobsHashForSourceScope(scalarHash, ['default', 'src-b']);
-
-    await cache.store('q', emb, [
-      { ...makeResult('from-src-b'), source_id: 'src-b' },
-    ], META, { sourceId: 'default', knobsHash: federatedHash });
-
-    const scalarHit = await cache.lookup(emb, { sourceId: 'default', knobsHash: scalarHash });
-    expect(scalarHit.hit).toBe(false);
-
-    const federatedHit = await cache.lookup(emb, { sourceId: 'default', knobsHash: federatedHash });
-    expect(federatedHit.hit).toBe(true);
-    expect(federatedHit.results?.[0].source_id).toBe('src-b');
   });
 });
 

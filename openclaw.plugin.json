@@ -1,7 +1,7 @@
 {
   "id": "gbrain",
   "name": "gbrain",
-  "version": "0.35.1.1",
+  "version": "0.36.5.0",
   "description": "Eva Brain/GBrain skills and personal knowledge brain with provider-neutral hybrid search",
   "family": "bundle-plugin",
   "configSchema": {
@@ -55,6 +55,7 @@
     "skills/skillify",
     "skills/skillpack-check",
     "skills/smoke-test",
+    "skills/skillpack-harvest",
     "skills/soul-audit",
     "skills/strategic-reading",
     "skills/testing",
@@ -65,6 +66,7 @@
   ],
   "shared_deps": [
     "skills/conventions",
+    "skills/_AGENT_README.md",
     "skills/_brain-filing-rules.md",
     "skills/_brain-filing-rules.json",
     "skills/_output-rules.md"

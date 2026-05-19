@@ -94,6 +94,23 @@ export interface ModeBundle {
   reranker_top_n_out: number | null;
   /** HTTP timeout in ms (default 5000). Threaded into gateway.rerank. */
   reranker_timeout_ms: number;
+  /**
+   * v0.35.6.0 — floor-ratio gate for metadata-axis boost stages (backlink,
+   * salience, recency). `undefined` = no gate (default for all three modes;
+   * preserves prior behavior bit-for-bit). When set to a number in [0, 1],
+   * each gated stage skips results whose score is below
+   * `floorRatio * topScore`, where topScore is computed ONCE at
+   * runPostFusionStages entry from the post-cosine-rescore snapshot.
+   *
+   * Sensible operator override values for dense-embedder corpora: 0.85-0.95.
+   * Default stays undefined until per-corpus ablation evidence supports a
+   * mode-level default. See `TODOS.md` floor-ratio ablation entry.
+   *
+   * Scoped to the three metadata boost stages — exact-match boost
+   * (intent-weights.applyExactMatchBoost) runs independently as a lexical
+   * relevance signal and is NOT gated.
+   */
+  floor_ratio: number | undefined;
 }
 
 /**
@@ -119,6 +136,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     reranker_top_n_in: 30,
     reranker_top_n_out: null,
     reranker_timeout_ms: 5000,
+    // v0.35.6.0 — undefined for all three bundles; the per-corpus ablation
+    // (TODOS.md) gates any default flip.
+    floor_ratio: undefined,
   }),
   balanced: Object.freeze({
     cache_enabled: true,
@@ -128,14 +148,22 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     tokenBudget: 12000,
     expansion: false,
     searchLimit: 25,
-    // Off in balanced too — operators opt in via
-    // `gbrain config set search.reranker.enabled true` until eval data
-    // backs a mode-bundle default change.
-    reranker_enabled: false,
+    // v0.36.0.0 (D6): reranker flipped ON for `balanced` mode bundle. The
+    // real-corpus benchmark shows zerank-2 reshuffles 60% of top-1 results
+    // — the headline ZE quality story reaches the 80% of installs that
+    // stay on `balanced`. Per-query rerank cost ~$0.025/M tokens, ~150ms
+    // p50 added latency. Missing ZEROENTROPY_API_KEY is handled via
+    // src/core/search/rerank.ts fail-open contract: log to audit JSONL,
+    // return input order unchanged. Opt out with
+    // `gbrain config set search.reranker.enabled false`.
+    reranker_enabled: true,
     reranker_model: 'zeroentropyai:zerank-2',
     reranker_top_n_in: 30,
     reranker_top_n_out: null,
     reranker_timeout_ms: 5000,
+    // v0.35.6.0 — undefined for all three bundles; the per-corpus ablation
+    // (TODOS.md) gates any default flip.
+    floor_ratio: undefined,
   }),
   tokenmax: Object.freeze({
     cache_enabled: true,
@@ -155,6 +183,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     reranker_top_n_in: 30,
     reranker_top_n_out: null,
     reranker_timeout_ms: 5000,
+    // v0.35.6.0 — undefined for all three bundles; the per-corpus ablation
+    // (TODOS.md) gates any default flip.
+    floor_ratio: undefined,
   }),
 });
 
@@ -186,6 +217,8 @@ export interface SearchKeyOverrides {
   // number | undefined.
   reranker_top_n_out?: number | null;
   reranker_timeout_ms?: number;
+  // v0.35.6.0 — floor-ratio gate override.
+  floor_ratio?: number;
 }
 
 /**
@@ -209,6 +242,8 @@ export interface SearchPerCallOpts {
   reranker_top_n_in?: number;
   reranker_top_n_out?: number | null;
   reranker_timeout_ms?: number;
+  // v0.35.6.0 — floor-ratio per-call override.
+  floor_ratio?: number;
 }
 
 /**
@@ -267,6 +302,8 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     reranker_top_n_in: pick('reranker_top_n_in'),
     reranker_top_n_out: pick('reranker_top_n_out'),
     reranker_timeout_ms: pick('reranker_timeout_ms'),
+    // v0.35.6.0 — floor-ratio resolved via the same pick chain.
+    floor_ratio: pick('floor_ratio'),
     resolved_mode,
     mode_valid: valid,
   };
@@ -317,19 +354,42 @@ export function attributeKnob<K extends keyof ModeBundle>(
  */
 // v0.35.0.0+ bump 1→2: reranker fields participate in the cache key so a
 // tokenmax-with-reranker write can't be served to a reranker-off lookup.
+// v0.35.6.0   bump 2→3: floor_ratio participates so a floor-on write can't
+// be served to a floor-off lookup (cross-floor contamination, codex T1).
 // CDX2-F13 convention: under a version bump, additions are APPEND-ONLY at
 // the end of `parts[]` — reordering existing fields would silently rebuild
 // the hash for every existing row.
 //
 // CDX2-F12 mid-deploy duplicate-row note: because `cacheRowId()` (in
-// src/core/search/query-cache.ts) includes knobsHash, a v=1 process and a
-// v=2 process writing the same `(source_id, query_text)` produce DISTINCT
+// src/core/search/query-cache.ts) includes knobsHash, a v=2 process and a
+// v=3 process writing the same `(source_id, query_text)` produce DISTINCT
 // row IDs. Expect a temporary hit-rate dip + cache-row doubling for hot
 // queries during a rolling deploy. Clears naturally within
 // `cache.ttl_seconds` (default 3600s). The CHANGELOG note covers this.
-export const KNOBS_HASH_VERSION = 2;
+export const KNOBS_HASH_VERSION = 3;
 
-export function knobsHash(knobs: ResolvedSearchKnobs): string {
+/**
+ * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
+ * embedding column + provider live OUTSIDE ResolvedSearchKnobs because
+ * they're orthogonal to search mode (mode bundles don't pick columns).
+ * Passing them as a second argument keeps ModeBundle pure and lets the
+ * hash invalidate correctly across column/provider switches.
+ *
+ * When undefined, the hash falls back to the legacy 'embedding' /
+ * 'default' values so unrelated callers (eval-replay, telemetry) that
+ * don't know the column produce a stable hash for the default case.
+ */
+export interface KnobsHashContext {
+  /** Resolved column name, e.g. 'embedding', 'embedding_voyage'. */
+  embeddingColumn?: string;
+  /** Resolved provider:model, e.g. 'voyage:voyage-3-large'. */
+  embeddingModel?: string;
+}
+
+export function knobsHash(
+  knobs: ResolvedSearchKnobs,
+  ctx?: KnobsHashContext,
+): string {
   // Fixed-order key list. Adding a knob here REQUIRES bumping
   // KNOBS_HASH_VERSION and is a breaking change for any persisted cache.
   const parts = [
@@ -348,6 +408,20 @@ export function knobsHash(knobs: ResolvedSearchKnobs): string {
     `rri=${knobs.reranker_top_n_in}`,
     `rro=${knobs.reranker_top_n_out ?? 'none'}`,
     `rrt=${knobs.reranker_timeout_ms}`,
+    // v=3 additions (append-only). Both contributions landed under v=3:
+    //
+    //   floor_ratio (v0.35.6.0 / codex T1): a floor-on write must not be
+    //     served to a floor-off lookup. 4-decimal precision so 0.85 and
+    //     0.851 produce different hashes; undefined uses literal 'none'.
+    //
+    //   col + prov (v0.36 / D8 / CDX-2): cross-column + cross-provider
+    //     cache contamination. A query against `embedding_voyage` must
+    //     NEVER be served from a cache row that ran against `embedding`
+    //     — they sit in different vector spaces. ctx is optional so
+    //     unrelated callers fall back to the default-column hash.
+    `fr=${knobs.floor_ratio === undefined ? 'none' : knobs.floor_ratio.toFixed(4)}`,
+    `col=${ctx?.embeddingColumn ?? 'embedding'}`,
+    `prov=${ctx?.embeddingModel ?? 'default'}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
@@ -435,6 +509,16 @@ export function loadOverridesFromConfig(
     if (Number.isFinite(n) && n > 0) out.reranker_timeout_ms = n;
   }
 
+  // v0.35.6.0 — floor-ratio config key. Accepts a number in [0, 1]; values
+  // outside that range silently fall through (no override applied). The
+  // runtime computeFloorThreshold also guards against out-of-range so a
+  // malformed value never gates anything — defense in depth.
+  const fr = get('search.floor_ratio');
+  if (fr !== undefined) {
+    const n = parseFloat(fr);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) out.floor_ratio = n;
+  }
+
   return out;
 }
 
@@ -453,6 +537,8 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.reranker.top_n_in',
   'search.reranker.top_n_out',
   'search.reranker.timeout_ms',
+  // v0.35.6.0 — floor-ratio gate
+  'search.floor_ratio',
 ]);
 
 /**
