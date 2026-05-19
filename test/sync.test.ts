@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
-import { buildSyncManifest, isSyncable, pathToSlug } from '../src/core/sync.ts';
-import { buildGitInvocation } from '../src/commands/sync.ts';
+import { buildSyncManifest, isSyncable, pathToSlug, pruneDir, isCodeFilePath } from '../src/core/sync.ts';
+import { buildAutoEmbedArgs, buildGitInvocation } from '../src/commands/sync.ts';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
@@ -103,6 +103,81 @@ describe('isSyncable', () => {
   test('rejects ops/ directory', () => {
     expect(isSyncable('ops/deploy-log.md')).toBe(false);
     expect(isSyncable('ops/config.md')).toBe(false);
+  });
+
+  // ────────────────────────────────────────────────────────────────
+  // v0.36 walker drift fix (closes #923, #202): node_modules exclusion
+  // ────────────────────────────────────────────────────────────────
+
+  test('CRITICAL latent-bug regression: rejects node_modules paths at any depth', () => {
+    // Pre-v0.36, isSyncable had no node_modules check. Any markdown file
+    // under a non-dot `node_modules` directory slipped through. This is
+    // the canonical latent-bug fix gated by IRON RULE per the wave plan.
+    expect(isSyncable('node_modules/some-pkg/README.md')).toBe(false);
+    expect(isSyncable('node_modules/some-pkg/CHANGELOG.md')).toBe(false);
+    expect(isSyncable('node_modules/some-pkg/docs/api.md')).toBe(false);
+    expect(isSyncable('apps/web/node_modules/dep/notes.md')).toBe(false);
+  });
+});
+
+describe('pruneDir', () => {
+  test('blocks node_modules (no leading dot, the latent-bug case)', () => {
+    expect(pruneDir('node_modules')).toBe(false);
+  });
+
+  test('blocks dot-prefix dirs (.git, .obsidian, .raw, .cache, etc.)', () => {
+    expect(pruneDir('.git')).toBe(false);
+    expect(pruneDir('.obsidian')).toBe(false);
+    expect(pruneDir('.raw')).toBe(false);
+    expect(pruneDir('.cache')).toBe(false);
+    expect(pruneDir('.vscode')).toBe(false);
+  });
+
+  test('blocks ops (gbrain operational dir)', () => {
+    expect(pruneDir('ops')).toBe(false);
+  });
+
+  test('blocks *.raw sidecar dirs (gbrain convention)', () => {
+    expect(pruneDir('.raw')).toBe(false);
+    expect(pruneDir('pedro.raw')).toBe(false);
+    expect(pruneDir('article.raw')).toBe(false);
+  });
+
+  test('allows normal content dirs', () => {
+    expect(pruneDir('wiki')).toBe(true);
+    expect(pruneDir('people')).toBe(true);
+    expect(pruneDir('meetings')).toBe(true);
+    expect(pruneDir('corpus')).toBe(true);
+    expect(pruneDir('2026')).toBe(true);
+  });
+
+  test('empty string returns true (defensive default)', () => {
+    expect(pruneDir('')).toBe(true);
+  });
+});
+
+describe('isCodeFilePath', () => {
+  test('v0.36.x #878 regression: Terraform / HCL extensions are admitted', () => {
+    expect(isCodeFilePath('infra/main.tf')).toBe(true);
+    expect(isCodeFilePath('infra/prod.tfvars')).toBe(true);
+    expect(isCodeFilePath('modules/network/variables.hcl')).toBe(true);
+  });
+
+  test('extensions are case-insensitive', () => {
+    expect(isCodeFilePath('INFRA/MAIN.TF')).toBe(true);
+    expect(isCodeFilePath('Modules/Net/Vars.HCL')).toBe(true);
+  });
+
+  test('does not false-positive on lookalike suffixes', () => {
+    expect(isCodeFilePath('docs/notes.txt')).toBe(false);
+    expect(isCodeFilePath('readme.tflint')).toBe(false);
+    expect(isCodeFilePath('config.hcling')).toBe(false);
+  });
+
+  test('still accepts the v0.20.0 baseline set (regression guard)', () => {
+    expect(isCodeFilePath('src/foo.ts')).toBe(true);
+    expect(isCodeFilePath('src/bar.py')).toBe(true);
+    expect(isCodeFilePath('config.toml')).toBe(true);
   });
 });
 
@@ -343,6 +418,26 @@ describe('performSync dry-run never writes', () => {
     );
     expect(rows[0].last_commit).toBe(head);
     expect(new Date(rows[0].last_sync_at as string).getTime()).toBeGreaterThan(new Date(staleIso).getTime());
+  });
+
+  test('first sync without origin skips git pull noise and uses local working tree', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const messages: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => { messages.push(args.map(String).join(' ')); };
+    try {
+      const result = await performSync(engine, {
+        repoPath,
+        noEmbed: true,
+      });
+      expect(result.status).toBe('first_sync');
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(messages.some(m => m.includes('No origin remote') && m.includes('skipping git pull'))).toBe(true);
+    expect(messages.some(m => m.includes('sync.git_pull start'))).toBe(false);
+    expect(messages.some(m => m.includes('git pull failed'))).toBe(false);
   });
 
   test('incremental dry-run does NOT write to DB or advance the bookmark', async () => {
@@ -639,7 +734,22 @@ describe('source-scoped sync wiring guards', () => {
     const source = readFileSync(join(process.cwd(), 'src/commands/sync.ts'), 'utf-8');
     expect(source).toContain("source_id: opts.sourceId ?? 'default'");
     expect(source).toContain('engine.getPage(slug, { sourceId: factsSourceId })');
-    expect(source).toContain("['--source', opts.sourceId, '--slugs'");
     expect(source).toContain("['--stale', '--source', opts.sourceId]");
+    expect(source).toContain('buildAutoEmbedArgs(pagesAffected, opts.sourceId)');
+  });
+});
+
+describe('sync auto-embed arguments', () => {
+  test('scopes incremental source sync embedding to the same source', () => {
+    expect(buildAutoEmbedArgs(['hello-js'], 'source-a')).toEqual([
+      '--source',
+      'source-a',
+      '--slugs',
+      'hello-js',
+    ]);
+  });
+
+  test('keeps default-source sync embed arguments unchanged', () => {
+    expect(buildAutoEmbedArgs(['people/alice'])).toEqual(['--slugs', 'people/alice']);
   });
 });

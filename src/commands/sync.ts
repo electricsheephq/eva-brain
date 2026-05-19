@@ -34,7 +34,7 @@ import { loadStorageConfig } from '../core/storage-config.ts';
 import { getDefaultSourcePath } from '../core/source-resolver.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
 
-const DEFAULT_EMBEDDING_MODEL = 'openai:text-embedding-3-large';
+const DEFAULT_EMBEDDING_MODEL = 'voyage:voyage-4-large';
 
 export interface SyncResult {
   status: 'up_to_date' | 'synced' | 'first_sync' | 'dry_run' | 'blocked_by_failures';
@@ -244,6 +244,10 @@ export function buildGitInvocation(repoPath: string, args: string[], configs: st
   return [...cfg, '-C', repoPath, ...args];
 }
 
+export function buildAutoEmbedArgs(slugs: string[], sourceId?: string): string[] {
+  return sourceId ? ['--source', sourceId, '--slugs', ...slugs] : ['--slugs', ...slugs];
+}
+
 /**
  * Shell out to git with a generous maxBuffer.
  *
@@ -260,6 +264,19 @@ function git(repoPath: string, args: string[], configs: string[] = []): string {
     timeout: 30000,
     maxBuffer: 100 * 1024 * 1024,
   }).trim();
+}
+
+function hasOriginRemote(repoPath: string): boolean {
+  try {
+    execFileSync('git', buildGitInvocation(repoPath, ['remote', 'get-url', 'origin']), {
+      encoding: 'utf-8',
+      timeout: 30000,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isDetachedHead(repoPath: string): boolean {
@@ -482,7 +499,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // hardening that cloneRepo applies. Route through pullRepo from
   // git-remote.ts so the flag set is consistent across initial clone and
   // ongoing pulls — single source of truth for the defensive flags.
-  if (!opts.noPull && !detachedHead) {
+  const originRemotePresent = !opts.noPull && !detachedHead ? hasOriginRemote(repoPath) : false;
+  if (!opts.noPull && !detachedHead && !originRemotePresent) {
+    console.error(`No origin remote on ${repoPath}; skipping git pull. Syncing from local working tree.`);
+  }
+
+  if (!opts.noPull && !detachedHead && originRemotePresent) {
     const _t0 = Date.now();
     console.error(`[gbrain phase] sync.git_pull start`);
     try {
@@ -1003,10 +1025,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   if (!noEmbed && pagesAffected.length > 0 && pagesAffected.length <= 100) {
     try {
       const { runEmbed } = await import('./embed.ts');
-      const embedArgs = opts.sourceId
-        ? ['--source', opts.sourceId, '--slugs', ...pagesAffected]
-        : ['--slugs', ...pagesAffected];
-      const result = await runEmbed(engine, embedArgs);
+      const result = await runEmbed(engine, buildAutoEmbedArgs(pagesAffected, opts.sourceId));
       // Before commit 2 lands: runEmbed is void. Best estimate is pagesAffected,
       // since runEmbed re-embeds every requested slug. Commit 2 sharpens this
       // with EmbedResult.embedded.
@@ -1426,17 +1445,35 @@ export function manageGitignore(
     return;
   }
 
-  // D49: submodule detection. In a submodule, `.git` is a regular file
-  // (containing `gitdir: ../path/to/parent.git/modules/x`), not a directory.
+  // Submodule + worktree detection (closes #889 misclassification).
+  // Both submodules and worktrees use `.git` as a FILE (not a directory), so
+  // statSync.isFile() doesn't discriminate. Discriminator is the gitdir path
+  // segment:
+  //   - submodule: gitdir contains `/modules/<name>` (skip — managed by parent)
+  //   - worktree:  gitdir contains `/worktrees/<name>` (MANAGE — first-class repo)
+  // Both contracts are documented Git internal layouts and stable across all 4
+  // {relative, absolute} × {modules, worktrees} combinations, including the
+  // absorbed-submodule case from `git submodule absorbgitdirs`.
+  // Malformed `.git` file (no `gitdir:` prefix, unreadable) → MANAGE (fail-closed
+  // toward managing, preserving the pre-#889 catch{} behavior).
   const dotGit = join(repoPath, '.git');
   if (existsSync(dotGit)) {
     try {
       if (statSync(dotGit).isFile()) {
-        console.warn(
-          `Note: skipping .gitignore management — ${repoPath} is a git submodule. ` +
-            `Add db_only directories to your parent repo's .gitignore manually.`,
-        );
-        return;
+        const content = readFileSync(dotGit, 'utf-8');
+        const match = content.match(/gitdir:\s*(.+)/);
+        const gitdir = match ? match[1].trim() : '';
+        if (gitdir.includes('/modules/')) {
+          console.warn(
+            `Note: skipping .gitignore management — ${repoPath} is a git submodule. ` +
+              `Add db_only directories to your parent repo's .gitignore manually.`,
+          );
+          return;
+        }
+        // Worktree (gitdir contains /worktrees/) OR malformed .git falls through
+        // to the existing manage path. Worktrees are first-class repos — they
+        // need .gitignore management too. Malformed → MANAGE preserves the
+        // pre-#889 fail-closed-toward-managing catch behavior.
       }
     } catch {
       // proceed; can't tell, default to managing

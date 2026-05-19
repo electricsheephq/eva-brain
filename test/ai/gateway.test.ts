@@ -32,10 +32,10 @@ describe('gateway configuration', () => {
     expect(getExpansionModel()).toBe('anthropic:claude-haiku-4-5-20251001');
   });
 
-  test('defaults preserve v0.13 OpenAI behavior', () => {
+  test('Eva defaults are Voyage 4 Large 2048d; ZE remains opt-in via ze-switch', () => {
     configureGateway({ env: {} });
-    expect(getEmbeddingModel()).toBe('openai:text-embedding-3-large');
-    expect(getEmbeddingDimensions()).toBe(1536);
+    expect(getEmbeddingModel()).toBe('voyage:voyage-4-large');
+    expect(getEmbeddingDimensions()).toBe(2048);
     expect(getExpansionModel()).toBe('anthropic:claude-haiku-4-5-20251001');
   });
 });
@@ -318,12 +318,12 @@ describe('Voyage OOM-cap: too-large response throws (Codex P3 follow-up)', () =>
 
 // ─────────────────────────────────────────────────────────────────────
 // Voyage flexible-dim runtime validation (Codex P3 follow-up after PR #962).
-// The bug class: brain configured for Voyage flexible-dim model without
-// `embedding_dimensions` → gateway falls back to DEFAULT 1536 → Voyage
-// HTTP 400. Catch it at the embed-call boundary with a clear AIConfigError.
+// The bug class: brain configured for a Voyage flexible-dim model with an
+// invalid `embedding_dimensions` value → Voyage HTTP 400. Catch it at the
+// embed-call boundary with a clear AIConfigError.
 // ─────────────────────────────────────────────────────────────────────
 describe('Voyage flexible-dim runtime validation', () => {
-  test('rejects 1536 (the default that bites Voyage-first users) with AIConfigError', () => {
+  test('rejects 1536 with AIConfigError', () => {
     expect(() => dimsProviderOptions('openai-compatible', 'voyage-4-large', 1536))
       .toThrow(AIConfigError);
     expect(() => dimsProviderOptions('openai-compatible', 'voyage-4-large', 1536))
@@ -376,5 +376,76 @@ describe('Voyage flexible-dim runtime validation', () => {
     expect(caught?.fix).toContain('embedding_dimensions');
     expect(caught?.fix).toContain('256');
     expect(caught?.fix).toContain('2048');
+  });
+});
+
+describe('embedding response integrity', () => {
+  beforeEach(() => resetGateway());
+
+  test('rejects partial embedding responses instead of silently dropping rows', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      object: 'list',
+      data: [
+        {
+          object: 'embedding',
+          index: 0,
+          embedding: new Array(1536).fill(0.01),
+        },
+      ],
+      model: 'text-embedding-3-large',
+      usage: { prompt_tokens: 3, total_tokens: 3 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch;
+
+    try {
+      configureGateway({
+        embedding_model: 'openai:text-embedding-3-large',
+        embedding_dimensions: 1536,
+        env: { OPENAI_API_KEY: 'openai-fake' },
+      });
+
+      await expect(embed(['first', 'second'])).rejects.toThrow('1 embedding(s) for 2 input(s)');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('checks every returned vector dimension, not just the first one', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      object: 'list',
+      data: [
+        {
+          object: 'embedding',
+          index: 0,
+          embedding: new Array(1536).fill(0.01),
+        },
+        {
+          object: 'embedding',
+          index: 1,
+          embedding: new Array(768).fill(0.01),
+        },
+      ],
+      model: 'text-embedding-3-large',
+      usage: { prompt_tokens: 3, total_tokens: 3 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })) as unknown as typeof fetch;
+
+    try {
+      configureGateway({
+        embedding_model: 'openai:text-embedding-3-large',
+        embedding_dimensions: 1536,
+        env: { OPENAI_API_KEY: 'openai-fake' },
+      });
+
+      await expect(embed(['first', 'second'])).rejects.toThrow('returned 768 but schema expects 1536');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

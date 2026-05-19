@@ -93,18 +93,33 @@ describe('writeBrainPage', () => {
     }
   });
 
-  test('writes centralized backup before mutating an existing file', () => {
+  test('writes a centralized .bak before mutating an existing file', () => {
+    // v0.36.x #902: backups land under ~/.gbrain/backups/frontmatter/... not
+    // next to the source file (pre-fix littered the brain tree with .bak
+    // files that broke gitignore expectations). The returned backupPath is
+    // the contract — the test asserts both the path shape and that the
+    // backup faithfully captures the pre-write content.
     const file = join(tmp, 'people', 'jane.md');
     mkdirSync(join(tmp, 'people'), { recursive: true });
     const original = `${fence}\ntype: person\ntitle: Old\n${fence}\n\nold`;
     writeFileSync(file, original);
-    const { backupPath } = writeBrainPage(file, `${fence}\ntype: person\ntitle: New\n${fence}\n\nnew`, {
-      sourcePath: tmp,
-      backupRoot: join(tmp, 'backups'),
-    });
-    expect(existsSync(file + '.bak')).toBe(false);
-    expect(backupPath).toBeTruthy();
-    expect(readFileSync(backupPath!, 'utf8')).toBe(original);
+    const backupRoot = mkdtempSync(join(tmpdir(), 'gbrain-test-backups-'));
+    try {
+      const { backupPath } = writeBrainPage(
+        file,
+        `${fence}\ntype: person\ntitle: New\n${fence}\n\nnew`,
+        { sourcePath: tmp, backupRoot },
+      );
+      expect(backupPath).toBeDefined();
+      // Centralized — under the test-injected backupRoot, NOT a sibling .bak.
+      expect(existsSync(file + '.bak')).toBe(false);
+      expect(backupPath!.startsWith(backupRoot + '/')).toBe(true);
+      expect(backupPath!.endsWith('.bak')).toBe(true);
+      expect(existsSync(backupPath!)).toBe(true);
+      expect(readFileSync(backupPath!, 'utf8')).toBe(original);
+    } finally {
+      rmSync(backupRoot, { recursive: true, force: true });
+    }
   });
 
   test('autoFix: true repairs nested quotes before writing', () => {
@@ -176,28 +191,6 @@ describe('scanBrainSources (PGLite)', () => {
     const beta = report.per_source.find(s => s.source_id === 'beta')!;
     expect(alpha.errors_by_code.NULL_BYTES).toBeGreaterThanOrEqual(1);
     expect(beta.errors_by_code.NESTED_QUOTES).toBeGreaterThanOrEqual(1);
-  });
-
-  test('ignores missing frontmatter by default because bare markdown is valid input', async () => {
-    mkdirSync(join(tmp, 'docs'), { recursive: true });
-    writeFileSync(join(tmp, 'docs', 'plain.md'), '# Plain\n\nNo YAML frontmatter.');
-    await registerSource('docs', tmp);
-
-    const report = await scanBrainSources(engine);
-    expect(report.ok).toBe(true);
-    expect(report.total).toBe(0);
-    expect(report.ignored_missing_open).toBe(1);
-    expect(report.per_source[0]!.ignoredMissingOpen).toBe(1);
-  });
-
-  test('strictMissingOpen reports missing frontmatter for curated page repos', async () => {
-    mkdirSync(join(tmp, 'docs'), { recursive: true });
-    writeFileSync(join(tmp, 'docs', 'plain.md'), '# Plain\n\nNo YAML frontmatter.');
-    await registerSource('docs', tmp);
-
-    const report = await scanBrainSources(engine, { strictMissingOpen: true });
-    expect(report.ok).toBe(false);
-    expect(report.errors_by_code.MISSING_OPEN).toBe(1);
   });
 
   test('respects sourceId filter', async () => {

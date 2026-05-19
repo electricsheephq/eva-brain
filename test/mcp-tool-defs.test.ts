@@ -13,8 +13,20 @@ import { operations } from '../src/core/operations.ts';
 import { buildToolDefs, paramDefToSchema } from '../src/mcp/tool-defs.ts';
 import type { ParamDef } from '../src/core/operations.ts';
 
-// Pre-extraction inline shape — lifted verbatim from the original
-// src/mcp/server.ts block so any future drift fails this test loudly.
+// Reference shape — mirrors the canonical `paramDefToSchema` helper from
+// src/mcp/tool-defs.ts. Drift between the helper and this reference fails
+// the byte-equality test loudly.
+//
+// v0.34 update: paramDefToSchema is recursive on `items` so nested
+// array-of-arrays preserves the inner shape on the MCP wire. The reference
+// below mirrors that recursion. The previous shallow `{ items: { type:
+// v.items.type } }` (legacy buildToolDefs) silently dropped nested items
+// — explicit fixture assertions below catch the drift class.
+//
+// `default` is included to match paramDefToSchema; no current op uses
+// `default:` at the ParamDef level so the round-trip is unchanged for
+// every existing operation, but new ops that add a default get it on the
+// wire automatically.
 type ParamDefLike = {
   type: 'string' | 'number' | 'boolean' | 'object' | 'array';
   description?: string;
@@ -22,7 +34,6 @@ type ParamDefLike = {
   default?: unknown;
   items?: ParamDefLike;
 };
-
 function referenceParamDefToSchema(p: ParamDefLike): Record<string, unknown> {
   return {
     type: p.type === 'array' ? 'array' : p.type,
@@ -32,7 +43,6 @@ function referenceParamDefToSchema(p: ParamDefLike): Record<string, unknown> {
     ...(p.items ? { items: referenceParamDefToSchema(p.items) } : {}),
   };
 }
-
 function legacyInlineMap(ops: typeof operations) {
   return ops.map(op => ({
     name: op.name,
@@ -80,6 +90,19 @@ describe('buildToolDefs', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Structural array-items guard (v0.34 fix wave).
+//
+// JSON Schema strict-mode validators (Gemini Pro strict, OpenAI structured
+// outputs) reject `type: 'array'` without `items`. Pre-v0.34 this happened
+// in production: `extract_facts.entity_hints` and `handle_to_tweet`'s
+// `candidates` both shipped as bare arrays.
+//
+// This recursive guard walks every tool def's inputSchema and fails the
+// suite with a property path if any array lacks `items.type`. Drift-proof
+// against future ops adding bare arrays.
+// ---------------------------------------------------------------------------
+
 interface SchemaNode {
   type?: unknown;
   properties?: Record<string, SchemaNode>;
@@ -112,23 +135,28 @@ function findArrayWithoutItems(node: SchemaNode, path: string[]): string[] {
 }
 
 describe('paramDefToSchema structural guard', () => {
-  test('every operation inputSchema array has items.type set', () => {
+  test('every operation inputSchema array has items.type set (no bare arrays)', () => {
     const allViolations: string[] = [];
     for (const def of buildToolDefs(operations)) {
-      allViolations.push(...findArrayWithoutItems(def.inputSchema as SchemaNode, [def.name]));
+      const v = findArrayWithoutItems(def.inputSchema as SchemaNode, [def.name]);
+      allViolations.push(...v);
     }
     expect(allViolations).toEqual([]);
   });
 
-  test('extract_facts.entity_hints declares string items', () => {
+  test('extract_facts.entity_hints declares items.type as string', () => {
     const def = buildToolDefs(operations).find(d => d.name === 'extract_facts');
     expect(def).toBeDefined();
     const eh = (def!.inputSchema.properties as Record<string, SchemaNode>).entity_hints;
     expect(eh.type).toBe('array');
+    expect(eh.items).toBeDefined();
     expect((eh.items as SchemaNode).type).toBe('string');
   });
 
-  test('paramDefToSchema recursively preserves nested items', () => {
+  test('paramDefToSchema recursively propagates nested items.items.type', () => {
+    // Synthetic ParamDef: array-of-arrays-of-strings. No current op uses
+    // this shape, so this test pins the contract for future ops and proves
+    // the helper recurses (closes the v0.32 nested-drop bug class).
     const nested: ParamDef = {
       type: 'array',
       items: {
@@ -140,5 +168,19 @@ describe('paramDefToSchema structural guard', () => {
     expect(schema.type).toBe('array');
     expect((schema.items as SchemaNode).type).toBe('array');
     expect(((schema.items as SchemaNode).items as SchemaNode).type).toBe('string');
+  });
+
+  test('paramDefToSchema preserves description on nested items', () => {
+    const p: ParamDef = {
+      type: 'array',
+      description: 'outer',
+      items: {
+        type: 'string',
+        description: 'inner',
+      },
+    };
+    const schema = paramDefToSchema(p) as SchemaNode;
+    expect(schema.description).toBe('outer');
+    expect((schema.items as SchemaNode).description).toBe('inner');
   });
 });

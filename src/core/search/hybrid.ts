@@ -13,6 +13,8 @@ import type { BrainEngine } from '../engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import type { SearchResult, SearchOpts, HybridSearchMeta } from '../types.ts';
 import { embed, embedQuery } from '../embedding.ts';
+import { resolveEmbeddingColumn, isCacheSafe } from './embedding-column.ts';
+import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
 import { applyReranker } from './rerank.ts';
 import { autoDetectDetail, classifyQuery } from './query-intent.ts';
@@ -32,6 +34,17 @@ import {
 
 const RRF_K = 60;
 const COMPILED_TRUTH_BOOST = 2.0;
+const pendingCacheWrites = new Set<Promise<unknown>>();
+
+export async function awaitPendingSearchCacheWrites(): Promise<void> {
+  if (pendingCacheWrites.size === 0) return;
+  await Promise.allSettled([...pendingCacheWrites]);
+}
+
+function trackCacheWrite(promise: Promise<unknown>): void {
+  pendingCacheWrites.add(promise);
+  promise.finally(() => pendingCacheWrites.delete(promise)).catch(() => { /* swallow */ });
+}
 /**
  * Backlink boost coefficient. Score is multiplied by (1 + BACKLINK_BOOST_COEF * log(1 + count)).
  * - 0 backlinks: factor = 1.0 (no boost).
@@ -48,14 +61,78 @@ const DEBUG = process.env.GBRAIN_SEARCH_DEBUG === '1';
  * Apply backlink boost to a result list in place. Mutates each result's score
  * by (1 + BACKLINK_BOOST_COEF * log(1 + count)). Pure data transform; no DB call.
  * Caller fetches counts via engine.getBacklinkCounts.
+ *
+ * v0.35.6.0 — floor-ratio gate. When `floorThreshold` is provided, results
+ * with `r.score < floorThreshold` are SKIPPED (no boost applied). NaN scores
+ * are also skipped (NaN < x is false in JS, which would otherwise let NaN
+ * results bypass the gate). The threshold is an ABSOLUTE score, not a ratio
+ * — compute it once at `runPostFusionStages` entry via `computeFloorThreshold`
+ * so stage order doesn't change which results clear the gate.
+ *
+ * The gate is scoped to the three metadata-axis boost stages (backlink +
+ * salience + recency). Exact-match boost (`applyExactMatchBoost` in
+ * intent-weights.ts) runs independently as a lexical-relevance signal by
+ * design.
  */
-export function applyBacklinkBoost(results: SearchResult[], counts: Map<string, number>): void {
+export function applyBacklinkBoost(
+  results: SearchResult[],
+  counts: Map<string, number>,
+  floorThreshold?: number,
+): void {
   for (const r of results) {
+    if (!Number.isFinite(r.score)) continue;
+    if (floorThreshold !== undefined && r.score < floorThreshold) continue;
     const count = counts.get(r.slug) ?? 0;
     if (count > 0) {
       r.score *= (1.0 + BACKLINK_BOOST_COEF * Math.log(1 + count));
     }
   }
+}
+
+/**
+ * v0.35.6.0 — floor-ratio threshold computation.
+ *
+ * Returns the absolute score floor below which boost stages skip a result.
+ * Returns `Number.NEGATIVE_INFINITY` (no gate) when:
+ *   - `floorRatio` is undefined (default — preserves prior behavior bit-for-bit)
+ *   - `floorRatio` is NaN, infinite, negative, or > 1 (out-of-range silently
+ *     disables the gate; range validation lives at the config-parse layer)
+ *   - No result has a positive, finite score (all-NaN, all-negative, or empty
+ *     input arrays produce no positive signal — gate stays off)
+ *
+ * Otherwise returns `topScore * floorRatio`, where `topScore` is the largest
+ * finite score in `results`. Callers compute this ONCE before any boost stage
+ * runs, then pass the resulting threshold to every stage. Single-baseline
+ * semantic — order-independent across the three metadata-axis boosts.
+ *
+ * Why this exists: gbrain's bounded boosts (`[1.0, ~1.6]` log-compressed
+ * salience clip, log-scaled backlinks, half-life recency) keep any single
+ * boost from catastrophically flipping rankings on curated small corpora.
+ * On larger corpora indexed with dense embedders (text-embedding-3-large,
+ * Voyage 3+, ZeroEntropy zembed-1), weak-overlap candidates can land in
+ * top-K via baseline vector overlap and accumulate metadata boost until
+ * they leapfrog the legitimate primary hit. The gate restricts each
+ * metadata boost to the head of the candidate pool so the long tail keeps
+ * its unboosted relevance ranking.
+ *
+ * 0.85 is a reasonable starting value for dense-embedder corpora. Default
+ * stays undefined (no gate) until per-corpus ablation evidence supports a
+ * default flip (see `TODOS.md` floor-ratio ablation entry).
+ */
+export function computeFloorThreshold(
+  results: SearchResult[],
+  floorRatio: number | undefined,
+): number {
+  if (floorRatio === undefined) return Number.NEGATIVE_INFINITY;
+  if (!Number.isFinite(floorRatio) || floorRatio < 0 || floorRatio > 1) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  let top = Number.NEGATIVE_INFINITY;
+  for (const r of results) {
+    if (Number.isFinite(r.score) && r.score > top) top = r.score;
+  }
+  if (!Number.isFinite(top) || top <= 0) return Number.NEGATIVE_INFINITY;
+  return top * floorRatio;
 }
 
 /**
@@ -73,9 +150,12 @@ export function applySalienceBoost(
   results: SearchResult[],
   scores: Map<string, number>,
   strength: 'on' | 'strong',
+  floorThreshold?: number,
 ): void {
   const k = strength === 'strong' ? 0.30 : 0.15;
   for (const r of results) {
+    if (!Number.isFinite(r.score)) continue;
+    if (floorThreshold !== undefined && r.score < floorThreshold) continue;
     const key = `${r.source_id ?? 'default'}::${r.slug}`;
     const score = scores.get(key);
     if (!score || score <= 0) continue;
@@ -102,12 +182,15 @@ export function applyRecencyBoost(
   decayMap: import('./recency-decay.ts').RecencyDecayMap,
   fallback: import('./recency-decay.ts').RecencyDecayConfig,
   nowMs: number = Date.now(),
+  floorThreshold?: number,
 ): void {
   const strengthMul = strength === 'strong' ? 1.5 : 1.0;
   // Sort prefixes longest-first so 'media/articles/' matches before 'media/'.
   const prefixes = Object.keys(decayMap).sort((a, b) => b.length - a.length);
 
   for (const r of results) {
+    if (!Number.isFinite(r.score)) continue;
+    if (floorThreshold !== undefined && r.score < floorThreshold) continue;
     const key = `${r.source_id ?? 'default'}::${r.slug}`;
     const d = dates.get(key);
     if (!d) continue;
@@ -144,6 +227,23 @@ export interface PostFusionOpts {
   recency: 'off' | 'on' | 'strong';
   decayMap?: import('./recency-decay.ts').RecencyDecayMap;
   fallback?: import('./recency-decay.ts').RecencyDecayConfig;
+  /**
+   * v0.35.6.0 — floor-ratio gate (opt-in, default off). When set, each
+   * metadata-axis boost stage (backlink, salience, recency) skips results
+   * whose score is below `floorRatio * topScore`. Threshold is computed
+   * ONCE at runPostFusionStages entry from the post-cosine-rescore score
+   * snapshot, then passed uniformly to all three stages — order-independent.
+   *
+   * Default undefined preserves prior behavior bit-for-bit. Sensible values
+   * for dense-embedder corpora: 0.85-0.95. See `computeFloorThreshold` for
+   * the empirical motivation and out-of-range handling.
+   *
+   * SCOPE: gates the three metadata stages only. Exact-match boost
+   * (`applyExactMatchBoost`) runs AFTER `runPostFusionStages` and is NOT
+   * gated — it's a lexical-relevance signal, different in kind from
+   * metadata boosts.
+   */
+  floorRatio?: number;
 }
 
 export async function runPostFusionStages(
@@ -153,12 +253,19 @@ export async function runPostFusionStages(
 ): Promise<void> {
   if (results.length === 0) return;
 
+  // v0.35.6.0 [floor-ratio gate]: compute threshold ONCE at entry, BEFORE any
+  // boost mutates scores. Single-baseline semantic — the same threshold gates
+  // all three downstream stages. This is intentionally different from a
+  // per-stage recompute (which would couple stage order to gating decisions);
+  // see plan `swift-sniffing-nygaard.md` D6 / codex outside-voice T2.
+  const floorThreshold = computeFloorThreshold(results, opts.floorRatio);
+
   // Backlink stage (existing behavior, preserved).
   if (opts.applyBacklinks) {
     try {
       const slugs = Array.from(new Set(results.map(r => r.slug)));
       const counts = await engine.getBacklinkCounts(slugs);
-      applyBacklinkBoost(results, counts);
+      applyBacklinkBoost(results, counts, floorThreshold);
     } catch {
       // Non-fatal; preserves the existing pre-v0.29.1 contract.
     }
@@ -175,7 +282,7 @@ export async function runPostFusionStages(
   if (opts.salience !== 'off') {
     try {
       const scores = await engine.getSalienceScores(refs);
-      applySalienceBoost(results, scores, opts.salience);
+      applySalienceBoost(results, scores, opts.salience, floorThreshold);
     } catch {
       // Non-fatal.
     }
@@ -192,6 +299,8 @@ export async function runPostFusionStages(
         opts.recency,
         opts.decayMap ?? DEFAULT_RECENCY_DECAY,
         opts.fallback ?? DEFAULT_FALLBACK,
+        Date.now(),
+        floorThreshold,
       );
     } catch {
       // Non-fatal.
@@ -245,8 +354,25 @@ export async function hybridSearch(
       tokenBudget: opts?.tokenBudget,
       expansion: opts?.expansion,
       searchLimit: opts?.limit,
+      // v0.35.6.0 — floor-ratio gate thread-through. Per-call value wins
+      // over per-key config wins over mode bundle (currently undefined for
+      // all 3 bundles — pending ablation evidence).
+      floor_ratio: opts?.floorRatio,
     },
   });
+
+  // v0.36 (D7+D11): resolve embedding column once at entry. Single
+  // round-trip to read DB-plane config (mirrors loadSearchModeConfig).
+  // Resolver throws on unknown name with a paste-ready hint; let it
+  // propagate — a misconfig should be loud, not silently fall back.
+  // Failing cfg load (pre-config brain, mid-migration, no engine.getConfig)
+  // falls through to the file-plane sync loadConfig() — same shape, just
+  // misses DB-plane overrides.
+  const mergedCfg = await loadConfigWithEngine(engine).catch(() => null);
+  const cfgForColumn = mergedCfg ?? ((await import('../config.ts')).loadConfig()) ?? null;
+  const resolvedCol = cfgForColumn
+    ? resolveEmbeddingColumn(opts, cfgForColumn)
+    : resolveEmbeddingColumn(opts, { engine: 'pglite' });
 
   const limit = opts?.limit || resolvedMode.searchLimit;
   const offset = opts?.offset || 0;
@@ -292,6 +418,10 @@ export async function hybridSearch(
     // ordering means we can't lazy-spread the full opts).
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
+    // v0.36 (D11): pass the pre-validated descriptor into the engine so
+    // it never has to read config. Engines normalize string-or-descriptor
+    // via normalizeEngineColumn; the descriptor path is the strict one.
+    embeddingColumn: resolvedCol,
   };
   // Track what actually ran for the optional onMeta callback (v0.25.0).
   // Caller leaves onMeta undefined → these flags are computed but never
@@ -357,15 +487,24 @@ export async function hybridSearch(
     ?? (suggestions.suggestedRecency !== 'off'
         ? suggestions.suggestedRecency
         : (intentRecency ?? suggestions.suggestedRecency));
-  const postFusionOpts = {
+  const postFusionOpts: PostFusionOpts = {
     applyBacklinks: true,
     salience: salienceMode,
     recency: recencyMode,
+    // v0.35.6.0 — floor-ratio gate threaded from resolved mode. Default
+    // undefined for all 3 bundles → no behavior change unless caller sets
+    // SearchOpts.floorRatio or `search.floor_ratio` config key.
+    floorRatio: resolvedMode.floor_ratio,
   };
 
   // Skip vector search entirely if the gateway has no embedding provider configured (Codex C3).
+  // v0.36 (D10): ask "is the RESOLVED column's provider reachable?" rather
+  // than "is the global default reachable?" — otherwise an unreachable
+  // global default disables vector search even when the active column's
+  // provider (Voyage, ZE) works fine.
   const { isAvailable } = await import('../ai/gateway.ts');
-  if (!isAvailable('embedding')) {
+  const providerProbe = resolvedCol.embeddingModel || undefined;
+  if (!isAvailable('embedding', providerProbe)) {
     if (keywordResults.length > 0) {
       await runPostFusionStages(engine, keywordResults, postFusionOpts);
       keywordResults.sort((a, b) => b.score - a.score);
@@ -380,6 +519,7 @@ export async function hybridSearch(
       expansion_applied: false,
       intent: suggestions.intent,
       mode: resolvedMode.resolved_mode,
+      embedding_column: resolvedCol.name,
       ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
         ? { token_budget: noEmbedBudgetMeta }
         : {}),
@@ -412,7 +552,15 @@ export async function hybridSearch(
     // v0.35.0.0+: query-side embedding. For asymmetric providers (ZE zembed-1,
     // Voyage v3+) routes input_type='query' through the embed seam; symmetric
     // providers ignore the field — no behavior change.
-    const embeddings = await Promise.all(queries.map(q => embedQuery(q)));
+    // v0.36 (D10): route through the resolved column's provider + dims so
+    // a query against `embedding_voyage` actually embeds via Voyage, not
+    // the global default (OpenAI). Empty embeddingModel falls back to
+    // gateway default — preserves pre-v0.36 behavior for the builtin
+    // 'embedding' column.
+    const embedOpts = resolvedCol.embeddingModel
+      ? { embeddingModel: resolvedCol.embeddingModel, dimensions: resolvedCol.dimensions }
+      : undefined;
+    const embeddings = await Promise.all(queries.map(q => embedQuery(q, embedOpts)));
     queryEmbedding = embeddings[0];
     vectorLists = await Promise.all(
       embeddings.map(emb => engine.searchVector(emb, searchOpts)),
@@ -440,6 +588,7 @@ export async function hybridSearch(
       expansion_applied: expansionApplied,
       intent: suggestions.intent,
       mode: resolvedMode.resolved_mode,
+      embedding_column: resolvedCol.name,
       ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
         ? { token_budget: kwBudgetMeta }
         : {}),
@@ -463,9 +612,12 @@ export async function hybridSearch(
   ];
   let fused = rrfFusionWeighted(allLists, detail !== 'high');
 
-  // Cosine re-scoring before dedup so semantically better chunks survive
+  // Cosine re-scoring before dedup so semantically better chunks survive.
+  // v0.36 (D9): hydrate from the active embedding column so rescore happens
+  // in the same vector space the HNSW just ranked in. Pre-v0.36 this
+  // always pulled from `embedding` and silently corrupted alt-column ranks.
   if (queryEmbedding) {
-    fused = await cosineReScore(engine, fused, queryEmbedding);
+    fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name);
   }
 
   // v0.29.1: post-fusion stages (backlink + salience + recency) run via
@@ -573,6 +725,7 @@ export async function hybridSearch(
     expansion_applied: expansionApplied,
     intent: suggestions.intent,
     mode: resolvedMode.resolved_mode,
+    embedding_column: resolvedCol.name,
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: budgetMeta }
       : {}),
@@ -621,10 +774,34 @@ export async function hybridSearchCached(
       expansion: opts?.expansion,
       intentWeighting: opts?.intentWeighting,
       searchLimit: opts?.limit,
+      // v0.35.6.0 — floor-ratio threaded through cache resolver too so
+      // knobsHash() differentiates floor-on vs floor-off cache rows.
+      // Without this, a no-floor write would be served to a floor-enabled
+      // read (ranking-correctness leak, codex T1).
+      floor_ratio: opts?.floorRatio,
     },
   });
+  // v0.36 (D8 / CDX-2 + codex /ship #4): resolve column for the cache
+  // decision. The query_cache.embedding column has one fixed pgvector dim
+  // sized at brain init; storing a 1024d Voyage or 2560d ZE cache
+  // embedding fails or corrupts results. Name-based check ("is it the
+  // default `embedding` column?") is insufficient — the registry
+  // explicitly allows overriding builtin `embedding` to a different
+  // provider/dim. isCacheSafe compares the resolved column's full
+  // embedding space (name + dim + model) against cfg and returns true
+  // only when ALL match. Otherwise skip.
+  const mergedCfgCached = await loadConfigWithEngine(engine).catch(() => null);
+  const cfgCached = mergedCfgCached ?? ((await import('../config.ts')).loadConfig()) ?? { engine: 'pglite' as const };
+  const resolvedColCached = resolveEmbeddingColumn(opts, cfgCached);
+  const isNonDefaultColumn = !isCacheSafe(resolvedColCached, cfgCached);
+
+  // Cache key carries the column + provider so different embedding spaces
+  // never collide on the same `(source_id, query_text)` row.
   const cacheKnobsHash = cacheKnobsHashForSourceScope(
-    knobsHash(resolvedForCache),
+    knobsHash(resolvedForCache, {
+      embeddingColumn: resolvedColCached.name,
+      embeddingModel: resolvedColCached.embeddingModel,
+    }),
     opts?.sourceIds,
   );
 
@@ -640,14 +817,15 @@ export async function hybridSearchCached(
     ttlSeconds: resolvedForCache.cache_ttl_seconds,
   });
 
-  // Skip cache entirely when the request asks for two-pass walks or has
-  // a non-default embedding column — those interact with structural state
-  // that the cache can't safely express.
+  // Skip cache entirely when the request asks for two-pass walks, has
+  // a non-default embedding column (per-call or via config default —
+  // D8 closes the silent-corruption bug class), or near-symbol mode
+  // (structural state that the cache can't safely express).
   const skipCache =
     !cache.isEnabled() ||
     (opts?.walkDepth ?? 0) > 0 ||
     Boolean(opts?.nearSymbol) ||
-    (opts?.embeddingColumn && opts.embeddingColumn !== 'embedding');
+    isNonDefaultColumn;
 
   let cacheStatus: 'hit' | 'miss' | 'disabled' = skipCache ? 'disabled' : 'miss';
   let cacheSimilarity: number | undefined;
@@ -662,7 +840,13 @@ export async function hybridSearchCached(
   if (!skipCache) {
     try {
       const { isAvailable } = await import('../ai/gateway.ts');
-      if (isAvailable('embedding')) {
+      // v0.36 (D10): for the cache-lookup embedding, also use the resolved
+      // column's provider. The cache lookup is always against the default
+      // 'embedding' column (skipCache short-circuits non-default above),
+      // so this is the default embeddingModel — but threading it keeps
+      // the provider probe consistent with the bare hybridSearch path.
+      const providerProbeCached = resolvedColCached.embeddingModel || undefined;
+      if (isAvailable('embedding', providerProbeCached)) {
         // v0.35.0.0+: query-side embedding (cache lookup path).
         queryEmbedding = await embedQuery(query);
       } else {
@@ -756,9 +940,11 @@ export async function hybridSearchCached(
     results.length > 0 &&
     (innerMeta?.vector_enabled ?? false)
   ) {
-    void cache
-      .store(query, queryEmbedding, results, finalMeta, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash })
-      .catch(() => { /* swallow */ });
+    trackCacheWrite(
+      cache
+        .store(query, queryEmbedding, results, finalMeta, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash })
+        .catch(() => { /* swallow */ }),
+    );
   }
 
   return budgeted;
@@ -865,6 +1051,7 @@ async function cosineReScore(
   engine: BrainEngine,
   results: SearchResult[],
   queryEmbedding: Float32Array,
+  column: string = 'embedding',
 ): Promise<SearchResult[]> {
   const chunkIds = results
     .map(r => r.chunk_id)
@@ -874,7 +1061,11 @@ async function cosineReScore(
 
   let embeddingMap: Map<number, Float32Array>;
   try {
-    embeddingMap = await engine.getEmbeddingsByChunkIds(chunkIds);
+    // v0.36 (D9): hydrate from the active column so rescore happens in
+    // the same embedding space the HNSW just ranked in. Without this,
+    // a Voyage HNSW retrieval would HNSW-rank against Voyage vectors but
+    // rescore against OpenAI vectors → NaN or wrong rankings.
+    embeddingMap = await engine.getEmbeddingsByChunkIds(chunkIds, column);
   } catch {
     // DB error is non-fatal, return results without re-scoring
     return results;

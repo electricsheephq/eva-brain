@@ -1,6 +1,6 @@
 import { execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
-import { join, dirname, resolve } from 'path';
+import { basename, join, dirname, resolve } from 'path';
 import { VERSION } from '../version.ts';
 import type { GBrainConfig } from '../core/config.ts';
 
@@ -115,6 +115,46 @@ function printSourceUpdaterCommands(): void {
   console.log(`  ${EVA_SOURCE_UPDATE_COMMAND}`);
 }
 
+export function resolveBunGlobalRoot(): string {
+  const bunInstall = process.env.BUN_INSTALL;
+  if (bunInstall) {
+    return join(bunInstall, 'install', 'global');
+  }
+
+  const defaultRoot = join(process.env.HOME || '', '.bun', 'install', 'global');
+  if (isBunGlobalRoot(defaultRoot)) {
+    return defaultRoot;
+  }
+
+  const installRoot = findBunInstallRootFromArgv();
+  return installRoot ?? defaultRoot;
+}
+
+function isBunGlobalRoot(dir: string): boolean {
+  return existsSync(join(dir, 'package.json')) && existsSync(join(dir, 'node_modules'));
+}
+
+function findBunInstallRootFromArgv(): string | null {
+  try {
+    const argv1 = process.argv[1];
+    if (!argv1) return null;
+
+    let dir = dirname(realpathSync(argv1));
+    for (let i = 0; i < 10; i++) {
+      if (basename(dir) === 'gbrain' && basename(dirname(dir)) === 'node_modules') {
+        const root = dirname(dirname(dir));
+        if (isBunGlobalRoot(root)) return root;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function verifyUpgrade(): string {
   try {
     const output = execSync('gbrain --version', { encoding: 'utf-8', timeout: 10_000 }).trim();
@@ -206,6 +246,16 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
     return;
   }
   let upgradeFrom = VERSION;
+
+  // v0.35.8.0: lay down ~/.gbrain/.gitignore retroactively. Existing users
+  // never re-run `gbrain init`, so init-only coverage misses them entirely
+  // (codex F-CDX-8). Idempotent + non-clobbering — safe to run every upgrade.
+  try {
+    const { ensureGitignore } = await import('../core/config.ts');
+    ensureGitignore();
+  } catch {
+    // Best-effort hygiene; never block upgrade.
+  }
   // Cosmetic: print feature pitches for migrations newer than the prior binary.
   try {
     const statePath = join(process.env.HOME || '', '.gbrain', 'upgrade-state.json');
@@ -350,6 +400,80 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
     }
   } catch {
     // Best-effort cosmetic surface; never block post-upgrade.
+  }
+
+  // v0.36 DX: skillpack reference sweep. After an upgrade, the gbrain bundle
+  // may have shipped changes to scaffolded skills the host already has on
+  // disk. Run `reference --all` automatically and print a one-line-per-skill
+  // summary so the agent + operator see what drifted without manually
+  // running the sweep. Skipped silently when:
+  //   - GBRAIN_SKIP_REFERENCE_SWEEP=1 in env
+  //   - no target workspace can be auto-detected (gbrain installed but
+  //     never scaffolded anywhere)
+  //   - the detected workspace IS the gbrain repo (dev-mode, would just
+  //     compare gbrain against itself)
+  //   - every scaffolded skill is identical (nothing to say)
+  await postUpgradeReferenceSweep();
+}
+
+/**
+ * Run `reference --all` against the auto-detected host workspace and print
+ * a one-line-per-skill summary of any drift. Best-effort; failures are
+ * swallowed so a broken sweep never blocks post-upgrade.
+ *
+ * Exported (with optional `opts` test seam) for unit testing the gate
+ * logic + output shape. Production callers pass no args — both paths are
+ * auto-detected.
+ */
+export async function postUpgradeReferenceSweep(
+  opts: { gbrainRoot?: string; targetWorkspace?: string } = {},
+): Promise<void> {
+  if (process.env.GBRAIN_SKIP_REFERENCE_SWEEP) return;
+  try {
+    const { autoDetectSkillsDirReadOnly } = await import('../core/repo-root.ts');
+    const { findGbrainRoot } = await import('../core/skillpack/bundle.ts');
+    const { runReferenceAll } = await import('../core/skillpack/reference.ts');
+    const path = await import('path');
+
+    // Allow tests to inject; default to auto-detection.
+    let targetWorkspace = opts.targetWorkspace;
+    if (!targetWorkspace) {
+      const detected = autoDetectSkillsDirReadOnly();
+      if (!detected.dir) return;
+      targetWorkspace = path.resolve(detected.dir, '..');
+    }
+
+    const gbrainRoot = opts.gbrainRoot ?? findGbrainRoot();
+    if (!gbrainRoot) return;
+
+    // Dev-mode guard: the detected workspace IS the gbrain repo. Sweeping
+    // gbrain against itself is always identical — print nothing.
+    if (path.resolve(targetWorkspace) === path.resolve(gbrainRoot)) return;
+
+    const result = runReferenceAll({ gbrainRoot, targetWorkspace });
+    // Print only skills that (a) the host has actually scaffolded, AND
+    // (b) have at least one differs or missing entry. Pure-`missing`
+    // skills the host never scaffolded are noise; skip them.
+    const drifted = result.skills.filter(
+      s =>
+        s.summary.identical + s.summary.differs > 0 &&
+        (s.summary.differs > 0 || s.summary.missing > 0),
+    );
+    if (drifted.length === 0) return;
+
+    console.log('');
+    console.log('Skillpack reference sweep (post-upgrade):');
+    for (const s of drifted) {
+      console.log(
+        `  ${s.slug.padEnd(40)} differs:${s.summary.differs} missing:${s.summary.missing}`,
+      );
+    }
+    console.log('');
+    console.log(
+      'Run `gbrain skillpack reference <slug>` to inspect per-skill diffs.\nSee `skills/_AGENT_README.md` for what your agent should do on update.\nSkip this sweep: `GBRAIN_SKIP_REFERENCE_SWEEP=1`.',
+    );
+  } catch {
+    // Best-effort. Never block post-upgrade.
   }
 }
 
